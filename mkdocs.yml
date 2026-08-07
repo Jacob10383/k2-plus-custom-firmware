@@ -1,0 +1,36 @@
+site_name: Jacobeans K2 Plus firmware
+site_description: Documentation for the Creality K2 Plus firmware
+site_url: https://jacob10383.github.io/k2-plus-custom-firmware/
+
+theme:
+  name: material
+  features:
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Use light mode
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+
+nav:
+  - Install: index.md
+  - Calibration: calibration.md
+  - OrcaSlicer: setup.md
+  - Updates & Recovery: updates-recovery.md
+  - Reference:
+      - Command Reference: command-reference.md
+      - Config Reference: config-reference.md
