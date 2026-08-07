@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026  36573259+Jacob10383@users.noreply.github.com
+# This file may be distributed under the terms of the GNU GPLv3 license.
+"""
+Bootstrap a wiped K2 /mnt/UDISK with the expected Klipper/Moonraker stack.
+
+Run this on the K2 as root, after /mnt/UDISK is formatted and mounted:
+
+    bootstrap
+
+The script is intentionally conservative. Existing install directories cause a
+failure unless --replace is passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+from contextlib import contextmanager
+from pathlib import Path
+
+
+UDISK = Path("/mnt/UDISK")
+ROOT = UDISK
+PRINTER_DATA = UDISK / "printer_data"
+CONFIG_DIR = PRINTER_DATA / "config"
+
+KALICO_REPO = "https://github.com/Jacob10383/kalico"
+KALICO_BRANCH = "main"
+MOONRAKER_REPO = "https://github.com/arksine/moonraker"
+CARTOGRAPHER_PACKAGE = "cartographer3d-plugin"
+
+FLUIDD_REPO = "Jacob10383/fluidd"
+FLUIDD_ASSET = "fluidd.zip"
+MAINSAIL_REPO = "mainsail-crew/mainsail"
+MAINSAIL_ASSET = "mainsail.zip"
+HELIX_REPO = "prestonbrown/helixscreen"
+HELIX_ASSET = "helixscreen-k2.zip"
+HELIX_DIR = ROOT / "helixscreen"
+
+
+MOONRAKER_ASVC = "klipper_mcu\nhelixscreen\nustreamer@stockcam\n"
+
+TIMELAPSE_URL = "https://raw.githubusercontent.com/mainsail-crew/moonraker-timelapse/main/component/timelapse.py"
+FIRMWARE_BASE_URL = "https://firmware.jacobean.xyz"
+FIRMWARE_VERSION = "6.18"
+RELEASE_INDEX_URL = f"{FIRMWARE_BASE_URL}/{FIRMWARE_VERSION}/index"
+BOOTSTRAP_INSTALL_PATH = Path("/usr/bin/bootstrap")
+TIMEZONE_URL = "https://ipapi.co/timezone"
+NETWORK_ATTEMPTS = 3
+NETWORK_DELAY_SECONDS = 3
+
+SERVICES_TO_STOP = ["moonraker", "klipper", "klipper-mcu"]
+SERVICES_TO_START = ["klipper", "moonraker"]
+MANAGED_PATHS = [
+    ROOT / "klipper",
+    ROOT / "moonraker",
+    ROOT / "klippy-env",
+    ROOT / "moonraker-env",
+    ROOT / "fluidd",
+    ROOT / "mainsail",
+    CONFIG_DIR,
+]
+
+
+def object_url(digest: str) -> str:
+    return f"{FIRMWARE_BASE_URL}/{FIRMWARE_VERSION}/o/{digest}"
+
+
+def header(message: str) -> None:
+    print(f"\033[1m{message}\033[0m", flush=True)
+
+
+def section(message: str) -> None:
+    print(f"\n\033[1;36m==> {message}\033[0m", flush=True)
+
+
+def log(message: str) -> None:
+    print(f"  {message}", flush=True)
+
+
+def log_warn(message: str) -> None:
+    print(f"  \033[33m{message}\033[0m", flush=True)
+
+
+def success(message: str) -> None:
+    print(f"\n\033[1;32m{message}\033[0m", flush=True)
+
+
+def retry_network(label: str, action, attempts: int = NETWORK_ATTEMPTS, delay: int = NETWORK_DELAY_SECONDS):
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            log_warn(
+                f"{label} failed ({type(exc).__name__}: {exc}); "
+                f"retrying in {delay}s ({attempt}/{attempts - 1})"
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+@contextmanager
+def step(title: str):
+    section(title)
+    yield
+
+
+def run(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    retry_label: str | None = None,
+) -> None:
+    log("$ " + " ".join(cmd))
+    def attempt() -> None:
+        subprocess.run(cmd, check=True, env=env)
+
+    if retry_label:
+        try:
+            retry_network(retry_label, attempt)
+        except Exception as exc:
+            raise SystemExit(f"{retry_label} failed: {exc}") from exc
+        return
+
+    subprocess.run(cmd, check=True, env=env)
+
+
+def set_timezone_from_ip() -> None:
+    def attempt() -> str:
+        with urllib.request.urlopen(TIMEZONE_URL, timeout=30) as response:
+            return response.read().decode().strip()
+
+    try:
+        timezone = retry_network("fetching timezone", attempt)
+    except Exception as exc:
+        log_warn(f"timezone lookup failed ({type(exc).__name__}: {exc})")
+        return
+
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/+")
+    if (
+        not timezone
+        or len(timezone) > 128
+        or timezone.startswith("/")
+        or ".." in timezone
+        or any(char not in allowed for char in timezone)
+    ):
+        log_warn(f"ignoring invalid timezone response: {timezone!r}")
+        return
+
+    if shutil.which("timedatectl") is None:
+        log_warn("timedatectl not found; skipping timezone setup")
+        return
+
+    cmd = ["timedatectl", "set-timezone", timezone]
+    log("$ " + " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+    if result.returncode:
+        log_warn(f"timedatectl failed with exit {result.returncode}")
+    else:
+        log(f"timezone set to {timezone}")
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("run this as root on the K2")
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        raise SystemExit(f"missing required tool: {name}")
+
+
+def require_udisk() -> None:
+    if not UDISK.is_dir():
+        raise SystemExit(f"{UDISK} does not exist")
+    if not os.path.ismount(UDISK):
+        raise SystemExit(f"{UDISK} is not a mountpoint")
+    probe = UDISK / ".bootstrap-write-test"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise SystemExit(f"{UDISK} is not writable: {exc}") from exc
+
+
+def prepare_path(path: Path, *, replace: bool) -> None:
+    if not path.exists():
+        return
+    if not replace:
+        raise SystemExit(f"{path} already exists; rerun with --replace to delete and recreate it")
+    log(f"removing existing {path}")
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def preflight_bootstrap(*, replace: list[str] | None) -> None:
+    require_root()
+    require_udisk()
+    require_tool("python3")
+    if set(replace or []) != {"helixscreen"}:
+        require_tool("git")
+
+    # If --replace is not passed at all, warn if any managed path exists
+    if replace is None:
+        existing = [str(path) for path in MANAGED_PATHS if path.exists()]
+        if existing:
+            paths = "\n".join(f"  {path}" for path in existing)
+            raise SystemExit(
+                "bootstrap would overwrite existing managed paths.\n"
+                f"{paths}\n"
+                "rerun with --replace to delete and recreate them"
+            )
+
+
+def preflight_update_extras() -> None:
+    require_root()
+    require_udisk()
+    extras_dir = ROOT / "klipper" / "klippy" / "extras"
+    if not extras_dir.is_dir():
+        raise SystemExit(f"missing existing Klipper extras directory: {extras_dir}")
+
+
+def clone_repo(url: str, dest: Path, *, branch: str | None, replace: bool) -> bool:
+    if dest.exists() and not replace:
+        log(f"{dest.name} already exists; skipping clone")
+        return False
+    prepare_path(dest, replace=replace)
+    cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        cmd.extend(["--branch", branch])
+    cmd.extend([url, str(dest)])
+    log("$ " + " ".join(cmd))
+
+    def attempt() -> None:
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        subprocess.run(cmd, check=True)
+
+    try:
+        retry_network(f"cloning {url}", attempt)
+    except Exception as exc:
+        raise SystemExit(f"cloning {url} failed: {exc}") from exc
+    return True
+
+
+def pip_env(venv: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PIP_ONLY_BINARY"] = ":all:"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return env
+
+
+def create_venv(venv: Path, *, replace: bool, system_site: bool = False) -> bool:
+    if venv.exists() and not replace:
+        log(f"{venv.name} already exists; skipping virtualenv creation")
+        return False
+    prepare_path(venv, replace=replace)
+    cmd = ["python3", "-m", "venv"]
+    if system_site:
+        cmd.append("--system-site-packages")
+    cmd.append(str(venv))
+    run(cmd)
+    ensure_pip_executable(venv)
+    return True
+
+
+def ensure_pip_executable(venv: Path) -> None:
+    python = venv / "bin" / "python"
+    pip = venv / "bin" / "pip"
+    if pip.is_file():
+        return
+    if not python.is_file():
+        raise SystemExit(f"missing Python executable in virtualenv: {python}")
+    pip.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(str(python))} -m pip \"$@\"\n",
+        encoding="utf-8",
+    )
+    pip.chmod(0o755)
+    log(f"created pip wrapper at {pip}")
+
+
+def pip_install_requirements(venv: Path, requirements: list[Path], *extra_packages: str) -> None:
+    for requirement in requirements:
+        if not requirement.is_file():
+            raise SystemExit(f"missing requirements file: {requirement}")
+    ensure_pip_executable(venv)
+    pip = venv / "bin" / "pip"
+    cmd = [
+        str(pip),
+        "install",
+        "--only-binary=:all:",
+    ]
+    for requirement in requirements:
+        cmd.extend(["-r", str(requirement)])
+    cmd.extend(extra_packages)
+    run(cmd, env=pip_env(venv), retry_label=f"installing Python packages into {venv}")
+    ensure_pip_executable(venv)
+
+
+def latest_release_asset(repo: str, asset_name: str) -> tuple[str, str]:
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    log(f"fetching latest release metadata for {repo}")
+    def attempt():
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    try:
+        release = retry_network(f"fetching release metadata for {repo}", attempt)
+    except Exception as exc:
+        raise SystemExit(f"failed to fetch release metadata for {repo}: {exc}") from exc
+
+    for asset in release.get("assets", []):
+        if asset.get("name") == asset_name:
+            return release.get("tag_name", "unknown"), asset["browser_download_url"]
+
+    assets = ", ".join(asset.get("name", "?") for asset in release.get("assets", []))
+    raise SystemExit(f"{repo} latest release has no {asset_name!r} asset; assets: {assets}")
+
+
+def download(url: str, dest: Path) -> None:
+    def attempt():
+        with urllib.request.urlopen(url, timeout=300) as response:
+            with dest.open("wb") as handle:
+                shutil.copyfileobj(response, handle)
+
+    try:
+        retry_network(f"downloading {url}", attempt)
+    except Exception as exc:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise SystemExit(f"failed to download {url}: {exc}") from exc
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_sha256(url: str, dest: Path, expected_sha256: str) -> None:
+    download(url, dest)
+    actual = file_sha256(dest)
+    if actual != expected_sha256:
+        dest.unlink(missing_ok=True)
+        raise SystemExit(
+            f"{dest.name} checksum mismatch: expected {expected_sha256}, got {actual}"
+        )
+
+
+def fetch_json(url: str):
+    def attempt():
+        with urllib.request.urlopen(url, timeout=60) as response:
+            return json.load(response)
+
+    try:
+        return retry_network(f"fetching {url}", attempt)
+    except Exception as exc:
+        raise SystemExit(f"failed to fetch {url}: {exc}") from exc
+
+
+def fetch_json_sha256(url: str, expected_sha256: str):
+    def attempt():
+        with urllib.request.urlopen(url, timeout=60) as response:
+            return response.read()
+
+    try:
+        data = retry_network(f"fetching {url}", attempt)
+    except Exception as exc:
+        raise SystemExit(f"failed to fetch {url}: {exc}") from exc
+
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected_sha256:
+        raise SystemExit(
+            f"{url} checksum mismatch: expected {expected_sha256}, got {actual}"
+        )
+
+    try:
+        return json.loads(data.decode())
+    except Exception as exc:
+        raise SystemExit(f"{url} did not contain valid JSON: {exc}") from exc
+
+
+def fetch_release_index() -> dict:
+    index = fetch_json(RELEASE_INDEX_URL)
+    if not isinstance(index, dict):
+        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain an object")
+    if index.get("format") != "k2-release-index-v1" or index.get("version") != FIRMWARE_VERSION:
+        raise SystemExit(f"{RELEASE_INDEX_URL} has an unsupported release index format")
+    return index
+
+
+def release_index_file_sha256(index: dict, key: str) -> str:
+    entry = index.get(key)
+    if not isinstance(entry, dict):
+        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a {key!r} object")
+    digest = entry.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a valid {key} SHA256")
+    return digest
+
+
+def install_bootstrap_update(index: dict | None = None) -> bool:
+    index = index or fetch_release_index()
+    digest = release_index_file_sha256(index, "bootstrap")
+    if BOOTSTRAP_INSTALL_PATH.is_file() and file_sha256(BOOTSTRAP_INSTALL_PATH) == digest:
+        log("bootstrap already current")
+        return False
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".bootstrap-", dir=str(BOOTSTRAP_INSTALL_PATH.parent), delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        log("updating bootstrap")
+        download_sha256(object_url(digest), tmp_path, digest)
+        tmp_path.chmod(0o755)
+        os.replace(tmp_path, BOOTSTRAP_INSTALL_PATH)
+        return True
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def extract_zip(zip_path: Path, dest: Path, *, replace: bool) -> None:
+    prepare_path(dest, replace=replace)
+    dest.mkdir(parents=True, exist_ok=True)
+    log(f"extracting {zip_path.name} to {dest}")
+    with zipfile.ZipFile(zip_path) as archive:
+        root = dest.resolve()
+        for member in archive.infolist():
+            target = (dest / member.filename).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError as exc:
+                raise SystemExit(f"{zip_path.name} contains unsafe path: {member.filename}") from exc
+        archive.extractall(dest)
+
+
+def install_web_ui(repo: str, asset_name: str, dest: Path, *, replace: bool) -> None:
+    if dest.exists() and not replace:
+        log(f"{dest.name} already exists; skipping install")
+        return
+    tag, asset_url = latest_release_asset(repo, asset_name)
+    log(f"{repo} latest release is {tag}")
+    with tempfile.TemporaryDirectory(prefix="udisk-bootstrap-", dir=str(UDISK)) as tmpdir:
+        zip_path = Path(tmpdir) / asset_name
+        download(asset_url, zip_path)
+        extract_zip(zip_path, dest, replace=replace)
+
+
+def chmod_helix_release(release_dir: Path) -> None:
+    for path in release_dir.glob("bin/*"):
+        if path.is_file():
+            path.chmod(path.stat().st_mode | 0o755)
+    for path in release_dir.rglob("*.sh"):
+        if path.is_file():
+            path.chmod(path.stat().st_mode | 0o755)
+
+
+def validate_helix_release(release_dir: Path) -> None:
+    for path in [release_dir / "bin" / "helix-screen", release_dir / "bin" / "helix-launcher.sh"]:
+        if not path.is_file():
+            raise SystemExit(f"HelixScreen archive is missing {path.relative_to(release_dir)}")
+        if not os.access(path, os.X_OK):
+            raise SystemExit(f"HelixScreen archive entry is not executable: {path.relative_to(release_dir)}")
+    for path in [release_dir / "ui_xml", release_dir / "assets"]:
+        if not path.is_dir():
+            raise SystemExit(f"HelixScreen archive is missing {path.relative_to(release_dir)}")
+
+
+def refresh_helix_units() -> None:
+    script = HELIX_DIR / "config" / "refresh-service-units.sh"
+    if script.is_file():
+        run([str(script)])
+    else:
+        log_warn(f"missing {script}; systemd units were not refreshed")
+
+
+def install_helixscreen() -> None:
+    tag, asset_url = latest_release_asset(HELIX_REPO, HELIX_ASSET)
+    log(f"{HELIX_REPO} latest release is {tag}")
+
+    with tempfile.TemporaryDirectory(prefix="udisk-helixscreen-", dir=str(UDISK)) as tmpdir:
+        tmp = Path(tmpdir)
+        zip_path = tmp / HELIX_ASSET
+        extract_dir = tmp / "extract"
+        new_dir = tmp / "helixscreen.new"
+        old_dir = HELIX_DIR.with_name(".helixscreen.old")
+
+        download(asset_url, zip_path)
+        extract_zip(zip_path, extract_dir, replace=True)
+        shutil.move(str(extract_dir), new_dir)
+        chmod_helix_release(new_dir)
+        validate_helix_release(new_dir)
+
+        prepare_path(old_dir, replace=True)
+        service_control("stop", ["helixscreen-update.path", "helixscreen-update.service", "helixscreen"])
+        if HELIX_DIR.exists():
+            os.replace(HELIX_DIR, old_dir)
+        try:
+            os.replace(new_dir, HELIX_DIR)
+        except OSError:
+            if HELIX_DIR.exists():
+                shutil.rmtree(HELIX_DIR, ignore_errors=True)
+            if old_dir.exists():
+                os.replace(old_dir, HELIX_DIR)
+            raise
+
+    refresh_helix_units()
+
+
+def service_control(action: str, services: list[str]) -> None:
+    if shutil.which("systemctl") is None:
+        return
+    for svc in services:
+        result = subprocess.run(
+            ["systemctl", action, svc],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            log(f"{action}ed {svc}")
+        else:
+            log_warn(f"failed to {action} {svc} (exit {result.returncode})")
+
+
+def get_local_ip() -> str:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+
+def moonraker_json(path: str, timeout: int = 2) -> dict:
+    with urllib.request.urlopen(f"http://localhost:7125{path}", timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def wait_for_moonraker(timeout: int = 120) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            info = moonraker_json("/server/info")
+            components = info.get("result", {}).get("components", [])
+            if "webcam" not in components:
+                time.sleep(1)
+                continue
+            moonraker_json("/server/webcams/list")
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def install_webcam() -> None:
+    log("waiting for Moonraker...")
+    if not wait_for_moonraker():
+        log_warn("Moonraker webcam API did not come up in 120s — skipping webcam registration")
+        return
+    ip = get_local_ip()
+    payload = json.dumps({
+        "name": "Front",
+        "enabled": True,
+        "icon": "mdiWebcam",
+        "aspect_ratio": "4:3",
+        "target_fps": 30,
+        "target_fps_idle": 30,
+        "location": "printer",
+        "service": "uv4l-mjpeg",
+        "stream_url": f"http://{ip}:8080/stream",
+        "snapshot_url": f"http://{ip}:8080/snapshot",
+        "flip_horizontal": False,
+        "flip_vertical": False,
+        "rotation": 0,
+    }).encode()
+    req = urllib.request.Request(
+        "http://localhost:7125/server/webcams/item",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        result = json.load(resp)
+    uid = result["result"]["webcam"]["uid"]
+    log(f"registered webcam 'Front' ({ip}) uid={uid}")
+
+
+def backup_config_dir() -> Path | None:
+    """Move existing configs into config_backups/<timestamp> instead of deleting them."""
+    if CONFIG_DIR.is_symlink() or (CONFIG_DIR.exists() and not CONFIG_DIR.is_dir()):
+        log(f"removing non-directory {CONFIG_DIR}")
+        CONFIG_DIR.unlink()
+        return None
+    if not CONFIG_DIR.is_dir():
+        return None
+    # never move config_backups into itself
+    items = [path for path in CONFIG_DIR.iterdir() if path.name != "config_backups"]
+    if not items:
+        log("no existing configs to back up")
+        return None
+    stamp = time.strftime("bootstrap-replace-%Y%m%d-%H%M%S")
+    dest = CONFIG_DIR / "config_backups" / stamp
+    suffix = 1
+    while dest.exists():
+        suffix += 1
+        dest = dest.with_name(f"{stamp}-{suffix}")
+    dest.mkdir(parents=True)
+    for item in items:
+        shutil.move(str(item), dest / item.name)
+    log(f"backed up {len(items)} item(s) -> {dest}")
+    return dest
+
+
+def install_k2_configs() -> None:
+    src = ROOT / "klipper" / "config" / "k2"
+    if not src.is_dir():
+        raise SystemExit(f"k2 config dir not found: {src}")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, CONFIG_DIR, dirs_exist_ok=True)
+    log(f"copied {src} -> {CONFIG_DIR}")
+
+
+def install_moonraker_asvc() -> None:
+    PRINTER_DATA.mkdir(parents=True, exist_ok=True)
+    asvc = PRINTER_DATA / "moonraker.asvc"
+    asvc.write_text(MOONRAKER_ASVC, encoding="utf-8")
+    log(f"wrote {asvc}")
+
+
+def install_timelapse() -> None:
+    dest = ROOT / "moonraker" / "moonraker" / "components" / "timelapse.py"
+    download(TIMELAPSE_URL, dest)
+    log(f"wrote {dest}")
+
+
+def install_kalico_extras(index: dict | None = None) -> list[Path]:
+    extras_dir = ROOT / "klipper" / "klippy" / "extras"
+    extras_dir.mkdir(parents=True, exist_ok=True)
+
+    index = index or fetch_release_index()
+    extras = index.get("extras")
+    if not isinstance(extras, dict):
+        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain an extras object")
+    manifest_sha256 = extras.get("manifest_sha256")
+    if (
+        not isinstance(manifest_sha256, str)
+        or len(manifest_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in manifest_sha256)
+    ):
+        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a valid extras manifest SHA256")
+
+    manifest_url = object_url(manifest_sha256)
+    manifest = fetch_json_sha256(manifest_url, manifest_sha256)
+    if not isinstance(manifest, dict):
+        raise SystemExit(f"{manifest_url} did not contain an object")
+    if manifest.get("format") != "k2-extras-sha256-v1" or manifest.get("version") != FIRMWARE_VERSION:
+        raise SystemExit(f"{manifest_url} has an unsupported extras manifest format")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise SystemExit(f"{manifest_url} did not contain a files object")
+
+    changed = []
+    for name, meta in sorted(files.items()):
+        if (
+            not isinstance(name, str)
+            or "/" in name
+            or name.startswith(".")
+            or not isinstance(meta, dict)
+            or not isinstance(meta.get("sha256"), str)
+        ):
+            raise SystemExit(f"{manifest_url} contains invalid file metadata")
+        digest = meta["sha256"]
+        dest = extras_dir / name
+        if dest.is_file() and file_sha256(dest) == digest:
+            log(f"{name} already current")
+            continue
+        log(f"installing {name}" if not dest.exists() else f"updating {name}")
+        download_sha256(
+            object_url(digest),
+            dest,
+            digest,
+        )
+        changed.append(dest)
+    return changed
+
+
+
+def verify_cartographer_package() -> None:
+    python = ROOT / "klippy-env" / "bin" / "python"
+    klipper_path = str(ROOT / "klipper")
+    script = (
+        "import sys, importlib; "
+        f"sys.path.insert(0, {klipper_path!r}); "
+        "from klippy import compat; "
+        "compat.install(); "
+        "importlib.import_module('klippy.extras.cartographer'); "
+        "version = importlib.import_module('cartographer.__version__'); "
+        "print(f\"cartographer {version.__version__} from {version.__file__}\")"
+    )
+    run([str(python), "-c", script])
+
+
+PROBE_STACK_BEGIN = "# BEGIN_PROBE_STACK"
+PROBE_STACK_END = "# END_PROBE_STACK"
+PROBE_CONFIG_FILES = ("prtouch.cfg", "cartographer.cfg")
+# mode: (label, active config -> register_as_probe)
+PROBE_MODES = {
+    "carto": (
+        "Cartographer as exclusive probe",
+        {"cartographer.cfg": True},
+    ),
+    "mix": (
+        "Cartographer as primary probe (prtouch still active)",
+        {"cartographer.cfg": True, "prtouch.cfg": False},
+    ),
+    "prtouch": (
+        "prtouch as exclusive probe",
+        {"prtouch.cfg": True},
+    ),
+}
+
+
+def _probe_stack_block(mode: str) -> str:
+    active = PROBE_MODES[mode][1]
+    body = "".join(
+        f"{'' if filename in active else '# '}[include {filename}]\n"
+        for filename in PROBE_CONFIG_FILES
+    )
+    return f"{PROBE_STACK_BEGIN}\n{body}{PROBE_STACK_END}"
+
+
+def _probe_stack_pattern() -> re.Pattern[str]:
+    return re.compile(
+        re.escape(PROBE_STACK_BEGIN) + r"(.*?)" + re.escape(PROBE_STACK_END),
+        re.DOTALL,
+    )
+
+
+def _read_printer_cfg() -> tuple[Path, str]:
+    printer_cfg = CONFIG_DIR / "printer.cfg"
+    if not printer_cfg.is_file():
+        raise SystemExit(f"missing config file: {printer_cfg}")
+    text = printer_cfg.read_text(encoding="utf-8")
+    if not _probe_stack_pattern().search(text):
+        raise SystemExit(
+            f"{printer_cfg} missing {PROBE_STACK_BEGIN} / {PROBE_STACK_END} markers"
+        )
+    return printer_cfg, text
+
+
+def _include_active(block: str, filename: str) -> bool:
+    target = f"[include {filename}]"
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#") and stripped == target:
+            return True
+    return False
+
+
+def _get_rap(path: Path) -> bool | None:
+    if not path.is_file():
+        return None
+    match = re.search(r"^register_as_probe\s*:\s*(\S+)", path.read_text(encoding="utf-8"), re.M)
+    if match is None:
+        return None
+    value = match.group(1).lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _set_rap(path: Path, enabled: bool) -> None:
+    if not path.is_file():
+        raise SystemExit(f"missing config file: {path}")
+    text = path.read_text(encoding="utf-8")
+    new_text, n = re.subn(
+        r"^register_as_probe\s*:.*$",
+        f"register_as_probe: {'True' if enabled else 'False'}",
+        text,
+        count=1,
+        flags=re.M,
+    )
+    if n != 1:
+        raise SystemExit(f"register_as_probe not found in {path}")
+    path.write_text(new_text, encoding="utf-8")
+
+
+def _validate_probe_config(path: Path) -> None:
+    if not path.is_file():
+        raise SystemExit(f"missing config file: {path}")
+    if not re.search(r"^register_as_probe\s*:.*$", path.read_text(encoding="utf-8"), re.M):
+        raise SystemExit(f"register_as_probe not found in {path}")
+
+
+def get_probe_mode() -> str | None:
+    _printer_cfg, text = _read_printer_cfg()
+    match = _probe_stack_pattern().search(text)
+    assert match is not None  # validated by _read_printer_cfg
+    block = match.group(1)
+    active = {
+        filename
+        for filename in PROBE_CONFIG_FILES
+        if _include_active(block, filename)
+    }
+    for mode, (_label, configs) in PROBE_MODES.items():
+        if active == set(configs):
+            return mode
+    return None
+
+
+def _probe_mode_rap_matches(mode: str) -> bool:
+    return all(
+        _get_rap(CONFIG_DIR / filename) is enabled
+        for filename, enabled in PROBE_MODES[mode][1].items()
+    )
+
+
+def _rewrite_probe_stack(mode: str) -> None:
+    printer_cfg, text = _read_printer_cfg()
+    new_text, n = _probe_stack_pattern().subn(_probe_stack_block(mode), text, count=1)
+    if n != 1:
+        raise SystemExit(f"failed to rewrite probe stack markers in {printer_cfg}")
+    printer_cfg.write_text(new_text, encoding="utf-8")
+
+
+def report_probe_mode() -> None:
+    if not CONFIG_DIR.is_dir():
+        raise SystemExit(f"config dir not found: {CONFIG_DIR}")
+    current = get_probe_mode()
+    if current is None:
+        raise SystemExit("could not determine probe mode from printer.cfg probe stack")
+    success(f"Probe mode: {current} — {PROBE_MODES[current][0]}")
+    if not _probe_mode_rap_matches(current):
+        log_warn("register_as_probe flags do not match this stack; re-run with an explicit mode to fix")
+
+
+def set_probe_mode(mode: str) -> None:
+    if mode not in PROBE_MODES:
+        raise SystemExit(f"invalid probe mode {mode!r}; expected one of {tuple(PROBE_MODES)}")
+    if not CONFIG_DIR.is_dir():
+        raise SystemExit(f"config dir not found: {CONFIG_DIR}")
+
+    warning = "Default Cartographer config (applies to carto/mix) expects a 5.8mm Y-endstop spacer; PRTouch does not."
+    if mode == "prtouch":
+        warning += "\n  Remove any Cartographer entries from printer.cfg's SAVE_CONFIG block before using PRTouch."
+    log_warn(warning)
+    label, configs = PROBE_MODES[mode]
+    if get_probe_mode() == mode and _probe_mode_rap_matches(mode):
+        success(f"Already set to {label}")
+        return
+
+    config_updates = [
+        (CONFIG_DIR / filename, enabled)
+        for filename, enabled in configs.items()
+    ]
+    for path, _enabled in config_updates:
+        _validate_probe_config(path)
+
+    log(f"Switching to {label}")
+    _rewrite_probe_stack(mode)
+    for path, enabled in config_updates:
+        _set_rap(path, enabled)
+
+    with step("Restarting Klipper"):
+        service_control("restart", ["klipper"])
+    success(f"Switched to {label}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bootstrap wiped K2 UDISK payload")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--replace",
+        nargs="*",
+        metavar="TARGET",
+        choices=["klipper", "moonraker", "klippy-env", "klipper-env", "moonraker-env", "fluidd", "mainsail", "configs", "helixscreen"],
+        help="delete and recreate managed directories if they already exist (optionally specify targets; configs are moved to config_backups instead of deleted)",
+    )
+    mode.add_argument(
+        "--update",
+        nargs="*",
+        metavar="TARGET",
+        choices=["bootstrap", "extras"],
+        help="update bootstrap and/or changed R2-managed Kalico extras files",
+    )
+    mode.add_argument(
+        "--set-timezone",
+        action="store_true",
+        help="detect timezone from public IP and apply it via timedatectl, then exit",
+    )
+    mode.add_argument(
+        "--add-webcam",
+        action="store_true",
+        help="register the Front webcam with Moonraker, then exit",
+    )
+    mode.add_argument(
+        "--probe",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODE",
+        help="show current probe stack, or set it to carto|mix|prtouch and restart klipper if changed",
+    )
+    args = parser.parse_args()
+
+    def should_run(target: str) -> bool:
+        if args.replace is None or len(args.replace) == 0:
+            return True
+        if target in ("klippy-env", "klipper-env"):
+            return "klippy-env" in args.replace or "klipper-env" in args.replace
+        return target in args.replace
+
+    def should_replace(target: str) -> bool:
+        return args.replace is not None and should_run(target)
+
+    def is_full_run() -> bool:
+        return args.replace is None or len(args.replace) == 0
+
+    if args.set_timezone:
+        require_root()
+        header("K2 Timezone Setup")
+        set_timezone_from_ip()
+        return
+
+    if args.add_webcam:
+        header("K2 Webcam Registration")
+        install_webcam()
+        return
+
+    if args.probe is not None:
+        header("K2 Probe Mode")
+        if args.probe == "":
+            report_probe_mode()
+        elif args.probe not in PROBE_MODES:
+            raise SystemExit(
+                f"invalid probe mode {args.probe!r}; expected one of {tuple(PROBE_MODES)}"
+            )
+        else:
+            set_probe_mode(args.probe)
+        return
+
+    if args.update is not None:
+        update_bootstrap = not args.update or "bootstrap" in args.update
+        update_extras = not args.update or "extras" in args.update
+        index = None
+        bootstrap_changed = False
+        changed = []
+
+        header("K2 Update")
+        if update_bootstrap:
+            require_root()
+            index = fetch_release_index()
+            with step("Updating bootstrap"):
+                bootstrap_changed = install_bootstrap_update(index)
+            if bootstrap_changed and update_extras:
+                log("Relaunching updated bootstrap...")
+                os.execv(sys.argv[0], sys.argv)
+                return
+
+        if update_extras:
+            preflight_update_extras()
+            index = index or fetch_release_index()
+            with step("Updating Kalico extras"):
+                changed = install_kalico_extras(index)
+            if changed:
+                with step("Restarting Klipper"):
+                    service_control("restart", ["klipper"])
+
+        if update_bootstrap and update_extras:
+            if changed:
+                success(f"Updated {len(changed)} Kalico extras file(s)")
+            elif bootstrap_changed:
+                success("Bootstrap updated; Kalico extras already current")
+            else:
+                success("Bootstrap and Kalico extras already current")
+        elif update_bootstrap:
+            success("Bootstrap updated" if bootstrap_changed else "Bootstrap already current")
+        elif changed:
+            success(f"Updated {len(changed)} Kalico extras file(s)")
+        else:
+            success("Kalico extras already current")
+        return
+
+    preflight_bootstrap(replace=args.replace)
+    header("K2 UDISK Bootstrap")
+    replace_helix = args.replace is not None and "helixscreen" in args.replace
+    only_replace_helix = set(args.replace or []) == {"helixscreen"}
+
+    if not only_replace_helix:
+        with step("Stopping services"):
+            service_control("stop", SERVICES_TO_STOP)
+
+    ROOT.mkdir(parents=True, exist_ok=True)
+
+    if is_full_run():
+        with step("Setting timezone"):
+            set_timezone_from_ip()
+
+    if should_run("klipper"):
+        with step("Cloning Kalico (klipper)"):
+            clone_repo(KALICO_REPO, ROOT / "klipper", branch=KALICO_BRANCH, replace=should_replace("klipper"))
+
+        with step("Installing Kalico extras"):
+            install_kalico_extras()
+
+    if should_run("moonraker"):
+        with step("Cloning Moonraker"):
+            cloned = clone_repo(MOONRAKER_REPO, ROOT / "moonraker", branch=None, replace=should_replace("moonraker"))
+            if cloned:
+                install_timelapse()
+
+    if should_run("klippy-env"):
+        with step("Creating klippy venv"):
+            created = create_venv(ROOT / "klippy-env", replace=should_replace("klippy-env"), system_site=True)
+            if created:
+                pip_install_requirements(
+                    ROOT / "klippy-env",
+                    [ROOT / "klipper" / "scripts" / "klippy-requirements.txt"],
+                    CARTOGRAPHER_PACKAGE,
+                )
+
+        with step("Verifying Cartographer install"):
+            verify_cartographer_package()
+
+    if should_run("moonraker-env"):
+        with step("Creating moonraker venv"):
+            created = create_venv(ROOT / "moonraker-env", replace=should_replace("moonraker-env"), system_site=True)
+            if created:
+                pip_install_requirements(
+                    ROOT / "moonraker-env",
+                    [
+                        ROOT / "moonraker" / "scripts" / "moonraker-requirements.txt",
+                        ROOT / "moonraker" / "scripts" / "moonraker-speedups.txt",
+                    ],
+                )
+
+    if should_run("fluidd"):
+        with step("Installing Fluidd"):
+            install_web_ui(FLUIDD_REPO, FLUIDD_ASSET, ROOT / "fluidd", replace=should_replace("fluidd"))
+
+    if should_run("mainsail"):
+        with step("Installing Mainsail"):
+            install_web_ui(MAINSAIL_REPO, MAINSAIL_ASSET, ROOT / "mainsail", replace=should_replace("mainsail"))
+
+    if should_run("configs"):
+        with step("Setting up configs"):
+            if CONFIG_DIR.exists() and not should_replace("configs"):
+                log("configs already exist; skipping setup")
+            else:
+                if should_replace("configs"):
+                    backup_config_dir()
+                install_moonraker_asvc()
+                install_k2_configs()
+
+    if replace_helix:
+        with step("Installing HelixScreen"):
+            install_helixscreen()
+
+    if not only_replace_helix:
+        with step("Starting services"):
+            service_control("start", SERVICES_TO_START)
+
+    if replace_helix:
+        with step("Restarting HelixScreen"):
+            service_control("restart", ["helixscreen"])
+            service_control("restart", ["helixscreen-update.path"])
+
+    if is_full_run() or should_run("moonraker"):
+        with step("Registering webcam"):
+            install_webcam()
+
+    success("Bootstrap complete")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,680 @@
+# Copyright (C) 2026  36573259+Jacob10383@users.noreply.github.com
+# This file may be distributed under the terms of the GNU GPLv3 license.
+# prtouch - K2 nozzle load-cell Z probe (CS1237 + cross-MCU swap endstop)
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import logging
+from statistics import median
+
+from . import probe
+
+_POST_HOME_LIFT = 3.0
+_POST_HOME_LIFT_SPEED = 10.0
+
+
+def _sample_range(values):
+    return max(values) - min(values)
+
+
+def _best_subset(values, size):
+    if len(values) < size:
+        return None
+    values = sorted(values)
+    start = min(
+        range(len(values) - size + 1),
+        key=lambda i: values[i + size - 1] - values[i])
+    return values[start:start + size]
+
+
+def _thermal_z_comp(rate_mm_c, print_temp, touch_temp):
+    """Z shift so a touch at touch_temp is correct when printing at print_temp.
+
+    Hotter nozzle grows toward the bed. Label contact lower by rate*(T_print -
+    T_touch) so that after heating, tip-bed contact lands at z_offset.
+    """
+    return rate_mm_c * (print_temp - touch_temp)
+
+
+class _PRTouchPrinterProbe(probe.PrinterProbe):
+    """PrinterProbe without axis-twist correction for a nozzle probe."""
+
+    def _probe(self, speed, gcmd):
+        epos, is_good = self.probing_move(speed, gcmd)
+        self.gcode.respond_info(
+            "probe at %.3f,%.3f is z=%.6f"
+            % (epos[0], epos[1], epos[2]))
+        return epos[:3], is_good
+
+
+class PRTouchEndstopWrapper:
+    def __init__(self, config):
+        self.config = config
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.ppins = self.printer.lookup_object('pins')
+
+        self.position_endstop = config.getfloat('z_offset')
+        # When true: claim Klipper probe object + probe:z_virtual_endstop.
+        # When false: PRTOUCH_HOME still works; endstop chip is prtouch:.
+        self.register_as_probe = config.getboolean('register_as_probe', True)
+        self.speed = config.getfloat('speed', 5., above=0.)
+        self.lift_speed = config.getfloat('lift_speed', self.speed, above=0.)
+        self.sample_retract_dist = config.getfloat(
+            'sample_retract_dist', 2., above=0.)
+        # Always consume PrinterProbe knobs so they stay valid when
+        # register_as_probe is false (otherwise Klipper errors unused options).
+        self.sample_count = config.getint('samples', 1, minval=1)
+        self.samples_result = config.getchoice(
+            'samples_result', ['median', 'average'], 'average')
+        self.samples_tolerance = config.getfloat(
+            'samples_tolerance', 0.100, minval=0.)
+        self.samples_retries = config.getint(
+            'samples_tolerance_retries', 0, minval=0)
+        self.step_swap_pin = config.get('step_swap_pin', '!PC7')
+        self.pres_swap_pin = config.get('pres_swap_pin', 'nozzle_mcu:PA15')
+        self.pres_cfg_regs = config.getint(
+            'pres_cfg_regs', 60, minval=0, maxval=255)
+        self.pres_tri_hold = config.getintlist(
+            'pres_tri_hold', [4000, 10000, 500], count=3)
+        # Match CS1237 rate from pres_cfg_regs (60 -> 1280 SPS -> 0.78125ms).
+        self.pres_acq_tkms = config.getfloat(
+            'pres_acq_tkms', 0.78125, minval=0.1, maxval=1000.)
+        self.pres_tri_fter = config.getfloatlist(
+            'pres_tri_fter', [5., 1., 0.8], count=3)
+        self.pres_ded_tkms = config.getfloat(
+            'pres_ded_tkms', 128., minval=0., maxval=2000.)
+        # K2: inverted !PC7 is open when nozzle MCU drives idle=1.
+        self.pres_idle_swap_state = config.getint(
+            'pres_idle_swap_state', 1, minval=0, maxval=1)
+        self.pres_release_timeout = config.getfloat(
+            'pres_release_timeout', 0.250, above=0.)
+        self.pres_ack_timeout = config.getfloat(
+            'pres_ack_timeout', 0.250, above=0.)
+        self.pres_rearm_delay = config.getfloat(
+            'pres_rearm_delay', 0.010, minval=0.)
+
+        # PRTOUCH_HOME: multi-sample Z home (same probe / z_offset as G28 Z)
+        self.home_xy = config.getfloatlist('home_xy', (175., 175.), count=2)
+        self.home_samples = config.getint('home_samples', 3, minval=1)
+        self.home_max_samples = config.getint(
+            'home_max_samples', max(10, self.home_samples),
+            minval=self.home_samples)
+        self.home_max_noisy = config.getint('home_max_noisy', 3, minval=0)
+        self.home_sample_range = config.getfloat(
+            'home_sample_range', 0.010, minval=0.)
+        self.home_travel_speed = config.getfloat(
+            'home_travel_speed', 200., above=0.)
+        self.home_z_hop = config.getfloat('home_z_hop', 2., above=0.)
+        # Nozzle/stack growth (mm/°C). Used only when PRTOUCH_HOME PRINT_TEMP= is set.
+        self.thermal_expansion = config.getfloat(
+            'thermal_expansion', 0., minval=0.)
+
+        if config.has_section('stepper_z'):
+            zconfig = config.getsection('stepper_z')
+            self.z_position = zconfig.getfloat(
+                'position_min', 0., note_valid=False)
+        else:
+            pconfig = config.getsection('printer')
+            self.z_position = pconfig.getfloat(
+                'minimum_z_position', 0., note_valid=False)
+
+        # Set by load_config when register_as_probe is true.
+        self._printer_probe = None
+
+        self.pres_cs_pins = []
+        for i in range(8):
+            default_pin = (
+                'nozzle_mcu:PB13, nozzle_mcu:PB14' if i == 0 else None)
+            pin_val = config.get('pres_cs%d_pin' % i, default_pin)
+            if pin_val:
+                self.pres_cs_pins.append(pin_val)
+        if not self.pres_cs_pins:
+            raise config.error("prtouch: at least one pres_csN_pin required")
+
+        self.step_mcu = self.ppins.parse_pin(
+            self.step_swap_pin, True, True)['chip']
+        self.pres_mcu = self.ppins.parse_pin(
+            self.pres_swap_pin, True, True)['chip']
+        self.step_oid = self.step_mcu.create_oid()
+        self.pres_oid = self.pres_mcu.create_oid()
+
+        pin_params = self.ppins.lookup_pin(
+            self.step_swap_pin, can_invert=True, can_pullup=True)
+        self.mcu_endstop = self.step_mcu.setup_pin('endstop', pin_params)
+        self.get_mcu = self.mcu_endstop.get_mcu
+        self.add_stepper = self.mcu_endstop.add_stepper
+        self.get_steppers = self.mcu_endstop.get_steppers
+        self.query_endstop = self.mcu_endstop.query_endstop
+        self.home_wait = self.mcu_endstop.home_wait
+
+        # _armed means both MCUs acked start with err=0 — not "we sent start".
+        self._armed = False
+        self._step_acq_tick = None
+        self._pres_acq_tick = None
+        self._ack_by_source_oid = {}
+        self._last_ack = None
+        self.start_step_cmd = None
+        self.stop_step_cmd = None
+        self.start_pres_cmd = None
+        self.stop_pres_cmd = None
+
+        self.step_mcu.register_config_callback(self._build_step_config)
+        self.pres_mcu.register_config_callback(self._build_pres_config)
+        self.pres_mcu.register_response(
+            lambda params: self._handle_ack('pres', params),
+            'ack_prtouch', self.pres_oid)
+        self.step_mcu.register_response(
+            lambda params: self._handle_ack('step', params),
+            'ack_prtouch', self.step_oid)
+
+        self.printer.register_event_handler(
+            'klippy:mcu_identify', self._handle_mcu_identify)
+        self.printer.register_event_handler(
+            'klippy:shutdown', self._force_disarm)
+        self.printer.register_event_handler(
+            'stepper_enable:motor_off', self._force_disarm)
+
+        self.gcode.register_command(
+            'PRTOUCH_HOME', self.cmd_PRTOUCH_HOME,
+            desc=self.cmd_PRTOUCH_HOME_help)
+        self.gcode.register_command(
+            'PRTOUCH_SCAN_CALIBRATE', self.cmd_PRTOUCH_SCAN_CALIBRATE,
+            desc=self.cmd_PRTOUCH_SCAN_CALIBRATE_help)
+
+        if not self.register_as_probe:
+            # Alternate chip so carto (or another probe) can own "probe".
+            self.ppins.register_chip('prtouch', self)
+            # PrinterProbe normally arms via these; wire them ourselves.
+            self.printer.register_event_handler(
+                'homing:homing_move_begin', self._handle_homing_move_begin)
+            self.printer.register_event_handler(
+                'homing:homing_move_end', self._handle_homing_move_end)
+            self.printer.register_event_handler(
+                'gcode:command_error', self._handle_command_error)
+
+    def _handle_mcu_identify(self):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        for stepper in kin.get_steppers():
+            if stepper.is_active_axis('z'):
+                self.add_stepper(stepper)
+
+    def _handle_ack(self, source, params):
+        oid = params.get('oid')
+        self._last_ack = params
+        if oid is not None:
+            self._ack_by_source_oid[(source, oid)] = params
+        err = params.get('err', 0)
+        if err:
+            logging.warning(
+                "prtouch: %s ack err=%s expar0=%s expar1=%s oid=%s",
+                source, err, params.get('expar0'), params.get('expar1'), oid)
+
+    def _await_ack_ok(self, source, oid, label, expected_expar0):
+        """Block until ack_prtouch for oid arrives with err=0."""
+        key = (source, oid)
+        deadline = self.reactor.monotonic() + self.pres_ack_timeout
+        while True:
+            ack = self._ack_by_source_oid.pop(key, None)
+            if ack is not None:
+                if (
+                        ack.get('expar0', 0) != expected_expar0
+                        or ack.get('expar1', 0) != 0):
+                    continue
+                err = ack.get('err', 0)
+                if err:
+                    raise self.printer.command_error(
+                        "prtouch: %s failed (ack err=%s expar0=%s expar1=%s)"
+                        % (label, err, ack.get('expar0'), ack.get('expar1')))
+                return
+            now = self.reactor.monotonic()
+            if now >= deadline:
+                raise self.printer.command_error(
+                    "prtouch: %s ack timeout" % (label,))
+            self.reactor.pause(min(deadline, now + .005))
+
+    def _run_checked(
+            self, source, cmd, params, oid, label, expected_expar0):
+        """Send a start command and require a clean MCU ack before continuing."""
+        self._ack_by_source_oid.pop((source, oid), None)
+        cmd.send(params)
+        self._await_ack_ok(source, oid, label, expected_expar0)
+
+    def _build_step_config(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        kin_name = str(self.config.getsection('printer').get('kinematics'))
+        is_corexz = kin_name == 'corexz'
+
+        oid_zstp = oid_xstp = oid_ystp = 0
+        for stepper in toolhead.get_kinematics().get_steppers():
+            name = stepper.get_name()
+            if name == 'stepper_z':
+                oid_zstp = stepper.get_oid()
+            elif name == 'stepper_x' and is_corexz:
+                oid_xstp = stepper.get_oid()
+            elif name == 'stepper_z1' and not is_corexz:
+                # Firmware packs secondary Z into x/y OID slots.
+                oid_xstp = stepper.get_oid()
+            elif name == 'stepper_z2' and not is_corexz:
+                oid_ystp = stepper.get_oid()
+
+        if not oid_zstp:
+            logging.warning("prtouch: stepper_z OID not found at config")
+
+        step_swap_pin_num = self.ppins.parse_pin(
+            self.step_swap_pin, True, True)['pin']
+        self.step_mcu.add_config_cmd(
+            'config_prtouch_step oid=%d oid_xstp=%d oid_ystp=%d '
+            'oid_zstp=%d swp_pin=%s'
+            % (self.step_oid, oid_xstp, oid_ystp, oid_zstp, step_swap_pin_num))
+        self.start_step_cmd = self.step_mcu.lookup_command(
+            'start_prtouch_step oid=%c aqc_tick=%u', cq=None)
+        self.stop_step_cmd = self.step_mcu.lookup_command(
+            'stop_prtouch_step oid=%c', cq=None)
+        step_freq = self.step_mcu.get_constant_float('CLOCK_FREQ')
+        self._step_acq_tick = max(
+            1, int(round(self.pres_acq_tkms * .001 * step_freq)))
+
+    def _build_pres_config(self):
+        pres_swap_pin_num = self.ppins.parse_pin(
+            self.pres_swap_pin, True, True)['pin']
+        for idx, pin_str in enumerate(self.pres_cs_pins):
+            pins = [p.strip() for p in pin_str.split(',') if p.strip()]
+            if len(pins) != 2:
+                raise self.printer.config_error(
+                    "prtouch: pres_cs%d_pin must be 'clk_pin, sdo_pin'" % idx)
+            clk_pin = self.ppins.parse_pin(pins[0], True, True)['pin']
+            sdo_pin = self.ppins.parse_pin(pins[1], True, True)['pin']
+            self.pres_mcu.add_config_cmd(
+                'config_prtouch_pres oid=%d idx=%d swp_pin=%s '
+                'clk_pin=%s sdo_pin=%s'
+                % (self.pres_oid, idx, pres_swap_pin_num, clk_pin, sdo_pin))
+
+        self.start_pres_cmd = self.pres_mcu.lookup_command(
+            'start_prtouch_pres oid=%c cfg_regs=%c acq_tick=%u '
+            'ned_tftr=%c ned_hftr=%c ned_lftr=%u min_hold=%i max_hold=%i '
+            'add_hold=%i lmt_dead=%u',
+            cq=None)
+        self.stop_pres_cmd = self.pres_mcu.lookup_command(
+            'stop_prtouch_pres oid=%c sta_swap=%c', cq=None)
+        pres_freq = self.pres_mcu.get_constant_float('CLOCK_FREQ')
+        self._pres_acq_tick = max(
+            1, int(round(self.pres_acq_tkms * .001 * pres_freq)))
+
+    def get_position_endstop(self):
+        return self.position_endstop
+
+    def setup_pin(self, pin_type, pin_params):
+        if pin_type != 'endstop' or pin_params['pin'] != 'z_virtual_endstop':
+            raise self.config.error(
+                "prtouch virtual endstop only useful as endstop pin")
+        if pin_params['invert'] or pin_params['pullup']:
+            raise self.config.error(
+                "Can not pullup/invert prtouch virtual endstop")
+        return self
+
+    def get_status(self, eventtime=None):
+        last = self._last_ack
+        return {
+            'armed': self._armed,
+            'last_ack_err': None if last is None else last.get('err', 0),
+            'last_ack_oid': None if last is None else last.get('oid'),
+        }
+
+    def _query_swap_triggered(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        return bool(self.mcu_endstop.query_endstop(print_time))
+
+    def _wait_for_swap_release(self):
+        deadline = self.reactor.monotonic() + self.pres_release_timeout
+        while True:
+            if not self._query_swap_triggered():
+                return
+            eventtime = self.reactor.monotonic()
+            if eventtime >= deadline:
+                raise self.printer.command_error(
+                    "prtouch: swap endstop did not release after probe")
+            self.reactor.pause(min(deadline, eventtime + .005))
+
+    def _force_disarm(self, print_time=None):
+        self._disarm(swallow=True)
+
+    def _disarm(self, verify_release=False, swallow=False):
+        # Stop pressure (idle swap) before step capture so !PC7 doesn't latch.
+        try:
+            if self.stop_pres_cmd is not None:
+                self.stop_pres_cmd.send(
+                    [self.pres_oid, self.pres_idle_swap_state])
+        except Exception as exc:
+            if not swallow:
+                raise
+            logging.warning(
+                "prtouch: stop_pres during force disarm: %s", exc)
+        finally:
+            try:
+                if self.stop_step_cmd is not None:
+                    self.stop_step_cmd.send([self.step_oid])
+            except Exception as exc:
+                if not swallow:
+                    raise
+                logging.warning(
+                    "prtouch: stop_step during force disarm: %s", exc)
+            finally:
+                self._armed = False
+        if verify_release:
+            self._wait_for_swap_release()
+
+    def _arm(self):
+        """Fail-closed arm: both MCUs must ack start ok, swap must stay idle.
+
+        Probe motion is only allowed after this returns. A send that merely
+        enqueues is not enough — that was the bed-crash footgun.
+        """
+        self._disarm(verify_release=True)
+        if self.pres_rearm_delay:
+            self.reactor.pause(
+                self.reactor.monotonic() + self.pres_rearm_delay)
+
+        ned_tftr = max(0, min(255, int(round(self.pres_tri_fter[0]))))
+        ned_hftr = max(0, min(255, int(round(self.pres_tri_fter[1]))))
+        ned_lftr = max(
+            0, min(0xffffffff, int(round(self.pres_tri_fter[2] * 1000.))))
+        lmt_dead = max(
+            0, int(round(self.pres_ded_tkms / self.pres_acq_tkms)))
+        min_hold, max_hold, add_hold = self.pres_tri_hold
+
+        try:
+            # Step capture first so a swap trigger can't beat the timestamp stream.
+            # Firmware START markers: step=(0, 0), pressure=(0x40, 0).
+            self._run_checked(
+                'step',
+                self.start_step_cmd,
+                [self.step_oid, self._step_acq_tick],
+                self.step_oid, 'start_prtouch_step', 0)
+            self._run_checked(
+                'pres',
+                self.start_pres_cmd,
+                [
+                    self.pres_oid, self.pres_cfg_regs, self._pres_acq_tick,
+                    ned_tftr, ned_hftr, ned_lftr,
+                    min_hold, max_hold, add_hold, lmt_dead,
+                ],
+                self.pres_oid, 'start_prtouch_pres', 0x40)
+            if self._query_swap_triggered():
+                raise self.printer.command_error(
+                    "prtouch: swap endstop asserted after arm — refusing probe")
+        except Exception:
+            self._disarm(swallow=True)
+            raise
+        self._armed = True
+
+    def home_start(self, print_time, sample_time, sample_count, rest_time,
+                   triggered=True):
+        try:
+            return self.mcu_endstop.home_start(
+                print_time, sample_time, sample_count, rest_time, triggered)
+        except Exception:
+            if self._armed:
+                self._disarm()
+            raise
+
+    def probe_prepare(self, hmove):
+        self._arm()
+
+    def probe_finish(self, hmove):
+        if self._armed:
+            self._disarm(verify_release=True)
+
+    def multi_probe_begin(self, always_restore_toolhead=False):
+        pass
+
+    def multi_probe_end(self):
+        if self._armed:
+            self._disarm()
+
+    def _handle_homing_move_begin(self, hmove):
+        if self in hmove.get_mcu_endstops():
+            self.probe_prepare(hmove)
+
+    def _handle_homing_move_end(self, hmove):
+        if self in hmove.get_mcu_endstops():
+            self.probe_finish(hmove)
+
+    def _handle_command_error(self):
+        try:
+            self.multi_probe_end()
+        except Exception:
+            logging.exception("prtouch: multi_probe_end after command error")
+
+    def probing_move(self, pos, speed, gcmd):
+        return self.printer.lookup_object('homing').probing_move(
+            self, pos, speed)
+
+    def _probe_one(self, gcmd):
+        """Single touch sample for PRTOUCH_HOME."""
+        if self._printer_probe is not None:
+            return self._printer_probe.run_probe(gcmd)
+        toolhead = self.printer.lookup_object('toolhead')
+        curtime = self.reactor.monotonic()
+        if 'z' not in toolhead.get_status(curtime)['homed_axes']:
+            raise gcmd.error("prtouch: must home Z before probe")
+        speed = gcmd.get_float('PROBE_SPEED', self.speed, above=0.)
+        pos = toolhead.get_position()
+        pos[2] = self.z_position
+        result = self.probing_move(pos, speed, gcmd)
+        if isinstance(result, tuple) and len(result) == 2:
+            epos = result[0]
+        else:
+            epos = result
+        self.gcode.respond_info(
+            "probe at %.3f,%.3f is z=%.6f" % (epos[0], epos[1], epos[2]))
+        return epos[:3]
+
+    def _multi_sample_probe_z(self, gcmd=None):
+        samples = self.home_samples
+        max_samples = max(self.home_max_samples, samples)
+        max_noisy = self.home_max_noisy
+        sample_range = self.home_sample_range
+        sample_params = {
+            'SAMPLES': '1',
+            'SAMPLES_RESULT': 'median',
+            'SAMPLES_TOLERANCE': '999',
+            'SAMPLES_TOLERANCE_RETRIES': '0',
+        }
+        if gcmd is not None:
+            samples = gcmd.get_int(
+                'SAMPLES', samples, minval=1, maxval=50)
+            max_samples = gcmd.get_int(
+                'MAX_SAMPLES', max(max_samples, samples),
+                minval=samples, maxval=100)
+            max_noisy = gcmd.get_int(
+                'MAX_NOISY', max_noisy, minval=0, maxval=100)
+            sample_range = gcmd.get_float(
+                'SAMPLE_RANGE', sample_range, minval=0., maxval=1.)
+            for key in ('PROBE_SPEED', 'LIFT_SPEED', 'SAMPLE_RETRACT_DIST'):
+                val = gcmd.get(key, None)
+                if val is not None:
+                    sample_params[key] = val
+        window_size = samples + max_noisy
+        sample_gcmd = self.gcode.create_gcode_command(
+            'PRTOUCH_SAMPLE', 'PRTOUCH_SAMPLE', sample_params)
+        collected = []
+        best = None
+        for attempt in range(1, max_samples + 1):
+            epos = self._probe_one(sample_gcmd)
+            collected.append(epos[2])
+            window = collected[-window_size:]
+            if len(window) >= samples:
+                best = _best_subset(window, samples)
+                if best is not None and _sample_range(best) <= sample_range:
+                    break
+            if attempt < max_samples:
+                self._retract_home_sample(sample_gcmd)
+        if best is None or _sample_range(best) > sample_range:
+            raise self.printer.command_error(
+                "prtouch: unable to find %d samples within %.4fmm "
+                "after %d touches"
+                % (samples, sample_range, max_samples))
+        return float(median(best)), collected, best
+
+    def _seed_z_homed_if_needed(self, toolhead):
+        curtime = self.reactor.monotonic()
+        if 'z' in toolhead.get_status(curtime)['homed_axes']:
+            return False
+        zconfig = self.config.getsection('stepper_z')
+        z_max = zconfig.getfloat('position_max')
+        pos = toolhead.get_position()
+        pos[2] = z_max - 10.
+        toolhead.set_position(pos, homing_axes='z')
+        return True
+
+    def _lookup_scan_calibrate_macro(self):
+        carto = self.printer.lookup_object('cartographer', None)
+        if carto is None:
+            return None
+        for reg in getattr(carto, 'macros', []):
+            macro = getattr(reg, 'macro', None)
+            if (
+                    macro is not None
+                    and type(macro).__name__ == 'ScanCalibrateMacro'
+                    and hasattr(macro, '_calibrate')):
+                return macro
+        return None
+
+    def _establish_nozzle_z_zero(self, gcmd=None):
+        toolhead = self.printer.lookup_object('toolhead')
+        self._seed_z_homed_if_needed(toolhead)
+        pos = toolhead.get_position()
+        if pos[2] < self.sample_retract_dist:
+            toolhead.manual_move(
+                [None, None, self.sample_retract_dist], self.lift_speed)
+            toolhead.wait_moves()
+        trigger_z, _collected, best = self._multi_sample_probe_z(gcmd)
+        toolhead.get_last_move_time()
+        pos = toolhead.get_position()
+        pos[2] = pos[2] - trigger_z + self.position_endstop
+        toolhead.set_position(pos, homing_axes='z')
+        return trigger_z, best
+
+    cmd_PRTOUCH_HOME_help = (
+        "Multi-sample Z home with the nozzle probe "
+        "(more accurate than a single G28 Z touch). "
+        "Optional PRINT_TEMP applies thermal_expansion compensation.")
+
+    cmd_PRTOUCH_SCAN_CALIBRATE_help = (
+        "Calibrate Cartographer scan model using prtouch for nozzle Z=0. "
+        "Requires cartographer. Optional MODEL=default.")
+
+    def _get_extruder_temp(self):
+        pheaters = self.printer.lookup_object('heaters')
+        heater = pheaters.lookup_heater('extruder')
+        temp, _target = heater.get_temp(self.reactor.monotonic())
+        return float(temp)
+
+    def cmd_PRTOUCH_SCAN_CALIBRATE(self, gcmd):
+        macro = self._lookup_scan_calibrate_macro()
+        if macro is None:
+            raise gcmd.error(
+                "prtouch: cartographer ScanCalibrateMacro not loaded")
+        toolhead = self.printer.lookup_object('toolhead')
+        curtime = self.reactor.monotonic()
+        homed = toolhead.get_status(curtime)['homed_axes']
+        if 'x' not in homed or 'y' not in homed:
+            raise gcmd.error(
+                "prtouch: must home X/Y before PRTOUCH_SCAN_CALIBRATE")
+        model = gcmd.get('MODEL', 'default').strip().lower()
+        zrp = macro._config.bed_mesh.zero_reference_position
+        travel = macro._config.general.travel_speed
+        toolhead.manual_move([zrp[0], zrp[1], None], travel)
+        toolhead.wait_moves()
+        trigger_z, best = self._establish_nozzle_z_zero(gcmd)
+        gcmd.respond_info(
+            "prtouch: nozzle Z=%.4f (median=%.4f range=%.4f); "
+            "running carto scan calibrate"
+            % (self.position_endstop, trigger_z, _sample_range(best)))
+        macro._calibrate(model)
+        self.gcode.run_script_from_command('SAVE_CONFIG RESTART=0')
+
+    def cmd_PRTOUCH_HOME(self, gcmd):
+        toolhead = self.printer.lookup_object('toolhead')
+        curtime = self.reactor.monotonic()
+        homed = toolhead.get_status(curtime)['homed_axes']
+        if 'x' not in homed or 'y' not in homed:
+            raise gcmd.error("prtouch: must home X/Y before PRTOUCH_HOME")
+
+        travel_speed = gcmd.get_float(
+            'TRAVEL_SPEED', self.home_travel_speed, above=0.)
+        z_hop = gcmd.get_float('Z_HOP', self.home_z_hop, above=0.)
+        print_temp = gcmd.get_float('PRINT_TEMP', None, minval=0.)
+
+        thermal_comp = 0.
+        touch_temp = None
+        if print_temp is not None:
+            if self.thermal_expansion <= 0.:
+                raise gcmd.error(
+                    "prtouch: PRINT_TEMP requires thermal_expansion "
+                    "in [prtouch] config")
+            touch_temp = self._get_extruder_temp()
+            thermal_comp = _thermal_z_comp(
+                self.thermal_expansion, print_temp, touch_temp)
+
+        z_was_unhomed = 'z' not in homed
+        try:
+            if z_was_unhomed:
+                self._seed_z_homed_if_needed(toolhead)
+
+            pos = toolhead.get_position()
+            toolhead.manual_move(
+                [None, None, pos[2] + z_hop], travel_speed)
+            toolhead.manual_move(
+                [self.home_xy[0], self.home_xy[1], None], travel_speed)
+            toolhead.wait_moves()
+
+            trigger_z, collected, best = self._multi_sample_probe_z(gcmd)
+            toolhead.get_last_move_time()
+            pos = toolhead.get_position()
+            # Contact becomes z_offset - thermal_comp so hotter print tip
+            # lands at z_offset after nozzle growth.
+            pos[2] = (
+                pos[2] - trigger_z + self.position_endstop - thermal_comp)
+        finally:
+            if z_was_unhomed:
+                toolhead.get_kinematics().clear_homing_state('z')
+
+        toolhead.set_position(pos, homing_axes='z')
+        pos = toolhead.get_position()
+        pos[2] = _POST_HOME_LIFT
+        toolhead.manual_move([None, None, pos[2]], _POST_HOME_LIFT_SPEED)
+        toolhead.wait_moves()
+        gcode_move = self.printer.lookup_object('gcode_move', None)
+        if gcode_move is not None:
+            gcode_move.reset_last_position()
+        msg = (
+            "prtouch: Z home at (%.3f, %.3f) z=%.4f "
+            "(median=%.4f range=%.4f attempts=%d)"
+            % (pos[0], pos[1], self.position_endstop - thermal_comp,
+               trigger_z, _sample_range(best), len(collected)))
+        if print_temp is not None:
+            msg += (
+                " thermal=%.4fmm (touch=%.1fC print=%.1fC rate=%.6fmm/C)"
+                % (thermal_comp, touch_temp, print_temp,
+                   self.thermal_expansion))
+        gcmd.respond_info(msg)
+
+    def _retract_home_sample(self, gcmd):
+        retract = gcmd.get_float(
+            'SAMPLE_RETRACT_DIST', self.sample_retract_dist, above=0.)
+        lift_speed = gcmd.get_float('LIFT_SPEED', self.lift_speed, above=0.)
+        toolhead = self.printer.lookup_object('toolhead')
+        pos = toolhead.get_position()
+        toolhead.manual_move([None, None, pos[2] + retract], lift_speed)
+
+
+def load_config(config):
+    prtouch = PRTouchEndstopWrapper(config)
+    if prtouch.register_as_probe:
+        pprobe = _PRTouchPrinterProbe(config, prtouch)
+        config.get_printer().add_object('probe', pprobe)
+        prtouch._printer_probe = pprobe
+    return prtouch

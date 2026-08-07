@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026  36573259+Jacob10383@users.noreply.github.com
+# This file may be distributed under the terms of the GNU GPLv3 license.
+"""
+K2 UDISK environment slot manager.
+
+Swaps /mnt/UDISK contents between two named environment slots
+('stock' and 'custom') with idempotent file moves and an atomic
+U-Boot env write.
+
+Usage:
+    swap                # swap to the other environment
+    swap status         # show running env and available slots
+"""
+
+from __future__ import annotations
+
+import argparse
+import binascii
+import datetime
+import hashlib
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+UDISK = Path("/mnt/UDISK")
+SLOTS_DIR = UDISK / ".slots"
+ENV_SIZE = 0x20000
+ENV_DEVICES = {
+    "p2": Path("/dev/mmcblk0p2"),
+    "p3": Path("/dev/mmcblk0p3"),
+}
+ENV_SNAPSHOT_FILE = "env.bin"
+PROTECTED_SLOT_FILES = {ENV_SNAPSHOT_FILE}
+MANAGED_UDISK_NAMES = {".slots", ".install", ".k2-custom-root-overlay"}
+
+SERVICE_TARGETS = [
+    {"name": "helixscreen", "systemd": ["helixscreen"], "init": []},
+    {"name": "moonraker", "systemd": ["moonraker"], "init": ["moonraker"]},
+    {"name": "klipper", "systemd": ["klipper"], "init": ["klipper"]},
+    {"name": "klipper-mcu", "systemd": ["klipper-mcu"], "init": ["klipper_mcu"]},
+    {"name": "webrtc", "systemd": [], "init": ["webrtc"]},
+    {"name": "app", "systemd": [], "init": ["app"]},
+    {"name": "device_manager", "systemd": [], "init": ["device_manager"]},
+]
+UDISK_WRITER_PROCESSES = [
+    "device_manager",
+    "cam_app",
+    "webrtc_local",
+    "webrtc",
+    "master-server",
+    "audio-server",
+    "wifi-server",
+    "app-server",
+    "display-server",
+    "upgrade-server",
+    "web-server",
+    "Monitor",
+    "helix-screen",
+    "helix-splash",
+    "helix-watchdog",
+    "moonraker.py",
+    "klippy.py",
+    "wpa_supplicant",
+]
+
+CUSTOM_ROOTFS_SENTINEL = Path("/etc/.k2_custom")
+CUSTOM_KERNEL_MARKER = "-k2jt"
+
+PARTITION_PAIRS = {
+    "A": {"root": "/dev/mmcblk0p6", "boot_env": "bootA", "root_env": "rootfsA"},
+    "B": {"root": "/dev/mmcblk0p7", "boot_env": "bootB", "root_env": "rootfsB"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def header(message: str) -> None:
+    print(f"\n\033[1m{message}\033[0m", flush=True)
+
+
+def section(message: str) -> None:
+    print(f"\n\033[1;36m==> {message}\033[0m", flush=True)
+
+
+def log(message: str) -> None:
+    print(f"  {message}", flush=True)
+
+
+def log_warn(message: str) -> None:
+    print(f"  \033[33m{message}\033[0m", flush=True)
+
+
+def success(message: str) -> None:
+    print(f"\n\033[1;32m{message}\033[0m", flush=True)
+
+
+@contextmanager
+def step(title: str):
+    section(title)
+    yield
+
+
+def read_fw_env(key: str) -> str | None:
+    result = subprocess.run(
+        ["fw_printenv", key],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip()
+    prefix = f"{key}="
+    if not line.startswith(prefix):
+        return None
+    return line[len(prefix):]
+
+
+# ---------------------------------------------------------------------------
+# Precondition checks
+# ---------------------------------------------------------------------------
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("run this as root on the K2")
+
+
+def ignore_sighup() -> None:
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def require_udisk() -> None:
+    if not UDISK.is_dir():
+        raise SystemExit(f"{UDISK} does not exist")
+    if not os.path.ismount(UDISK):
+        raise SystemExit(f"{UDISK} is not a mountpoint")
+    probe = UDISK / ".swap-write-test"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise SystemExit(f"{UDISK} is not writable: {exc}") from exc
+
+
+def service_control(action: str, targets: list[dict[str, list[str] | str]]) -> None:
+    for target in targets:
+        handled = False
+        if shutil.which("systemctl"):
+            for unit in target["systemd"]:
+                result = subprocess.run(
+                    ["systemctl", action, unit],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode == 0:
+                    handled = True
+                    break
+
+        for svc in target["init"]:
+            init_script = Path("/etc/init.d") / svc
+            if not init_script.exists():
+                continue
+            result = subprocess.run(
+                [str(init_script), action],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                handled = True
+                break
+
+        if handled:
+            log(f"{action}ed {target['name']}")
+
+
+def quiet_udisk_writers() -> None:
+    try:
+        os.chdir("/")
+    except OSError:
+        pass
+
+    service_control("stop", SERVICE_TARGETS)
+
+    for name in UDISK_WRITER_PROCESSES:
+        result = subprocess.run(
+            ["killall", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            log(f"killed {name}")
+
+    subprocess.run(["sync"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment detection
+# ---------------------------------------------------------------------------
+
+def detect_rootfs_env() -> str:
+    """'custom' if /etc/.k2_custom exists, else 'stock'."""
+    return "custom" if CUSTOM_ROOTFS_SENTINEL.exists() else "stock"
+
+
+def detect_kernel_env() -> str:
+    """'custom' if running kernel carries the -k2jt marker, else 'stock'."""
+    return "custom" if CUSTOM_KERNEL_MARKER in os.uname().release else "stock"
+
+
+def detect_running_env() -> str:
+    """Return the running env only if kernel and rootfs agree; else abort."""
+    rootfs_env = detect_rootfs_env()
+    kernel_env = detect_kernel_env()
+    if rootfs_env != kernel_env:
+        raise SystemExit(
+            f"DESYNC: kernel is '{kernel_env}' (uname={os.uname().release}) but "
+            f"rootfs is '{rootfs_env}' (sentinel {CUSTOM_ROOTFS_SENTINEL}"
+            f"{' present' if CUSTOM_ROOTFS_SENTINEL.exists() else ' absent'}).\n"
+            f"  Refusing to swap. Restore a matching raw U-Boot env snapshot "
+            f"for the boot/rootfs partition pair, then reboot."
+        )
+    return rootfs_env
+
+
+def detect_active_slot() -> str:
+    """Return 'A' or 'B' based on /proc/cmdline root=."""
+    with open("/proc/cmdline") as f:
+        cmdline = f.read()
+    if "root=/dev/mmcblk0p6" in cmdline:
+        return "A"
+    if "root=/dev/mmcblk0p7" in cmdline:
+        return "B"
+    raise SystemExit("cannot determine active partition slot from /proc/cmdline")
+
+
+def firmware_label(env_name: str) -> str:
+    if env_name == "stock":
+        version = read_fw_env("version")
+        return f"Creality firmware {version}" if version else "Creality firmware"
+    return "Jacobean's firmware"
+
+
+def confirm_swap(from_slot: str, from_partition_slot: str, to_slot: str, to_partition_slot: str) -> None:
+    print()
+    log(
+        f"You are running {firmware_label(from_slot)} on "
+        f"rootfs{from_partition_slot} and boot{from_partition_slot}."
+    )
+    log(
+        f"This will switch the printer to {firmware_label(to_slot)} on "
+        f"the other slot (rootfs{to_partition_slot} / boot{to_partition_slot})."
+    )
+    log("If you proceed, the printer will prepare the swap and reboot automatically.")
+
+    try:
+        answer = input("\nContinue? [y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+
+    if answer not in {"y", "yes"}:
+        raise SystemExit("swap cancelled")
+
+
+def reboot_device() -> None:
+    section("Rebooting")
+    subprocess.run(["sync"], check=True)
+    subprocess.run(["reboot"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# Raw U-Boot env snapshots
+# ---------------------------------------------------------------------------
+
+def env_crc(blob: bytes | bytearray) -> int:
+    return binascii.crc32(blob[5:]) & 0xFFFFFFFF
+
+
+def parse_env_blob(blob: bytes) -> dict:
+    if len(blob) != ENV_SIZE:
+        raise ValueError(f"env blob is {len(blob)} bytes, expected {ENV_SIZE}")
+    stored_crc = struct.unpack("<I", blob[:4])[0]
+    computed_crc = env_crc(blob)
+    values = {}
+    for raw in blob[5:].split(b"\0"):
+        if not raw:
+            break
+        text = raw.decode(errors="replace")
+        if "=" in text:
+            key, value = text.split("=", 1)
+            values[key] = value
+    return {
+        "stored_crc": f"{stored_crc:08x}",
+        "computed_crc": f"{computed_crc:08x}",
+        "valid_crc": stored_crc == computed_crc,
+        "flag": blob[4],
+        "values": values,
+        "sha256": hashlib.sha256(blob).hexdigest(),
+    }
+
+
+def env_entries(blob: bytes) -> list[tuple[str, str]]:
+    entries = []
+    for raw in blob[5:].split(b"\0"):
+        if not raw:
+            break
+        text = raw.decode(errors="replace")
+        if "=" in text:
+            key, value = text.split("=", 1)
+            entries.append((key, value))
+    return entries
+
+
+def env_summary(device: str, info: dict) -> dict:
+    values = info["values"]
+    return {
+        "device": device,
+        "sha256": info["sha256"],
+        "flag": info["flag"],
+        "valid_crc": info["valid_crc"],
+        "boot_partition": values.get("boot_partition"),
+        "root_partition": values.get("root_partition"),
+        "loglevel": values.get("loglevel"),
+    }
+
+
+def require_partition_slot(partition_slot: str, label: str) -> str:
+    if partition_slot not in PARTITION_PAIRS:
+        raise SystemExit(f"{label} has unknown partition slot '{partition_slot}'")
+    return partition_slot
+
+
+def env_validation_problems(info: dict, partition_slot: str) -> list[str]:
+    partition_slot = require_partition_slot(partition_slot, "env validation")
+    pair = PARTITION_PAIRS[partition_slot]
+    values = info["values"]
+    problems = []
+    if not info["valid_crc"]:
+        problems.append(
+            f"CRC invalid stored={info['stored_crc']} computed={info['computed_crc']}"
+        )
+    if values.get("boot_partition") != pair["boot_env"]:
+        problems.append(
+            f"boot_partition={values.get('boot_partition')!r}, "
+            f"expected {pair['boot_env']!r}"
+        )
+    if values.get("root_partition") != pair["root_env"]:
+        problems.append(
+            f"root_partition={values.get('root_partition')!r}, "
+            f"expected {pair['root_env']!r}"
+        )
+    return problems
+
+
+def validate_env_info(info: dict, partition_slot: str, label: str) -> None:
+    problems = env_validation_problems(info, partition_slot)
+    if problems:
+        raise SystemExit(f"{label} env validation failed: " + "; ".join(problems))
+
+
+def read_env_device(name: str) -> bytes:
+    with ENV_DEVICES[name].open("rb") as f:
+        blob = f.read(ENV_SIZE)
+    if len(blob) != ENV_SIZE:
+        raise SystemExit(f"short read from {ENV_DEVICES[name]}: {len(blob)} bytes")
+    return blob
+
+
+def write_env_device(name: str, blob: bytes) -> None:
+    info = parse_env_blob(blob)
+    if not info["valid_crc"]:
+        raise SystemExit(f"refusing to write invalid env blob to {ENV_DEVICES[name]}")
+    with ENV_DEVICES[name].open("r+b") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def write_blob_file(path: Path, blob: bytes) -> None:
+    with path.open("wb") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_env_blobs() -> tuple[dict[str, bytes], dict[str, dict]]:
+    blobs = {}
+    infos = {}
+    for name in ENV_DEVICES:
+        blob = read_env_device(name)
+        blobs[name] = blob
+        infos[name] = parse_env_blob(blob)
+    return blobs, infos
+
+
+def select_current_env(infos: dict[str, dict], label: str) -> tuple[str, dict]:
+    valid = {
+        name: info
+        for name, info in infos.items()
+        if info["valid_crc"]
+    }
+    if not valid:
+        raise SystemExit(f"{label} has no CRC-valid env sectors")
+    if len(valid) == 1:
+        name = next(iter(valid))
+        return name, valid[name]
+
+    p2 = valid["p2"]
+    p3 = valid["p3"]
+    if p2["flag"] == p3["flag"]:
+        return "p2", p2  # U-Boot convention: p2 tiebreaker
+    diff = (p2["flag"] - p3["flag"]) & 0xFF
+    return ("p2", p2) if diff < 128 else ("p3", p3)
+
+
+def inactive_env_device(current_device: str) -> str:
+    if current_device == "p2":
+        return "p3"
+    if current_device == "p3":
+        return "p2"
+    raise SystemExit(f"unknown env device '{current_device}'")
+
+
+def build_env_blob(source_blob: bytes, updates: dict[str, str], label: str) -> bytes:
+    seen = set()
+    rebuilt = bytearray()
+    for key, value in env_entries(source_blob):
+        if key in updates:
+            value = updates[key]
+        seen.add(key)
+        rebuilt.extend(f"{key}={value}".encode())
+        rebuilt.append(0)
+
+    for key, value in updates.items():
+        if key not in seen:
+            rebuilt.extend(f"{key}={value}".encode())
+            rebuilt.append(0)
+
+    rebuilt.append(0)
+    payload_size = ENV_SIZE - 5
+    if len(rebuilt) > payload_size:
+        raise SystemExit(f"{label} env does not fit in {ENV_SIZE:#x} bytes")
+
+    data = bytearray(ENV_SIZE)
+    data[4] = source_blob[4]
+    data[5:5 + len(rebuilt)] = rebuilt
+    data[:4] = struct.pack("<I", env_crc(data))
+    return bytes(data)
+
+
+def normalize_env_for_slot(source_blob: bytes, partition_slot: str, label: str) -> tuple[bytes, dict]:
+    partition_slot = require_partition_slot(partition_slot, label)
+    pair = PARTITION_PAIRS[partition_slot]
+    source_info = parse_env_blob(source_blob)
+    if not source_info["valid_crc"]:
+        raise SystemExit(f"{label} source env has invalid CRC")
+    for key in ("boot_partition", "root_partition"):
+        if key not in source_info["values"]:
+            raise SystemExit(f"{label} source env is missing {key}")
+
+    normalized = build_env_blob(
+        source_blob,
+        {
+            "boot_partition": pair["boot_env"],
+            "root_partition": pair["root_env"],
+        },
+        label,
+    )
+    info = parse_env_blob(normalized)
+    validate_env_info(info, partition_slot, f"{label} normalized env")
+    return normalized, info
+
+
+def next_env_flag(current_flag: int) -> int:
+    return (current_flag + 1) & 0xFF
+
+
+def set_env_flag(blob: bytes, flag: int) -> bytes:
+    data = bytearray(blob)
+    data[4] = flag & 0xFF
+    data[:4] = struct.pack("<I", env_crc(data))
+    return bytes(data)
+
+
+def build_current_env_blob(
+    source_blob: bytes,
+    current_flag: int,
+    partition_slot: str,
+    label: str,
+) -> tuple[bytes, dict]:
+    updated, _normalized_info = normalize_env_for_slot(source_blob, partition_slot, label)
+    updated = set_env_flag(updated, next_env_flag(current_flag))
+    info = parse_env_blob(updated)
+    validate_env_info(info, partition_slot, f"{label} generated env")
+    return updated, info
+
+
+def write_new_current_env(
+    source_blob: bytes,
+    partition_slot: str,
+    label: str,
+) -> tuple[str, dict]:
+    _live_blobs, live_infos = read_env_blobs()
+    current_device, current_info = select_current_env(live_infos, f"{label} live env")
+    target_device = inactive_env_device(current_device)
+    target_blob, target_info = build_current_env_blob(
+        source_blob,
+        current_info["flag"],
+        partition_slot,
+        label,
+    )
+    write_env_device(target_device, target_blob)
+    subprocess.run(["sync"], check=True)
+    return target_device, target_info
+
+
+def verify_boot_env(partition_slot: str) -> None:
+    _blobs, infos = read_env_blobs()
+    _current_device, current_info = select_current_env(infos, "boot env verification")
+    validate_env_info(current_info, partition_slot, "boot env verification")
+
+
+# ---------------------------------------------------------------------------
+# Slot env helpers
+# ---------------------------------------------------------------------------
+
+def capture_env_to_slot(
+    slot_dir: Path,
+    env_type: str,
+    partition_slot: str,
+) -> tuple[str, dict]:
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    partition_slot = require_partition_slot(partition_slot, f"{env_type} live env")
+    blobs, infos = read_env_blobs()
+    current_device, current_info = select_current_env(infos, f"{env_type} live env")
+    normalized, normalized_info = normalize_env_for_slot(
+        blobs[current_device],
+        partition_slot,
+        f"{env_type} {current_device}",
+    )
+    write_blob_file(slot_dir / ENV_SNAPSHOT_FILE, normalized)
+    subprocess.run(["sync"], check=True)
+    return current_device, normalized_info
+
+
+def partition_slot_from_env(info: dict) -> str:
+    bp = info["values"].get("boot_partition")
+    rp = info["values"].get("root_partition")
+    for slot, pair in PARTITION_PAIRS.items():
+        if pair["boot_env"] == bp and pair["root_env"] == rp:
+            return slot
+    raise SystemExit(f"env has unrecognized partition pair {bp}/{rp}")
+
+
+def load_slot_env(slot_dir: Path, slot_name: str) -> tuple[bytes, dict, str]:
+    path = slot_dir / ENV_SNAPSHOT_FILE
+    if not path.exists():
+        raise SystemExit(f"slot '{slot_name}' is missing env snapshot {path.name}")
+    blob = path.read_bytes()
+    info = parse_env_blob(blob)
+    partition_slot = partition_slot_from_env(info)
+    validate_env_info(info, partition_slot, f"{slot_name} env")
+    return blob, info, partition_slot
+
+
+def restore_slot_env(slot_name: str) -> dict:
+    slot_dir = SLOTS_DIR / slot_name
+    blob, _info, partition_slot = load_slot_env(slot_dir, slot_name)
+    target_device, target_info = write_new_current_env(
+        blob,
+        partition_slot,
+        slot_name,
+    )
+    verify_boot_env(partition_slot)
+    return env_summary(target_device, target_info)
+
+
+# ---------------------------------------------------------------------------
+# Live entry enumeration
+# ---------------------------------------------------------------------------
+
+def gather_live_entries() -> list[Path]:
+    """Return top-level UDISK entries that are eligible to be moved."""
+    return [
+        entry for entry in sorted(UDISK.iterdir())
+        if entry.name not in MANAGED_UDISK_NAMES
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Idempotent single-entry move helper
+# ---------------------------------------------------------------------------
+
+def move_entry_to_dir(src: Path, dest_dir: Path) -> None:
+    """Move src into dest_dir. Skip if destination already exists (idempotent)."""
+    dest = dest_dir / src.name
+    if dest.exists() or dest.is_symlink():
+        log_warn(f"skipping {src.name} — already at destination")
+        return
+    log(f"moving {src.name}")
+    shutil.move(str(src), str(dest_dir))
+
+
+def preflight_archive_moves(entries: list[Path], slot_dir: Path) -> None:
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    problems = []
+    for entry in entries:
+        if entry.is_mount():
+            problems.append(f"{entry.name} is a mountpoint")
+    if problems:
+        raise SystemExit("live archive preflight failed: " + "; ".join(problems))
+
+
+# ---------------------------------------------------------------------------
+# Archive / restore
+# ---------------------------------------------------------------------------
+
+def archive_live_to_slot(slot_name: str) -> None:
+    slot_dir = SLOTS_DIR / slot_name
+    partition_slot = detect_active_slot()
+    entries = gather_live_entries()
+    if not entries:
+        log("nothing to archive (UDISK root is empty)")
+    preflight_archive_moves(entries, slot_dir)
+    for entry in entries:
+        move_entry_to_dir(entry, slot_dir)
+    # Capture env last as commit
+    capture_env_to_slot(slot_dir, slot_name, partition_slot)
+
+
+def restore_slot_to_live(slot_name: str) -> None:
+    slot_dir = SLOTS_DIR / slot_name
+    entries = [
+        e for e in sorted(slot_dir.iterdir())
+        if e.name not in PROTECTED_SLOT_FILES
+    ]
+    if not entries:
+        log(f"slot '{slot_name}' is empty")
+    for entry in entries:
+        move_entry_to_dir(entry, UDISK)
+    subprocess.run(["sync"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    require_root()
+    require_udisk()
+
+    kernel = os.uname().release
+    kernel_env = detect_kernel_env()
+    rootfs_env = detect_rootfs_env()
+    try:
+        active_slot = detect_active_slot()
+    except SystemExit:
+        active_slot = "?"
+
+    header("Swap status")
+    print()
+    print(f"  Kernel              : {kernel}  \033[1m[{kernel_env}]\033[0m")
+    print(
+        f"  Rootfs sentinel     : {CUSTOM_ROOTFS_SENTINEL} "
+        f"{'present' if CUSTOM_ROOTFS_SENTINEL.exists() else 'absent'}  "
+        f"\033[1m[{rootfs_env}]\033[0m"
+    )
+    print(f"  Active partition    : slot {active_slot}")
+    if kernel_env != rootfs_env:
+        print(
+            f"  \033[1;31mDESYNC\033[0m  kernel={kernel_env} rootfs={rootfs_env} — "
+            f"swap disabled until realigned"
+        )
+    else:
+        print(f"  Running environment : \033[1;32m{kernel_env}\033[0m")
+
+    if not SLOTS_DIR.exists():
+        print("\n  No slots available.")
+        print()
+        return
+
+    print()
+    for entry in sorted(SLOTS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        slot_dir = entry
+        env_path = slot_dir / ENV_SNAPSHOT_FILE
+        if env_path.exists():
+            try:
+                _blob, info, partition_slot = load_slot_env(slot_dir, slot_dir.name)
+                crc = "ok" if info["valid_crc"] else "bad-crc"
+                boot = info["values"].get("boot_partition", "?")
+                root = info["values"].get("root_partition", "?")
+                flag = info["flag"]
+                mtime = datetime.datetime.fromtimestamp(
+                    env_path.stat().st_mtime
+                ).isoformat(timespec="seconds")
+                print(
+                    f"  \033[1m{slot_dir.name}\033[0m  partition={partition_slot}  "
+                    f"env={crc}  flag={flag}  {boot}/{root}  archived={mtime}"
+                )
+            except SystemExit as exc:
+                print(f"  \033[1m{slot_dir.name}\033[0m  \033[31merror: {exc}\033[0m")
+        else:
+            print(f"  \033[1m{slot_dir.name}\033[0m  (no env.bin)")
+    print()
+
+
+def cmd_swap(args: argparse.Namespace) -> None:
+    require_root()
+    require_udisk()
+
+    from_slot = detect_running_env()
+    from_partition_slot = detect_active_slot()
+
+    to_slot = "custom" if from_slot == "stock" else "stock"
+    target_dir = SLOTS_DIR / to_slot
+    if not target_dir.exists():
+        raise SystemExit(
+            f"slot '{to_slot}' does not exist at {target_dir}. "
+            f"Run install.py to set up {firmware_label(to_slot)} first."
+        )
+    if not (target_dir / ENV_SNAPSHOT_FILE).exists():
+        raise SystemExit(
+            f"slot '{to_slot}' exists but is missing env.bin — may be corrupt. "
+            f"Run install.py to reinitialize."
+        )
+
+    _to_blob, _to_info, to_partition_slot = load_slot_env(target_dir, to_slot)
+
+    if not args.yes:
+        confirm_swap(from_slot, from_partition_slot, to_slot, to_partition_slot)
+    header(f"Swap: {from_slot} -> {to_slot}")
+
+    with step("Stopping UDISK writers"):
+        quiet_udisk_writers()
+
+    with step(f"Archiving live environment to slot '{from_slot}'"):
+        archive_live_to_slot(from_slot)
+
+    with step(f"Restoring slot '{to_slot}' to live"):
+        restore_slot_to_live(to_slot)
+
+    with step(f"Restoring U-Boot env snapshot for '{to_slot}'"):
+        restore_slot_env(to_slot)
+
+    success("Swap complete")
+    if not args.no_reboot:
+        time.sleep(2)
+        reboot_device()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="swap",
+        description="K2 UDISK environment slot manager",
+    )
+    parser.add_argument(
+        "--no-reboot",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("status", help="show running env and available slots")
+    args = parser.parse_args()
+
+    ignore_sighup()
+
+    if args.command == "status":
+        cmd_status(args)
+    else:
+        cmd_swap(args)
+
+
+if __name__ == "__main__":
+    main()
