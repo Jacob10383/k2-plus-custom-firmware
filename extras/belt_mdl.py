@@ -14,7 +14,6 @@ MODULE_ALIASES = {"x": "x", "y": "y", "mdlx": "x", "mdly": "y"}
 UNINITIALIZED_WORD = b"\xff\xff\xff\xff"
 FLASH_WORDS = 3
 MAX_MOVE_UNITS = 0xFFFE
-MIN_CALIBRATION_ADC_SPAN = 50000
 RECOMMENDED_CALIBRATION_ADC_SPAN = 100000
 SETTLE_CENTER = 175.0
 SETTLE_ENVELOPE = 350.0
@@ -43,11 +42,6 @@ def _unpack_i32(data):
 def calibration_line(low_adc, high_adc, low_tension, high_tension):
     if not low_adc or not high_adc:
         raise ValueError("calibration ADC anchors must be nonzero")
-    if abs(high_adc - low_adc) < MIN_CALIBRATION_ADC_SPAN:
-        raise ValueError(
-            "calibration ADC span %d is below required %d"
-            % (abs(high_adc - low_adc), MIN_CALIBRATION_ADC_SPAN)
-        )
     slope = (high_tension - low_tension) / (high_adc - low_adc)
     return slope, low_tension - slope * low_adc
 

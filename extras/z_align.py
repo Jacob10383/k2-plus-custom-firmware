@@ -36,7 +36,7 @@ from .motor_control import MOTOR_COMMAND_TIMEOUT
 
 
 def _klog(msg, *args, level=logging.info):
-    level("z prep: " + msg, *args)
+    level("z_align: " + msg, *args)
 
 
 POLL_INTERVAL = 0.010

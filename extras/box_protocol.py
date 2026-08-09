@@ -154,6 +154,9 @@ def state_name(value):
     return "NO_RESPONSE" if value is None else STATE_NAMES.get(value, "UNKNOWN")
 
 
+def _klog(msg, *args, level=logging.info):
+    level("box_protocol: " + msg, *args)
+
 class ProtocolError(ValueError):
     """The peer response violates its firmware wire contract."""
 
@@ -200,12 +203,11 @@ class AutoAddressReply:
 def _protocol_error(message, reply=None, context=None):
     if reply is not None:
         context_text = "" if context is None else " context=%s" % context
-        logging.warning(
-            "box_protocol: rejected response%s address=%d command=0x%02x "
-            "status=0x%02x payload_len=%d payload=%s frame=%s error=%s",
+        _klog(
+            'rejected response%s address=%d command=0x%02x status=0x%02x payload_len=%d payload=%s frame=%s error=%s',
             context_text, reply.address, reply.command, reply.status,
             len(reply.payload), reply.payload.hex(), reply.raw.hex(), message,
-        )
+            level=logging.warning)
         message = "%s (cmd=0x%02x status=0x%02x)" % (
             message, reply.command, reply.status)
     raise ProtocolError(message)
@@ -253,12 +255,10 @@ def decode_reply(frame, expected_address, expected_command, context=None):
     try:
         raw = bytes(frame)
     except (TypeError, ValueError):
-        logging.warning(
-            "box_protocol: rejected response envelope expected_address=%d "
-            "expected_command=0x%02x context=%s frame=%r "
-            "error=response is not bytes",
+        _klog(
+            'rejected response envelope expected_address=%d expected_command=0x%02x context=%s frame=%r error=response is not bytes',
             expected_address, expected_command, context or "none", frame,
-        )
+            level=logging.warning)
         raise ProtocolError("response is not bytes")
     error = None
     if len(raw) < 6:
@@ -274,12 +274,10 @@ def decode_reply(frame, expected_address, expected_command, context=None):
     elif not check_485_frame_crc(raw)[0]:
         error = "response CRC is invalid"
     if error is not None:
-        logging.warning(
-            "box_protocol: rejected response envelope expected_address=%d "
-            "expected_command=0x%02x context=%s frame=%s error=%s",
+        _klog(
+            'rejected response envelope expected_address=%d expected_command=0x%02x context=%s frame=%s error=%s',
             expected_address, expected_command, context or "none", raw.hex(),
-            error,
-        )
+            error, level=logging.warning)
         raise ProtocolError(error)
     return Reply(raw[1], raw[4], raw[3], raw[5:-1], raw)
 

@@ -32,6 +32,7 @@ SAFE_WIDGET_COMMANDS = frozenset((
     "_BOX_SLOT_CLEAR",
     "_BOX_MATERIAL_SET",
     "_BOX_SET_RUNOUT_SWAP",
+    "_BOX_SET_UNLOAD_AFTER_PRINT",
     "_BOX_SET_RFID_INSERT_READING",
     "_BOX_SET_RFID_STARTUP_READING",
 ))
@@ -127,8 +128,8 @@ SPOOLMAN_TIMEOUT = 2.0
 SPOOLMAN_MAX_BYTES = 8 * 1024 * 1024
 
 
-def _log(message, *args, level=logging.info):
-    level("box: " + message, *args)
+def _klog(msg, *args, level=logging.info):
+    level("box: " + msg, *args)
 
 
 class _VirtualSDGCodeObserver:
@@ -147,7 +148,7 @@ class _VirtualSDGCodeObserver:
                 self.owner._observe_sd_line(script)
             except Exception:
                 self.enabled = False
-                logging.exception("box: runout feature observer disabled")
+                _klog('runout feature observer disabled', level=logging.exception)
         return result
 
 
@@ -512,6 +513,8 @@ class Box:
             ("_BOX_MATERIAL_SET", self.cmd_material_set, "Save material metadata"),
             ("_BOX_SET_RUNOUT_SWAP", self.cmd_runout_swap,
              "Set automatic runout swapping"),
+            ("_BOX_SET_UNLOAD_AFTER_PRINT", self.cmd_unload_after_print,
+             "Set automatic unload after printing"),
             ("_BOX_SET_RFID_INSERT_READING", self.cmd_rfid_insert,
              "Set RFID insertion reads"),
             ("_BOX_SET_RFID_STARTUP_READING", self.cmd_rfid_startup,
@@ -602,7 +605,7 @@ class Box:
                     and self.filament_sensor_enabled()):
                 self.runout_defer_active = True
         except Exception:
-            logging.exception("box: runout defer arm failed")
+            _klog('runout defer arm failed', level=logging.exception)
 
     def _observe_sd_line(self, line):
         marker = line.lstrip()
@@ -623,7 +626,7 @@ class Box:
             if reset is not None:
                 reset()
         except Exception:
-            logging.exception("box: runout distance cleanup failed")
+            _klog('runout distance cleanup failed', level=logging.exception)
 
     def _reset_runout_defer(self, *args):
         self.cancel_runout_defer()
@@ -657,6 +660,7 @@ class Box:
             "materials": self.store.materials,
             "runout": self._runout_status(physical, snap),
             "runout_swap_enabled": self.runout_swap_enabled,
+            "unload_after_print_enabled": self.unload_after_print_enabled,
             "rfid_insert_reading_enabled": self.rfid_insert_reading_enabled,
             "rfid_startup_reading_enabled": self.rfid_startup_reading_enabled,
             "tracking_active": snap.tracking,
@@ -813,6 +817,10 @@ class Box:
         return bool(self.store.setting("runout_swap_enabled", True))
 
     @property
+    def unload_after_print_enabled(self):
+        return bool(self.store.setting("unload_after_print_enabled", False))
+
+    @property
     def rfid_insert_reading_enabled(self):
         return bool(self.store.setting("rfid_insert_reading_enabled", False))
 
@@ -842,7 +850,7 @@ class Box:
                 webhooks.call_remote_method(
                     "spoolman_set_active_spool", spool_id=spool_id)
         except Exception:
-            logging.exception("box: active Spoolman update failed")
+            _klog('active Spoolman update failed', level=logging.exception)
 
     def get_filament_sensor_state(self):
         try:
@@ -1084,6 +1092,12 @@ class Box:
         self.store.set_setting("runout_swap_enabled", enabled)
         self._info(gcmd, "Runout swap %s" % ("enabled" if enabled else "disabled"))
 
+    def cmd_unload_after_print(self, gcmd):
+        enabled = bool(gcmd.get_int("ENABLE", 0, minval=0, maxval=1))
+        self.store.set_setting("unload_after_print_enabled", enabled)
+        self._info(gcmd, "Unload after print %s" % (
+            "enabled" if enabled else "disabled"))
+
     def cmd_rfid_insert(self, gcmd):
         enabled = bool(gcmd.get_int("ENABLE", 0, minval=0, maxval=1))
         self.store.set_setting("rfid_insert_reading_enabled", enabled)
@@ -1259,7 +1273,7 @@ class Box:
                 else:
                     self._rfid_inserted(slot)
                     self.rfid_pending[slot] = "waiting"
-                    _log("ignored unverified RFID completion for T%d", slot)
+                    _klog("ignored unverified RFID completion for T%d", slot)
 
     def _pending_rfid_slots(self, address, phase):
         first = (address - 1) * SLOTS_PER_BOX
@@ -1305,7 +1319,7 @@ class Box:
                 return reply
             self._query_presence(address, driver)
             self._handle_slot_events(address, reply.slot_events)
-        _log("box %d slot events did not drain after %d reads",
+        _klog("box %d slot events did not drain after %d reads",
              address, STATE_EVENT_DRAIN, level=logging.warning)
         return None
 
@@ -1509,7 +1523,7 @@ class Box:
             record = after.records.get(name, "").strip("\x00")
             fields = after.fields.get(name)
             if len(record) != 40 or not fields:
-                _log("T%d forced RFID result was invalid", slot)
+                _klog("T%d forced RFID result was invalid", slot)
                 continue
             if self._apply_rfid_record(slot, record, fields):
                 applied.add(slot)
@@ -1532,7 +1546,7 @@ class Box:
             try:
                 reply = driver.query_rfid_remaining(mask, timeout=0.5)
             except Exception as exc:
-                _log("RFID remaining query failed on box %d: %s", address, exc)
+                _klog("RFID remaining query failed on box %d: %s", address, exc)
                 continue
             if reply is None or reply.status != box_protocol.STATUS_OK:
                 continue
@@ -1937,13 +1951,13 @@ class Box:
                         "G0 Z%.3f F%d" % (lifted_z, CUT_SAFE_Z_F))
                     toolhead.wait_moves()
                 except Exception:
-                    _log("failed restoring cut Z", level=logging.exception)
+                    _klog("failed restoring cut Z", level=logging.exception)
             if limits_saved:
                 try:
                     restore_motion_limits(
                         self.gcode, "_box_cut_limits", include_gcode=True, move=0)
                 except Exception:
-                    _log("failed restoring cut motion limits", level=logging.exception)
+                    _klog("failed restoring cut motion limits", level=logging.exception)
 
     def _lift_for_cut(self, toolhead):
         status = toolhead.get_status(self.reactor.monotonic())
@@ -2123,7 +2137,7 @@ class Box:
         latched = self._latch_fatal_fault(
             reply.address, reply.status, reason)
         if latched:
-            _log(
+            _klog(
                 "CFS command fault address=%d command=0x%02x status=%s "
                 "context=%s raw=%s",
                 reply.address, reply.command,
@@ -2190,7 +2204,7 @@ class Box:
                 reply = self._query_box_snapshot(
                     address, driver, include_topology)
             except Exception as exc:
-                _log("box %d status query failed: %s", address, exc,
+                _klog("box %d status query failed: %s", address, exc,
                      level=logging.warning)
                 continue
             if reply is None:
@@ -2287,7 +2301,7 @@ class Box:
                 self._refresh_rfid_remaining()
                 self.last_rfid_refresh = eventtime
         except Exception:
-            _log("status poll failed", level=logging.exception)
+            _klog("status poll failed", level=logging.exception)
             return eventtime + ERROR_BACKOFF
         return eventtime + (ACTIVE_POLL if self.snapshot.tracking else IDLE_POLL)
 

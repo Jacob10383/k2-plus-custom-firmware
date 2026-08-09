@@ -75,6 +75,9 @@ def parse_reader_response(response):
     }
 
 
+def _klog(msg, *args, level=logging.info):
+    level("external_rfid_reader: " + msg, *args)
+
 class ExternalRfidReader:
     CONSOLE_PREFIX = "[RFID READER]: "
 
@@ -129,8 +132,8 @@ class ExternalRfidReader:
                 parsed = self._request_record()
             except Exception as exc:
                 self._last_error = str(exc)
-                logging.warning(
-                    "external_rfid_reader: record fetch failed: %s", exc)
+                _klog(
+                    'record fetch failed: %s', exc, level=logging.warning)
                 return None
             if parsed is None:
                 self._last_error = "no valid response"
@@ -193,7 +196,7 @@ class ExternalRfidReader:
             self._write_sysfs(enable, 1)
             time.sleep(BEEP_DURATION)
         except OSError as exc:
-            logging.warning("external_rfid_reader: PWM beep failed: %s", exc)
+            _klog('PWM beep failed: %s', exc, level=logging.warning)
         finally:
             try:
                 self._write_sysfs(enable, 0)

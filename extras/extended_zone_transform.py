@@ -11,6 +11,9 @@ import logging
 import math
 
 
+_COORD_EPSILON = 1.0e-9
+
+
 def _klog(msg, *args, level=logging.info):
     level("extended_zone_transform: " + msg, *args)
 
@@ -25,7 +28,8 @@ class ExtendedZoneTransform:
         self.extended_y_max = config.getfloat("extended_y_max", 380.0)
         self.safe_x_min = config.getfloat("safe_x_min", 122.0)
         self.safe_x_max = config.getfloat("safe_x_max", 230.0)
-        self.debug = config.getboolean("debug", False)
+        # compat: old cfgs may still set this
+        config.getboolean("debug", False)
 
         if self.extended_y_max < self.standard_y_max:
             raise config.error(
@@ -77,10 +81,17 @@ class ExtendedZoneTransform:
         )
 
     def _is_safe_x(self, x):
-        return self.safe_x_min <= x <= self.safe_x_max
+        return (
+            self.safe_x_min - _COORD_EPSILON
+            <= x
+            <= self.safe_x_max + _COORD_EPSILON
+        )
+
+    def _is_extended_y(self, y):
+        return y > self.standard_y_max + _COORD_EPSILON
 
     def _apply_y_envelope(self, desired_y_max):
-        if self._active_y_max is not None and abs(self._active_y_max - desired_y_max) < 1.0e-9:
+        if self._active_y_max is not None and abs(self._active_y_max - desired_y_max) < _COORD_EPSILON:
             return
         kin = self.toolhead.kin
         y_rail = kin.rails[1]
@@ -102,11 +113,7 @@ class ExtendedZoneTransform:
             kin.limits[1] = (min_y, desired_y_max)
 
         self._active_y_max = desired_y_max
-        if self.debug:
-            _klog(
-                "y envelope switched to %.1f",
-                desired_y_max,
-            )
+        _klog("y envelope switched to %.1f", desired_y_max)
 
     def _check_homed_xy(self):
         curtime = self.reactor.monotonic()
@@ -127,15 +134,16 @@ class ExtendedZoneTransform:
         target_x, target_y = target[0], target[1]
 
         special_state = getattr(self.toolhead, "special_queuing_state", None)
-        if max(current_y, target_y) <= standard_y_max or special_state == "Drip":
+        if not (self._is_extended_y(current_y) or self._is_extended_y(target_y)) \
+                or special_state == "Drip":
             return [target]
 
-        if abs(current_x - target_x) < 1.0e-9 and abs(current_y - target_y) < 1.0e-9:
+        if abs(current_x - target_x) < _COORD_EPSILON and abs(current_y - target_y) < _COORD_EPSILON:
             return [target]
 
         self._check_homed_xy()
 
-        if current_y > standard_y_max and not self._is_safe_x(current_x):
+        if self._is_extended_y(current_y) and not self._is_safe_x(current_x):
             raise self.gcode.error(
                 "Move out of range: Current position (X=%.1f, Y=%.1f) is in an invalid state. "
                 "X must be between %.1f-%.1f when Y > %.1f. "
@@ -149,18 +157,18 @@ class ExtendedZoneTransform:
                 )
             )
 
-        if target_y > standard_y_max and not self._is_safe_x(target_x):
+        if self._is_extended_y(target_y) and not self._is_safe_x(target_x):
             raise self.gcode.error(
                 "Move out of range: Target (X=%.1f, Y=%.1f) is outside safe extended zone "
                 "(Safe X: %.1f-%.1f)"
                 % (target_x, target_y, self.safe_x_min, self.safe_x_max)
             )
 
-        if min(current_y, target_y) > standard_y_max:
+        if self._is_extended_y(current_y) and self._is_extended_y(target_y):
             return [target]
 
         y_diff = target_y - current_y
-        if abs(y_diff) < 1.0e-9:
+        if abs(y_diff) < _COORD_EPSILON:
             intersect_x = current_x
         else:
             intersect_x = (
@@ -172,8 +180,8 @@ class ExtendedZoneTransform:
             return [target]
 
         extrude_delta = target[3] - current[3]
-        is_travel_move = abs(extrude_delta) < 1.0e-5
-        is_retraction_move = extrude_delta < -1.0e-5
+        is_travel_move = abs(extrude_delta) < _COORD_EPSILON
+        is_retraction_move = extrude_delta < -_COORD_EPSILON
         if not (is_travel_move or is_retraction_move):
             raise self.gcode.error(
                 "Move out of range: Path crosses boundary Y=%.1f at X=%.1f, which is unsafe.\n"
@@ -201,23 +209,33 @@ class ExtendedZoneTransform:
                 )
             )
 
-        if current_y > standard_y_max:
+        mid = list(target)
+        if self._is_extended_y(current_y):
             # Exit extended zone at a safe X before continuing.
-            mid = [current_x, standard_y_max, target[2], target[3]]
+            mid[:2] = [current_x, standard_y_max]
         else:
             # Enter extended zone only after X is already in safe corridor.
-            mid = [target_x, current_y, target[2], target[3]]
+            mid[:2] = [target_x, current_y]
 
-        if self.debug:
-            _klog(
-                "[EXTENDED_ZONE_TRANSFORM]: routing move via midpoint %s "
-                "(current=%s target=%s intersect_x=%.3f)",
-                mid,
-                current,
-                target,
-                intersect_x,
-            )
+        _klog(
+            "routing move via midpoint %s (current=%s target=%s intersect_x=%.3f)",
+            mid,
+            current,
+            target,
+            intersect_x,
+        )
         return [mid, target]
+
+    def _route(self, current, target):
+        """Plan the segments for a move and open/close the Y envelope for it."""
+        segments = self._plan_move_segments(current, target)
+        desired_y_max = (
+            self.extended_y_max
+            if self._is_extended_y(current[1]) or self._is_extended_y(target[1])
+            else self.standard_y_max
+        )
+        self._apply_y_envelope(desired_y_max)
+        return segments
 
     def move(self, newpos, speed):
         if self.next_transform is None:
@@ -228,13 +246,7 @@ class ExtendedZoneTransform:
         target = list(newpos)
         current = list(self.last_position)
 
-        segments = self._plan_move_segments(current, target)
-        desired_y_max = (
-            self.extended_y_max
-            if max(current[1], target[1]) > self.standard_y_max
-            else self.standard_y_max
-        )
-        self._apply_y_envelope(desired_y_max)
+        segments = self._route(current, target)
         for idx, segment in enumerate(segments):
             try:
                 self.next_transform.move(segment, speed)
@@ -242,6 +254,32 @@ class ExtendedZoneTransform:
                 self._log_move_failure_context(current, target, segments, idx)
                 raise
         self.last_position[:] = target
+
+    def manual_move(self, coord, speed):
+        """Extended-zone aware replacement for toolhead.manual_move().
+
+        Toolhead-space moves never reach this transform, so they would
+        otherwise miss the safe-X checks, midpoint routing and envelope
+        switching that G0/G1 moves get. Bed mesh compensation is still
+        skipped, as it is for any toolhead-space move.
+        """
+        if self.toolhead is None:
+            self.toolhead = self.printer.lookup_object("toolhead")
+        toolhead = self.toolhead
+
+        current = list(toolhead.get_position())
+        target = list(current)
+        for axis, value in enumerate(coord):
+            if value is not None:
+                target[axis] = value
+
+        segments = self._route(current, target)
+        for idx, segment in enumerate(segments):
+            try:
+                toolhead.manual_move(segment, speed)
+            except self.printer.command_error:
+                self._log_move_failure_context(current, target, segments, idx)
+                raise
 
     def _log_move_failure_context(self, current, target, segments, failed_idx):
         """Dump gcode_move offset/mode state and zone config when a downstream
@@ -379,7 +417,7 @@ class ExtendedZoneTransform:
 
         offset_x = self._get_float_param(params, "I", 0.0)
         offset_y = self._get_float_param(params, "J", 0.0)
-        if abs(offset_x) < 1.0e-9 and abs(offset_y) < 1.0e-9:
+        if abs(offset_x) < _COORD_EPSILON and abs(offset_y) < _COORD_EPSILON:
             return False
 
         if "F" in params:
@@ -399,18 +437,18 @@ class ExtendedZoneTransform:
         current_y = float(current[1])
         current_z = float(current[2])
         target_z = self._get_float_param(params, "Z")
-        if abs(target_z - current_z) < 1.0e-9:
+        if abs(target_z - current_z) < _COORD_EPSILON:
             return False
-        if current_y <= self.standard_y_max:
+        if not self._is_extended_y(current_y):
             return False
-        if current_y > self.extended_y_max + 1.0e-6:
+        if current_y > self.extended_y_max + _COORD_EPSILON:
             return False
         if not self._is_safe_x(current_x):
             return False
 
         radius = math.hypot(offset_x, offset_y)
         arc_y_max = current_y + offset_y + radius
-        return arc_y_max > self.extended_y_max + 1.0e-6
+        return arc_y_max > self.extended_y_max + _COORD_EPSILON
 
     def _get_float_param(self, params, key, default=None):
         value = params.get(key)
@@ -433,11 +471,11 @@ class ExtendedZoneTransform:
         if "F" in params:
             g1_params["F"] = self._get_float_param(params, "F")
             command += " F%s" % g1_params["F"]
-        if self.debug:
-            _klog(
-                "sanitizing no-XY helical %s to %s in extended safe zone"
-                % (gcmd.get_command(), command)
-            )
+        _klog(
+            "sanitizing no-XY helical %s to %s in extended safe zone",
+            gcmd.get_command(),
+            command,
+        )
 
         last_position = list(gcode_move.last_position)
         speed = gcode_move.speed

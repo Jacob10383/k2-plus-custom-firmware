@@ -12,6 +12,10 @@ ADDRESS_WEDGE_WARNING = (
 MAX_ADDRESSES = 4
 
 
+def _klog(msg, *args, level=logging.info):
+    level("box_addr: " + msg, *args)
+
+
 @dataclass(frozen=True)
 class AutoAddressResult:
     """Reachable and persisted identities plus nonfatal enumeration errors."""
@@ -32,10 +36,9 @@ class AutoAddressManager:
         """Find the requested number of boxes without deriving topology from it."""
         errors = []
         known = dict(self._known_input)
-        logging.info(
-            "box_addr: enumeration start target=%d known=%s",
-            self.target_count,
-            {address: uniid.hex() for address, uniid in sorted(known.items())})
+        _klog(
+            'enumeration start target=%d known=%s', self.target_count,
+            {address: uniid.hex() for address, uniid in sorted(known.items())}, level=logging.info)
         for uniid, addresses in self._known_addresses_by_id(known).items():
             if len(addresses) > 1:
                 errors.append(
@@ -50,13 +53,12 @@ class AutoAddressManager:
             reply = self._call(errors, "query address %d" % address,
                                client.query, address)
             if reply is None:
-                logging.info(
-                    "box_addr: A2 query address=%d response=none", address)
+                _klog(
+                    'A2 query address=%d response=none', address, level=logging.info)
                 continue
             uniid = reply.uniid
-            logging.info(
-                "box_addr: A2 query address=%d uid=%s",
-                address, uniid.hex())
+            _klog(
+                'A2 query address=%d uid=%s', address, uniid.hex(), level=logging.info)
             occupied.add(address)
             self._remember(known, address, uniid)
             online[address] = uniid
@@ -68,10 +70,10 @@ class AutoAddressManager:
         while len(online) < self.target_count:
             reply = self._call(errors, "discover", client.discover)
             if reply is None:
-                logging.info("box_addr: A1 discovery response=none")
+                _klog('A1 discovery response=none', level=logging.info)
                 break
             uniid = reply.uniid
-            logging.info("box_addr: A1 discovered uid=%s", uniid.hex())
+            _klog('A1 discovered uid=%s', uniid.hex(), level=logging.info)
             if uniid in seen_discoveries:
                 errors.append("discover repeated box %s" % uniid.hex())
                 break
@@ -87,10 +89,9 @@ class AutoAddressManager:
                 errors.append("all four CFS addresses are online")
                 break
 
-            logging.info(
-                "box_addr: A0 assign uid=%s address=%d source=%s",
-                uniid.hex(), target,
-                "persisted" if preferred else "first-free")
+            _klog(
+                'A0 assign uid=%s address=%d source=%s', uniid.hex(), target,
+                "persisted" if preferred else "first-free", level=logging.info)
             assigned = self._call(
                 errors, "assign box %s to address %d" % (uniid.hex(), target),
                 client.assign, uniid, target)
@@ -111,9 +112,8 @@ class AutoAddressManager:
                     % target)
                 break
 
-            logging.info(
-                "box_addr: A0 verified uid=%s address=%d",
-                uniid.hex(), target)
+            _klog(
+                'A0 verified uid=%s address=%d', uniid.hex(), target, level=logging.info)
             self._remember(known, target, uniid)
             online[target] = uniid
             occupied.add(target)
@@ -123,13 +123,12 @@ class AutoAddressManager:
             known=dict(sorted(known.items())),
             errors=tuple(errors),
         )
-        logging.info(
-            "box_addr: enumeration complete online=%s known=%s errors=%s",
-            {address: uniid.hex()
+        _klog(
+            'enumeration complete online=%s known=%s errors=%s', {address: uniid.hex()
              for address, uniid in result.online.items()},
             {address: uniid.hex()
              for address, uniid in result.known.items()},
-            list(result.errors) or "none")
+            list(result.errors) or "none", level=logging.info)
         return result
 
     @staticmethod

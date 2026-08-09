@@ -114,7 +114,7 @@ class MotorControlConfigModel:
 
 
 def _klog(msg, *args, level=logging.info):
-    level("motor control: " + msg, *args)
+    level("motor_cut_calibration: " + msg, *args)
 
 
 CUT_CAL_AXIS = "x"
@@ -1352,7 +1352,7 @@ motor-control stack for cfg-backed param application at startup.
 
 
 def _klog(msg, *args, level=logging.info):
-    level("motor param: " + msg, *args)
+    level("motor_param_runtime: " + msg, *args)
 
 
 @dataclass
@@ -2456,7 +2456,7 @@ Architecture:
 
 
 def _klog(msg, *args, level=logging.info):
-    level("motor control: " + msg, *args)
+    level("motor_control: " + msg, *args)
 
 
 DEFAULT_REGISTRY_PATH = Path(__file__).parent / "motor_map.json"

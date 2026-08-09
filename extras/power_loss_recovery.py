@@ -97,6 +97,9 @@ def _position(payload):
     return value if type(value) is int and value >= 0 else -1
 
 
+def _klog(msg, *args, level=logging.info):
+    level("power_loss_recovery: " + msg, *args)
+
 class AtomicSnapshotStore:
     """Owns durable contexts, the A/B journal, and emergency checkpoint."""
 
@@ -144,7 +147,7 @@ class AtomicSnapshotStore:
         except Exception as exc:
             self._available = False
             self._last_error = str(exc)
-            logging.exception("power_loss_recovery: storage load failed")
+            _klog('storage load failed', level=logging.exception)
         if not start_worker:
             return
         if not self._available:
@@ -158,7 +161,7 @@ class AtomicSnapshotStore:
             self._available = False
             self._last_error = str(exc)
             self._release_owner()
-            logging.exception("power_loss_recovery: storage worker start failed")
+            _klog('storage worker start failed', level=logging.exception)
 
     def _release_owner(self):
         if not self._owns_directory:
@@ -267,8 +270,8 @@ class AtomicSnapshotStore:
                     records.append(record)
                 except Exception as exc:
                     ambiguous = True
-                    logging.warning(
-                        "power_loss_recovery: ignoring %s: %s", path, exc)
+                    _klog(
+                        'ignoring %s: %s', path, exc, level=logging.warning)
             if os.path.exists(path + ".tmp"):
                 ambiguous = True
         try:
@@ -511,8 +514,8 @@ class AtomicSnapshotStore:
                         self._emergency_error = str(exc)
                         self._writing = False
                         self._condition.notify_all()
-                    logging.exception(
-                        "power_loss_recovery: emergency write failed")
+                    _klog(
+                        'emergency write failed', level=logging.exception)
                     continue
                 with self._condition:
                     log_failure = task == "context" or kind != TOMBSTONE or self._available
@@ -529,9 +532,8 @@ class AtomicSnapshotStore:
                         self._poison_directory()
                     self._condition.notify_all()
                 if log_failure:
-                    logging.exception(
-                        "power_loss_recovery: %s write failed",
-                        "context" if task == "context" else kind)
+                    _klog(
+                        '%s write failed', "context" if task == "context" else kind, level=logging.exception)
                 invalidated = self._invalidate_recovery_files()
                 if invalidated:
                     with self._condition:
@@ -571,8 +573,8 @@ class AtomicSnapshotStore:
                 try:
                     self._prune_contexts()
                 except Exception:
-                    logging.exception(
-                        "power_loss_recovery: context cleanup failed")
+                    _klog(
+                        'context cleanup failed', level=logging.exception)
             with self._condition:
                 if self._available:
                     self._last_error = None
@@ -644,8 +646,8 @@ class AtomicSnapshotStore:
         except FileNotFoundError:
             names = ()
         except OSError as exc:
-            logging.warning(
-                "power_loss_recovery: context cleanup skipped: %s", exc)
+            _klog(
+                'context cleanup skipped: %s', exc, level=logging.warning)
             return
         for name in names:
             if not name.startswith("context-"):
@@ -677,8 +679,8 @@ class AtomicSnapshotStore:
             except FileNotFoundError:
                 continue
             except Exception as exc:
-                logging.warning(
-                    "power_loss_recovery: context cleanup skipped: %s", exc)
+                _klog(
+                    'context cleanup skipped: %s', exc, level=logging.warning)
                 return
             if record["context_id"] is not None:
                 keep.add(record["context_id"])
@@ -687,8 +689,8 @@ class AtomicSnapshotStore:
         except FileNotFoundError:
             names = ()
         except OSError as exc:
-            logging.warning(
-                "power_loss_recovery: context cleanup skipped: %s", exc)
+            _klog(
+                'context cleanup skipped: %s', exc, level=logging.warning)
             return
         removed = set()
         for name in names:
@@ -706,8 +708,8 @@ class AtomicSnapshotStore:
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                logging.warning(
-                    "power_loss_recovery: context cleanup failed: %s", exc)
+                _klog(
+                    'context cleanup failed: %s', exc, level=logging.warning)
         with self._condition:
             for context_id in tuple(self._contexts):
                 if context_id not in keep:
@@ -716,8 +718,8 @@ class AtomicSnapshotStore:
             try:
                 self._sync_directory()
             except OSError as exc:
-                logging.warning(
-                    "power_loss_recovery: context cleanup sync failed: %s", exc)
+                _klog(
+                    'context cleanup sync failed: %s', exc, level=logging.warning)
 
     def _invalidate_recovery_files(self):
         removed, ok = False, True
@@ -730,16 +732,15 @@ class AtomicSnapshotStore:
                     pass
                 except OSError as exc:
                     ok = False
-                    logging.error(
-                        "power_loss_recovery: failed to invalidate %s: %s",
-                        target, exc)
+                    _klog(
+                        'failed to invalidate %s: %s', target, exc, level=logging.error)
         if removed:
             try:
                 self._sync_directory()
             except OSError as exc:
                 ok = False
-                logging.error(
-                    "power_loss_recovery: invalidation sync failed: %s", exc)
+                _klog(
+                    'invalidation sync failed: %s', exc, level=logging.error)
         return ok
 
     def _seed_emergency(self, prepared):
@@ -754,7 +755,7 @@ class AtomicSnapshotStore:
         except Exception as exc:
             with self._condition:
                 self._emergency_error = str(exc)
-            logging.exception("power_loss_recovery: emergency seed failed")
+            _klog('emergency seed failed', level=logging.exception)
 
     def _write_direct(self, encoded):
         fd = os.open(
@@ -778,7 +779,7 @@ def _passive(fn):
         try:
             return fn(self, *args)
         except Exception:
-            logging.exception("power_loss_recovery: %s failed", fn.__name__)
+            _klog('%s failed', fn.__name__, level=logging.exception)
     return wrapped
 
 
@@ -810,8 +811,8 @@ class _VirtualSDGCodeProxy:
                 try:
                     self.owner._disable("source-line observer")
                 except Exception:
-                    logging.exception(
-                        "power_loss_recovery: observer disable failed")
+                    _klog(
+                        'observer disable failed', level=logging.exception)
         return result
 
 
@@ -912,7 +913,7 @@ class PowerLossRecovery:
             self.disabled_reason = None
         except Exception as exc:
             self.disabled_reason = str(exc)
-            logging.exception("power_loss_recovery: initialization failed")
+            _klog('initialization failed', level=logging.exception)
 
     def _recovery_notice_timer(self, eventtime):
         try:
@@ -931,7 +932,7 @@ class PowerLossRecovery:
                     % (state["path"], state["position"]))
                 self._emit_recovery_prompt(state)
         except Exception as exc:
-            logging.info("power_loss_recovery: recovery notice skipped: %s", exc)
+            _klog('recovery notice skipped: %s', exc, level=logging.info)
         return self.reactor.NEVER
 
     def _emit_recovery_prompt(self, state):
@@ -954,7 +955,7 @@ class PowerLossRecovery:
         try:
             self.gcode.respond_raw("// action:prompt_end")
         except Exception as exc:
-            logging.info("power_loss_recovery: prompt close skipped: %s", exc)
+            _klog('prompt close skipped: %s', exc, level=logging.info)
 
     @_passive
     def _handle_disconnect(self):
@@ -967,7 +968,7 @@ class PowerLossRecovery:
         self.candidate_due = False
         self.candidates.clear()
         self.safe_candidate = self.completion = None
-        logging.error("power_loss_recovery: disabled after %s", reason)
+        _klog('disabled after %s', reason, level=logging.error)
 
     def _reset_session(self, discard=False):
         self.session += 1
@@ -1100,7 +1101,7 @@ class PowerLossRecovery:
                 try:
                     self.fans[key] = max(0.0, min(1.0, float(value)))
                 except Exception:
-                    logging.exception("power_loss_recovery: fan shadow failed")
+                    _klog('fan shadow failed', level=logging.exception)
                 return result
 
             fan.set_speed_from_command = set_speed
@@ -1271,7 +1272,7 @@ class PowerLossRecovery:
         self.candidates.clear()
         self.safe_candidate = None
         self.store.discard()
-        logging.info("power_loss_recovery: session inhibited: %s", reason)
+        _klog('session inhibited: %s', reason, level=logging.info)
 
     def _clearance(self, saved_z):
         limit = min(self.maximum_recovery_z, float(self.z_align.zmax))
@@ -1573,7 +1574,7 @@ class PowerLossRecovery:
             self.v_sd.do_resume()
             self._close_recovery_prompt()
         except Exception as exc:
-            logging.exception("power_loss_recovery: recovery failed")
+            _klog('recovery failed', level=logging.exception)
             self.recovery_start = False
             self._cleanup_failed_recovery(loaded)
             raise gcmd.error("PLR recovery failed: %s" % exc)
@@ -1781,16 +1782,16 @@ class PowerLossRecovery:
         try:
             self._run("_RESET_PRINT_STATE")
         except Exception:
-            logging.exception("power_loss_recovery: cleanup failed")
+            _klog('cleanup failed', level=logging.exception)
         if loaded:
             try:
                 self._clear_references()
             except Exception:
-                logging.exception("power_loss_recovery: reference cleanup failed")
+                _klog('reference cleanup failed', level=logging.exception)
             try:
                 self.v_sd._reset_file()
             except Exception:
-                logging.exception("power_loss_recovery: file cleanup failed")
+                _klog('file cleanup failed', level=logging.exception)
 
     def _run(self, command):
         self.gcode.run_script_from_command(command)

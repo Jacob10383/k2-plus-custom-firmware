@@ -1,16 +1,16 @@
 {
   "files": {
     "belt_mdl.py": {
-      "sha256": "af5805b061f83f14fbe61b1c64a31ad53d1b4768cfc8b66b2f162061ee6244f5",
-      "size": 22293
+      "sha256": "7edb687cb922a832ce179b1ea4982179958c3309f56865d6caa1d056eeb45ddf",
+      "size": 22040
     },
     "box.py": {
-      "sha256": "164f0a869f8512469b3c9ba97fef80b1c4831f8e65c61dc02caff68c77a66f19",
-      "size": 119751
+      "sha256": "a56a3c267bee0719e6d5a99dce4ec935239cffadb25db488c0ad828880f93fe2",
+      "size": 120444
     },
     "box_addr.py": {
-      "sha256": "d24ddaaf017e899f4b12138980329fbfa429e209aed89e902bfd4d00372feac7",
-      "size": 6050
+      "sha256": "db219f06a67c14c24ad196e1f04f5ec66b55a797cf74737b19f2ac3952cb00ef",
+      "size": 6084
     },
     "box_catalog.py": {
       "sha256": "0933c92ddee2068acf8364d7b00f29831fb898b1ab53489180d7d6a551a62faa",
@@ -21,8 +21,8 @@
       "size": 58811
     },
     "box_protocol.py": {
-      "sha256": "60d7d9b256cfb1af024ef41e818184c2fe36195d19b0ba989d6666abedce73aa",
-      "size": 21419
+      "sha256": "ea3c6ae3b754d6a2b5b924d1a7331cf53631da88d97c05f08121e234ea0ea870",
+      "size": 21435
     },
     "cartographer.py": {
       "sha256": "ac787fe282f4dc2e64b3ebc4454332c4fd50ffdc0597d9e3935d6072e9572a2a",
@@ -33,12 +33,12 @@
       "size": 2994
     },
     "extended_zone_transform.py": {
-      "sha256": "828dd32a6d33928db115cb87ccc4152d5ba808ec6a3698c22d6eb63cd3b3213f",
-      "size": 18243
+      "sha256": "c38fda7c4181bd5a2f122688117e1c9cb26b55e17c8b9ca6ca2d9ed0ec725462",
+      "size": 19686
     },
     "external_rfid_reader.py": {
-      "sha256": "037e1f4f49e845891d85a350449f23307074572f12612fd6c5fb38071a2cf547",
-      "size": 7510
+      "sha256": "5b6b63ba8fb847e87874d1f4620d1bd33ee52122a4a05fbc71f58ba274c32be3",
+      "size": 7585
     },
     "fan_feedback.py": {
       "sha256": "72191615df815fb7bc104abbf083cadf527dfcbfc245d0d1673579c7907fac0b",
@@ -57,16 +57,16 @@
       "size": 3496
     },
     "motor_control.py": {
-      "sha256": "37c1a4df70ba5fa554c3101f57360aa743f7f4d7a086adba407dd4337d217b02",
-      "size": 181198
+      "sha256": "dd019ad9a8734b74ca92b79cb9c9b5f1676d540c424611b653dfe79a5ee78753",
+      "size": 181214
     },
     "motor_map.json": {
       "sha256": "d4f143b0ff2522165992bef5053a07f295fa7bc8cb0fef4a937179706388fee1",
       "size": 321924
     },
     "power_loss_recovery.py": {
-      "sha256": "fef51dbbbed5b836adc93792fc418ad86c70dccefd5919ed0b8e69c2878e4c87",
-      "size": 74715
+      "sha256": "8f388046780cbc1ff2a5c6ff2af93fea9e2458a3c424566f6cf60e69892d8bbd",
+      "size": 74551
     },
     "prtouch.py": {
       "sha256": "2be7b0100b2392f547cab6f891fdf20f6516b33e0d09b1f8fc8f7a43c82c99bd",
@@ -85,8 +85,8 @@
       "size": 7088
     },
     "z_align.py": {
-      "sha256": "f3fd8337bd942df7ebc79ba46b9c9d322e4a3107d5c0f5fbf39169829371912a",
-      "size": 35741
+      "sha256": "bd6d7a6ef205e3f832511b7cf2bb0b33c6fbc821a67c58baae5672f67ff267b9",
+      "size": 35742
     }
   },
   "format": "k2-extras-sha256-v1",
