@@ -4,6 +4,7 @@ site_url: https://jacob10383.github.io/k2-plus-custom-firmware/
 
 theme:
   name: material
+  custom_dir: overrides
   features:
     - navigation.top
     - content.code.copy
