@@ -11,6 +11,8 @@ import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 
+from extras import box_protocol
+
 
 FILAMENT_AREA = math.pi * (1.75 / 2.0) ** 2
 PURGE_CHUNK_MM = 100.0
@@ -565,18 +567,18 @@ class BoxChangeEngine:
         status = self.recovery_status()
         reason = status["reason"] or "Box recovery is incomplete"
         pause_state = (
-            "print remains paused" if self._is_print_paused()
-            else "pausing print")
-        return "%s; %s. Please %s, or CANCEL_PRINT" % (
+            "Print paused" if self._is_print_paused()
+            else "Pausing print")
+        return "%s. %s; %s, or CANCEL_PRINT" % (
             reason, pause_state, self._recovery_action(status))
 
     @staticmethod
     def _recovery_action(status):
         target = status["target"]
         if status["automatic"] and target is not None:
-            return "fix the issue and run RESUME to retry T%d" % target
+            return "RESUME retries T%d" % target
         elif status["retry_command"]:
-            return "fix the issue, run %s, then RESUME" % status["retry_command"]
+            return "run %s, then RESUME" % status["retry_command"]
         return "resolve the filament path and select a T command before RESUME"
 
     def _request_resume_temperature(self, request):
@@ -1252,8 +1254,9 @@ class BoxChangeEngine:
             request.resume = False
         if request.runout_recovery:
             self._restore_runout_target(request)
-        message = "T%d %s failed: %s" % (
-            request.target, request.last_step or "change", request.last_error)
+        message = box_protocol.format_failed(
+            "T%d %s" % (request.target, request.last_step or "change"),
+            request.last_error)
         if request.print_context:
             self.block_resume(message)
             if not self._is_print_paused():
@@ -1263,7 +1266,7 @@ class BoxChangeEngine:
             self._warn(self.recovery_notice())
             return False
         self._warn(message)
-        raise gcmd.error("[BOX]: %s" % request.last_error)
+        raise gcmd.error("[BOX]: %s" % message)
 
     def _wait_for_sensor(
             self, gcmd, detected, timeout,

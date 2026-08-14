@@ -73,11 +73,13 @@ CFS_COMMAND_FATAL_STATUSES = frozenset((
     box_protocol.STATUS_FEED_TIMEOUT,
     box_protocol.STATUS_OVERTRAVEL,
     box_protocol.STATUS_ODOMETER_STALLED,
+    box_protocol.STATUS_BUFFER_FILL_TIMEOUT,
     box_protocol.STATUS_BUFFER_NOT_FULL,
     box_protocol.STATUS_UNLOAD_BUFFER_TIMEOUT,
-    box_protocol.STATUS_UNLOAD_HUB_CLEAR_TIMEOUT,
+    box_protocol.STATUS_UNLOAD_HUB_PE_TIMEOUT,
     box_protocol.STATUS_UNLOAD_NO_FILAMENT,
     box_protocol.STATUS_UNLOAD_INLET_CLEAR,
+    box_protocol.STATUS_UNLOAD_ALL_EMPTY,
     box_protocol.STATUS_UNLOAD_MOTOR_BLOCKED,
     box_protocol.STATUS_UNLOAD_ODOMETER_TIMEOUT,
     box_protocol.STATUS_BUFFER_REFILL_STALLED,
@@ -449,7 +451,9 @@ class Box:
         self.rfid_percent = {}
         self.unknown_rfid = {}
         self.rfid_presence = {}
-        self.rfid_pending = {}
+        self.rfid_pending = set()
+        self.rfid_snapshot = {}
+        self.rfid_seen_invalid = set()
         self.rfid_live_slots = set()
         self.box_replies = {}
         self.last_rfid_refresh = 0.0
@@ -544,7 +548,7 @@ class Box:
                 raise
             except Exception as exc:
                 raise gcmd.error(
-                    "[BOX]: %s failed: %s" % (name, exc))
+                    "[BOX]: " + box_protocol.format_failed(name, exc))
         return guarded
 
     def cmd_runout(self, gcmd):
@@ -992,7 +996,8 @@ class Box:
         try:
             already_loaded = self.physical_load(slot)
         except Exception as exc:
-            raise gcmd.error("[BOX]: BOX_LOAD failed: %s" % exc)
+            raise gcmd.error(
+                "[BOX]: " + box_protocol.format_failed("BOX_LOAD", exc))
         if already_loaded:
             self._info(gcmd, "T%d already loaded; tracking active" % slot)
         else:
@@ -1111,6 +1116,8 @@ class Box:
         self.store.set_setting("rfid_insert_reading_enabled", enabled)
         if not enabled:
             self.rfid_pending.clear()
+            self.rfid_snapshot.clear()
+            self.rfid_seen_invalid.clear()
         for driver in self.drivers.values():
             driver.set_rfid_insert_reading(enabled)
         self._info(gcmd, "RFID insertion reading %s" % (
@@ -1174,15 +1181,18 @@ class Box:
         if value is None:
             return None
         text = str(value).strip().upper()
-        if not text.startswith("#"):
-            text = "#" + text
-        if len(text) != 7:
+        if text.startswith("#"):
+            text = text[1:]
+        elif len(text) == 7:
+            # Creality/K2-RFID stores 0RRGGBB; RGB starts at the second nibble.
+            text = text[1:]
+        if len(text) != 6:
             return None
         try:
-            int(text[1:], 16)
+            int(text, 16)
         except ValueError:
             return None
-        return text
+        return "#" + text
 
     # ------------------------------------------------------------------
     # RFID metadata and optional Spoolman association
@@ -1232,15 +1242,34 @@ class Box:
             mask |= (local_mask & 0x0F) << ((address - 1) * SLOTS_PER_BOX)
         return mask
 
+    def _clear_rfid_watch(self, slot):
+        self.rfid_pending.discard(slot)
+        self.rfid_snapshot.pop(slot, None)
+        self.rfid_seen_invalid.discard(slot)
+
+    def _snapshot_rfid_cache(self, slot):
+        try:
+            sample = self._query_rfid_sample(slot)
+        except Exception:
+            return
+        if sample is None:
+            return
+        self.rfid_snapshot[slot] = self._rfid_cache_key(sample)
+        if not self._rfid_record_ready(sample):
+            self.rfid_seen_invalid.add(slot)
+
     def _rfid_inserted(self, slot):
         self.rfid_live_slots.discard(slot)
         self.rfid_percent.pop(slot, None)
         self._invalidate_spoolman(slot)
+        self.rfid_snapshot.pop(slot, None)
+        self.rfid_seen_invalid.discard(slot)
         if self.rfid_insert_reading_enabled:
-            self.rfid_pending.setdefault(slot, "waiting")
+            self.rfid_pending.add(slot)
+            self._snapshot_rfid_cache(slot)
 
     def _rfid_removed(self, slot):
-        self.rfid_pending.pop(slot, None)
+        self._clear_rfid_watch(slot)
         self.rfid_live_slots.discard(slot)
         self.rfid_percent.pop(slot, None)
         self._invalidate_spoolman(slot)
@@ -1276,54 +1305,72 @@ class Box:
             elif event == 2:
                 self._rfid_removed(slot)
             elif event == 3 and self.rfid_insert_reading_enabled:
-                if self.rfid_pending.get(slot) == "fresh":
-                    self._read_rfid_result(slot)
-                else:
-                    self._rfid_inserted(slot)
-                    self.rfid_pending[slot] = "waiting"
-                    _klog("ignored unverified RFID completion for T%d", slot)
+                self._read_rfid_result(slot)
 
-    def _pending_rfid_slots(self, address, phase):
+    def _pending_rfid_slots(self, address):
         first = (address - 1) * SLOTS_PER_BOX
         return tuple(
             slot for slot in self.rfid_pending
-            if (first <= slot < first + SLOTS_PER_BOX
-                and self.rfid_pending[slot] == phase))
+            if first <= slot < first + SLOTS_PER_BOX)
 
-    def _busy_rfid_slots(self, address, driver):
-        reply = driver.query_rfid_records(timeout=0.5)
+    @staticmethod
+    def _rfid_cache_key(sample):
+        if not sample:
+            return None
+        return (sample[0] or "").strip("\x00")
+
+    @staticmethod
+    def _rfid_record_ready(sample):
+        if not sample:
+            return False
+        record, fields = sample
+        return len((record or "").strip("\x00")) == 40 and bool(fields)
+
+    def _rfid_should_apply(self, slot, sample):
+        if not self._rfid_record_ready(sample):
+            return False
+        if slot in self.rfid_seen_invalid:
+            return True
+        if slot not in self.rfid_snapshot:
+            return False
+        return self._rfid_cache_key(sample) != self.rfid_snapshot[slot]
+
+    def _watch_pending_rfid(self, address, driver):
+        slots = self._pending_rfid_slots(address)
+        if not slots:
+            return
+        try:
+            reply = driver.query_rfid_records(timeout=0.5)
+        except Exception:
+            return
         if reply is None or reply.status != box_protocol.STATUS_OK:
-            return set()
-        return {
-            self._global_slot(address, local)
-            for local, name in enumerate(box_protocol.RFID_SLOT_NAMES)
-            if reply.records.get(name, "").strip("\x00").lower() == "busy"
-        }
+            return
+        for slot in slots:
+            _, local = self._address_slot(slot)
+            name = box_protocol.RFID_SLOT_NAMES[local]
+            sample = (
+                reply.records.get(name, "").strip("\x00"),
+                reply.fields.get(name),
+            )
+            if not self._rfid_record_ready(sample):
+                self.rfid_seen_invalid.add(slot)
 
-    def _finish_verified_rfid(self, address, state_reply):
+    def _finish_pending_rfid(self, address, state_reply):
         if state_reply.box_state == box_protocol.BOX_STATE_PRELOAD:
             return
-        for slot in self._pending_rfid_slots(address, "fresh"):
+        for slot in self._pending_rfid_slots(address):
             self._read_rfid_result(slot)
 
     def _query_box_snapshot(self, address, driver, include_topology):
         if include_topology:
             self._query_presence(address, driver)
         for _attempt in range(STATE_EVENT_DRAIN):
-            waiting = self._pending_rfid_slots(address, "waiting")
-            busy_before = (
-                self._busy_rfid_slots(address, driver) if waiting else set())
+            self._watch_pending_rfid(address, driver)
             reply = driver.query_box_state(timeout=0.5)
             if reply is None:
                 return None
             if reply.slot_events is None:
-                if (reply.box_state == box_protocol.BOX_STATE_PRELOAD
-                        and busy_before):
-                    busy_after = self._busy_rfid_slots(address, driver)
-                    for slot in busy_before & busy_after & set(waiting):
-                        if self.rfid_pending.get(slot) == "waiting":
-                            self.rfid_pending[slot] = "fresh"
-                self._finish_verified_rfid(address, reply)
+                self._finish_pending_rfid(address, reply)
                 return reply
             self._query_presence(address, driver)
             self._handle_slot_events(address, reply.slot_events)
@@ -1495,16 +1542,20 @@ class Box:
             return "error"
         record, fields = sample
         if record.lower() == "busy":
+            self.rfid_seen_invalid.add(slot)
             return "busy"
-        self.rfid_pending.pop(slot, None)
-        if record.lower() in ("", "none", "unknown"):
-            if record.lower() == "none":
-                self._rfid_removed(slot)
-            else:
-                self.rfid_live_slots.discard(slot)
-                self.rfid_percent.pop(slot, None)
+        if record.lower() == "none":
+            self._rfid_removed(slot)
+            return "none"
+        if not self._rfid_record_ready(sample):
+            self.rfid_seen_invalid.add(slot)
+            self.rfid_live_slots.discard(slot)
+            self.rfid_percent.pop(slot, None)
             return record.lower() or "unknown"
-        if not fields or not self._apply_rfid_record(slot, record, fields):
+        if not self._rfid_should_apply(slot, sample):
+            return "stale"
+        self._clear_rfid_watch(slot)
+        if not self._apply_rfid_record(slot, record, fields):
             self.rfid_live_slots.discard(slot)
             self.rfid_percent.pop(slot, None)
             return "invalid"
@@ -1537,6 +1588,7 @@ class Box:
                 applied.add(slot)
                 self.rfid_live_slots.add(slot)
                 self._read_rfid_remaining(slot)
+            self._clear_rfid_watch(slot)
         return applied
 
     def _refresh_rfid_remaining(self):
@@ -2141,8 +2193,7 @@ class Box:
     def _record_command_fault(self, reply, context):
         if reply is None or reply.status not in CFS_COMMAND_FATAL_STATUSES:
             return False
-        reason = "%s returned %s" % (
-            context, box_protocol.status_name(reply.status))
+        reason = box_protocol.status_detail(reply.status)
         latched = self._latch_fatal_fault(
             reply.address, reply.status, reason)
         if latched:
@@ -2182,8 +2233,7 @@ class Box:
             raise BoxError("CFS did not respond during %s" % context)
         if reply.status not in allowed:
             self._record_command_fault(reply, context)
-            raise BoxError(
-                "%s returned %s" % (context, box_protocol.status_name(reply.status)))
+            raise BoxError(box_protocol.status_detail(reply.status))
         return reply
 
     @staticmethod
@@ -2343,8 +2393,10 @@ class Box:
                 self.runout_origin = tracking_owner.slot
                 self.runout_key = (address, tracking_owner.epoch)
                 if is_new:
-                    self._warn("CFS box %d spool runout (%s)" % (
-                        address, box_protocol.status_name(status)))
+                    self._info(
+                        self.gcode,
+                        "CFS box %d spool runout %s"
+                        % (address, box_protocol.status_detail(status)))
             elif is_new:
                 self._warn(
                     "CFS box %d reported %s without active tracking; advisory only"
@@ -2352,16 +2404,15 @@ class Box:
             self.fault_episodes[address] = key
             return
 
-        if (status in (
-                box_protocol.STATUS_BUFFER_REFILL_STALLED,
-                box_protocol.STATUS_BUFFER_REFILL_NO_MOTION)
+        if (status == box_protocol.STATUS_BUFFER_REFILL_STALLED
                 and self.runout_key is not None
                 and self.runout_key[0] == address):
             key = self._fault_key(status, "runout")
             is_new = self.fault_episodes.get(address) != key
             if is_new:
-                self._warn("CFS box %d spool runout (%s)" % (
-                    address, box_protocol.status_name(status)))
+                _klog(
+                    "CFS box %d BUFFER_REFILL_STALLED during runout %s",
+                    address, box_protocol.status_detail(status))
             self.fault_episodes[address] = key
             return
 
@@ -2370,12 +2421,11 @@ class Box:
             status, "fatal" if fatal else "advisory")
         if self.fault_episodes.get(address) == key:
             return
-        detail = "CFS box %d %s %s state=%s raw=%s" % (
+        detail = "CFS box %d %s %s state=%s" % (
             address,
             "fault" if fatal else "status",
-            box_protocol.status_name(status),
-            box_protocol.state_name(reply.box_state),
-            reply.raw.hex() if reply.raw else "none")
+            box_protocol.status_detail(status),
+            box_protocol.state_name(reply.box_state))
         if not fatal:
             self.fault_episodes[address] = key
             self._warn(detail + "; advisory only")
@@ -2499,7 +2549,7 @@ class Box:
                         self._warn(
                             "T%d deferred RFID read failed: %s; loading without metadata"
                             % (slot, exc))
-                self.rfid_pending.pop(slot, None)
+                self._clear_rfid_watch(slot)
             load_encoder_start = self._optional_encoder(driver)
             self._require_reply(
                 driver.load_stage(local, 0, timeout=45.0), "load stage 0")
@@ -2508,9 +2558,7 @@ class Box:
             with driver.load_session() as load_driver:
                 stage4 = load_driver.load_stage(local, 4, timeout=1.0)
                 if stage4 is not None and stage4.status != 0x00:
-                    raise BoxError(
-                        "load stage 4 rejected: %s"
-                        % box_protocol.status_name(stage4.status))
+                    raise BoxError(box_protocol.status_detail(stage4.status))
                 self.check_operation_abort(fault_generation)
 
                 deadline = self.reactor.monotonic() + LOAD_TIMEOUT
@@ -2534,9 +2582,7 @@ class Box:
                         continue
                     if stage5.status in (0x0A, 0x0B):
                         self._record_command_fault(stage5, "load stage 5")
-                        raise BoxError(
-                            "load failed: %s"
-                            % box_protocol.status_name(stage5.status))
+                        raise BoxError(box_protocol.status_detail(stage5.status))
                     if stage5.status == box_protocol.STATUS_ODOMETER_STALLED:
                         detected, error = self.get_filament_sensor_state()
                         if not error and detected:
@@ -2551,17 +2597,13 @@ class Box:
                                 local, 4, timeout=1.0)
                             if stage4 is not None and stage4.status != 0x00:
                                 raise BoxError(
-                                    "load stage 4 retry rejected: %s"
-                                    % box_protocol.status_name(stage4.status))
+                                    box_protocol.status_detail(stage4.status))
                             continue
                         self._record_command_fault(stage5, "load stage 5")
-                        raise BoxError(
-                            "CFS odometer stalled before printhead sensor arrival")
+                        raise BoxError(box_protocol.status_detail(stage5.status))
                     if stage5.status != 0x00:
                         self._record_command_fault(stage5, "load stage 5")
-                        raise BoxError(
-                            "load stage 5 failed: %s"
-                            % box_protocol.status_name(stage5.status))
+                        raise BoxError(box_protocol.status_detail(stage5.status))
                     self.reactor.pause(
                         self.reactor.monotonic() + STAGE5_POLL)
 
@@ -2590,9 +2632,7 @@ class Box:
                     "CFS final nudge did not reach 3mm; printhead sensor was "
                     "already confirmed")
             elif stage7.status != 0x00:
-                raise BoxError(
-                    "load stage 7 rejected: %s"
-                    % box_protocol.status_name(stage7.status))
+                raise BoxError(box_protocol.status_detail(stage7.status))
 
             self.check_operation_abort(fault_generation)
             self.activate_tracking(slot)
@@ -2811,7 +2851,7 @@ class Box:
             if episode is not None and episode[-1] == "fatal":
                 raise BoxError(
                     "CFS box %d remains in fatal state %s"
-                    % (last.path_box, box_protocol.status_name(episode[0])))
+                    % (last.path_box, box_protocol.status_detail(episode[0])))
             if (last.loaded_slot == loaded_slot
                     and last.filament_detected == detected
                     and last.tracking == tracking):

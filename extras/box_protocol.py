@@ -40,6 +40,7 @@ STATUS_INVALID_PARAM = 0x01
 STATUS_BAD_CRC = 0x02
 STATUS_BUSY = 0x03
 STATUS_STAGE0_SENSOR_TIMEOUT = 0x05
+STATUS_BUFFER_FILL_TIMEOUT = 0x06 #no callers
 STATUS_SLOT_EMPTY = 0x08
 STATUS_STAGE0_ODOMETER_TIMEOUT = 0x09
 STATUS_FEED_TIMEOUT = 0x0A
@@ -48,9 +49,10 @@ STATUS_ODOMETER_STALLED = 0x0C
 STATUS_BUFFER_NOT_FULL = 0x0D
 STATUS_STAGE7_NO_MOTION = 0x0E
 STATUS_UNLOAD_BUFFER_TIMEOUT = 0x13
-STATUS_UNLOAD_HUB_CLEAR_TIMEOUT = 0x14
+STATUS_UNLOAD_HUB_PE_TIMEOUT = 0x14
 STATUS_UNLOAD_NO_FILAMENT = 0x16
 STATUS_UNLOAD_INLET_CLEAR = 0x17
+STATUS_UNLOAD_ALL_EMPTY = 0x18
 STATUS_UNLOAD_MOTOR_BLOCKED = 0x19
 STATUS_UNLOAD_ODOMETER_TIMEOUT = 0x1A
 STATUS_SLOT_EVENT = 0x30
@@ -71,7 +73,7 @@ COMMAND_STATUSES = QUERY_STATUSES | frozenset((STATUS_BUSY,))
 LOAD_STAGE_STATUSES = {
     0: COMMAND_STATUSES | frozenset((
         STATUS_STAGE0_SENSOR_TIMEOUT, STATUS_SLOT_EMPTY,
-        STATUS_STAGE0_ODOMETER_TIMEOUT, STATUS_UNLOAD_HUB_CLEAR_TIMEOUT,
+        STATUS_STAGE0_ODOMETER_TIMEOUT, STATUS_UNLOAD_HUB_PE_TIMEOUT,
         STATUS_UNLOAD_INLET_CLEAR, STATUS_UNLOAD_MOTOR_BLOCKED,
         STATUS_UNLOAD_ODOMETER_TIMEOUT,
     )),
@@ -79,7 +81,9 @@ LOAD_STAGE_STATUSES = {
     5: QUERY_STATUSES | frozenset((
         STATUS_FEED_TIMEOUT, STATUS_OVERTRAVEL, STATUS_ODOMETER_STALLED,
     )),
-    6: QUERY_STATUSES | frozenset((STATUS_BUFFER_NOT_FULL,)),
+    6: QUERY_STATUSES | frozenset((
+        STATUS_BUFFER_NOT_FULL, STATUS_BUFFER_FILL_TIMEOUT,
+    )),
     7: QUERY_STATUSES | frozenset((STATUS_STAGE7_NO_MOTION,)),
 }
 LOAD_STAGE_PAYLOAD_LENGTHS = {
@@ -94,11 +98,12 @@ LOAD_STAGE_STATUS_PAYLOAD_LENGTHS = {
 UNLOAD_PHASE_STATUSES = {
     0: COMMAND_STATUSES | frozenset((
         STATUS_UNLOAD_BUFFER_TIMEOUT, STATUS_UNLOAD_NO_FILAMENT,
+        STATUS_UNLOAD_ALL_EMPTY,
     )),
     1: COMMAND_STATUSES | frozenset((
-        STATUS_UNLOAD_HUB_CLEAR_TIMEOUT, STATUS_UNLOAD_NO_FILAMENT,
-        STATUS_UNLOAD_INLET_CLEAR, STATUS_UNLOAD_MOTOR_BLOCKED,
-        STATUS_UNLOAD_ODOMETER_TIMEOUT,
+        STATUS_UNLOAD_HUB_PE_TIMEOUT, STATUS_UNLOAD_NO_FILAMENT,
+        STATUS_UNLOAD_INLET_CLEAR, STATUS_UNLOAD_ALL_EMPTY,
+        STATUS_UNLOAD_MOTOR_BLOCKED, STATUS_UNLOAD_ODOMETER_TIMEOUT,
     )),
 }
 RFID_FORCE_STATUSES = UNLOAD_PHASE_STATUSES[1]
@@ -118,6 +123,7 @@ STATUS_NAMES = {
     STATUS_BAD_CRC: "BAD_CRC",
     STATUS_BUSY: "BUSY",
     STATUS_STAGE0_SENSOR_TIMEOUT: "STAGE0_SENSOR_TIMEOUT",
+    STATUS_BUFFER_FILL_TIMEOUT: "BUFFER_FILL_TIMEOUT",
     STATUS_SLOT_EMPTY: "SLOT_EMPTY",
     STATUS_STAGE0_ODOMETER_TIMEOUT: "STAGE0_ODOMETER_TIMEOUT",
     STATUS_FEED_TIMEOUT: "FEED_TIMEOUT",
@@ -126,9 +132,10 @@ STATUS_NAMES = {
     STATUS_BUFFER_NOT_FULL: "BUFFER_NOT_FULL",
     STATUS_STAGE7_NO_MOTION: "STAGE7_NO_MOTION",
     STATUS_UNLOAD_BUFFER_TIMEOUT: "UNLOAD_BUFFER_TIMEOUT",
-    STATUS_UNLOAD_HUB_CLEAR_TIMEOUT: "UNLOAD_HUB_CLEAR_TIMEOUT",
+    STATUS_UNLOAD_HUB_PE_TIMEOUT: "UNLOAD_HUB_PE_TIMEOUT",
     STATUS_UNLOAD_NO_FILAMENT: "UNLOAD_NO_FILAMENT",
     STATUS_UNLOAD_INLET_CLEAR: "UNLOAD_INLET_CLEAR",
+    STATUS_UNLOAD_ALL_EMPTY: "UNLOAD_ALL_EMPTY",
     STATUS_UNLOAD_MOTOR_BLOCKED: "UNLOAD_MOTOR_BLOCKED",
     STATUS_UNLOAD_ODOMETER_TIMEOUT: "UNLOAD_ODOMETER_TIMEOUT",
     STATUS_SLOT_EVENT: "SLOT_EVENT",
@@ -152,6 +159,94 @@ def status_name(value):
 
 def state_name(value):
     return "NO_RESPONSE" if value is None else STATE_NAMES.get(value, "UNKNOWN")
+
+
+# (meaning, what to check or None). Identifiers stay in STATUS_NAMES.
+STATUS_HINTS = {
+    STATUS_STAGE0_SENSOR_TIMEOUT: (
+        "filament never reached the path sensor on the way into the hub (7 s)",
+        "if filament is seated in the slot gears and not tangled",
+    ),
+    STATUS_SLOT_EMPTY: (
+        "the chosen slot has no filament at the inlet",
+        None,
+    ),
+    STATUS_STAGE0_ODOMETER_TIMEOUT: (
+        "the hub odometer did not move for 2 s",
+        "for a tangle, or whether the hub is turning filament",
+    ),
+    STATUS_FEED_TIMEOUT: (
+        "the hub fed for 25 s without filament finishing the path through the buffer to the printhead",
+        None,
+    ),
+    STATUS_OVERTRAVEL: (
+        "hub fed 3 m but filament never arrived",
+        "for PTFE disconnections",
+    ),
+    STATUS_ODOMETER_STALLED: (
+        "the hub odometer stopped changing for 500 ms",
+        "for a jam or resistance in the filament path",
+    ),
+    STATUS_BUFFER_NOT_FULL: (
+        "the buffer never showed full after feeding",
+        None,
+    ),
+    STATUS_UNLOAD_BUFFER_TIMEOUT: (
+        "the hub reversed and the buffer did not go empty in 5 s",
+        "for filament stuck in the buffer, or the PTFE between buffer and hub",
+    ),
+    STATUS_UNLOAD_HUB_PE_TIMEOUT: (
+        "retract waited for the hub path to clear, and it never did",
+        "for filament stuck in the hub",
+    ),
+    STATUS_UNLOAD_NO_FILAMENT: (
+        "the chosen slot is not showing filament present",
+        None,
+    ),
+    STATUS_UNLOAD_INLET_CLEAR: (
+        "retract from the hub started while the slot inlet still showed filament",
+        None,
+    ),
+    STATUS_UNLOAD_MOTOR_BLOCKED: (
+        "the hub motor stalled while pulling filament back",
+        "for a jam on retract",
+    ),
+    STATUS_UNLOAD_ODOMETER_TIMEOUT: (
+        "the hub pulled back for 40 s without completion",
+        None,
+    ),
+    STATUS_RUNOUT: (
+        "the spool ran out",
+        None,
+    ),
+    STATUS_BUFFER_REFILL_STALLED: (
+        "the hub is moving filament, but the buffer stays empty",
+        "the PTFE from the hub into the buffer",
+    ),
+    STATUS_BUFFER_REFILL_NO_MOTION: (
+        "the hub tried to refill the buffer, but the odometer moved less than 5 mm",
+        "for a jam or tangle in the filament path",
+    ),
+}
+
+
+def status_detail(value):
+    name = status_name(value)
+    hint = STATUS_HINTS.get(value)
+    if hint is None:
+        return name
+    meaning, check = hint
+    body = meaning if meaning.endswith(".") else meaning + "."
+    if check:
+        body += " Check %s." % (check.rstrip("."),)
+    return "(%s): %s" % (name, body)
+
+
+def format_failed(prefix, detail):
+    detail = str(detail)
+    if detail.startswith("("):
+        return "%s failed %s" % (prefix, detail)
+    return "%s failed: %s" % (prefix, detail)
 
 
 def _klog(msg, *args, level=logging.info):

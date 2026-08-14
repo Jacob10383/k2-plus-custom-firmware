@@ -363,17 +363,34 @@ WARNING_CODE_LABELS = {
     2: "MCU overheating",
 }
 
+# Response STATUS latch bits: stall, error, warning.
+FRAME_STATUS_STALL = 0x01
+FRAME_STATUS_ERROR = 0x02
+FRAME_STATUS_WARNING = 0x04
+FRAME_STATUS_KNOWN = (
+    FRAME_STATUS_STALL | FRAME_STATUS_ERROR | FRAME_STATUS_WARNING)
+
 
 def decode_protection_payload(payload: bytes) -> dict:
     error_code = int.from_bytes(payload[:4].ljust(4, b"\x00"), "little")
-    warning_code = int.from_bytes(payload[4:6].ljust(2, b"\x00"), "little")
-    status_code = payload[6] if len(payload) >= 7 else 0
+    warning_code = int.from_bytes(payload[4:8].ljust(4, b"\x00"), "little")
     return {
         "error_code": error_code,
         "warning_code": warning_code,
-        "status_code": status_code,
         "has_error": bool(error_code),
-        "active": bool(error_code or warning_code or status_code),
+        "active": bool(error_code or warning_code),
+    }
+
+
+def decode_frame_status(status) -> dict:
+    value = int(status or 0) & 0xFF
+    unknown = value & ~FRAME_STATUS_KNOWN
+    return {
+        "status": value,
+        "stalled": bool(value & FRAME_STATUS_STALL),
+        "faulted": bool(value & FRAME_STATUS_ERROR),
+        "warned": bool(value & FRAME_STATUS_WARNING),
+        "unknown": unknown,
     }
 
 
@@ -403,13 +420,11 @@ def _decode_mask(mask: int, labels_map: dict[int, str]) -> dict:
 def describe_fault_detail(detail: dict) -> dict:
     error_code = int(detail["error_code"] or 0)
     warning_code = int(detail["warning_code"] or 0)
-    status_code = int(detail["status_code"] or 0)
     error_detail = _decode_mask(error_code, ERROR_CODE_LABELS)
     warning_detail = _decode_mask(warning_code, WARNING_CODE_LABELS)
     return {
         "error_code": error_code,
         "warning_code": warning_code,
-        "status_code": status_code,
         "error_bits": error_detail["bits"],
         "warning_bits": warning_detail["bits"],
         "error_labels": error_detail["labels"],
@@ -446,16 +461,15 @@ def format_fault_detail(axis_label: str, detail: dict) -> str:
         "unknown warning", decoded["unknown_warning_bits"])
     if unknown_warning_text:
         parts.append(unknown_warning_text)
-    if decoded["status_code"]:
-        parts.append("status=%d" % (decoded["status_code"],))
+    if detail.get("unverified"):
+        parts.append("unverified protection query")
+        query_error = detail.get("query_error")
+        if query_error:
+            parts.append(str(query_error))
     if not parts:
         parts.append(
-            "err=%d warn=%d status=%d"
-            % (
-                decoded["error_code"],
-                decoded["warning_code"],
-                decoded["status_code"],
-            ))
+            "err=%d warn=%d"
+            % (decoded["error_code"], decoded["warning_code"]))
     return "%s: %s" % (axis_label, "; ".join(parts))
 
 
@@ -1201,15 +1215,25 @@ class MotorFirmwareClient:
             addr, FUNC_READ_ADDR, b"\x02", timeout=timeout,
             label="read_addr")
         frame, public = self._validated_frame_result(
-            result, frame, "read_addr", strict_status=True)
+            result, frame, "read_addr")
         payload = frame["payload"]
         if len(payload) != 1:
             raise RuntimeError(
                 "unexpected read_addr payload len=%d payload_hex=%s"
                 % (len(payload), payload.hex()))
+        decoded = decode_frame_status(frame["status"])
+        if decoded["unknown"]:
+            raise RuntimeError(
+                "unexpected read_addr status for addr=0x%02X: 0x%02X"
+                " (unknown status bits 0x%02X - not safe to proceed)"
+                % (int(addr) & 0xFF, decoded["status"], decoded["unknown"]))
         return {
             **public,
             "reported_addr": payload[0],
+            "status": decoded["status"],
+            "faulted": decoded["faulted"],
+            "warned": decoded["warned"],
+            "stalled": decoded["stalled"],
         }
 
     def startup_prepare_probe_bus(
@@ -1228,17 +1252,18 @@ class MotorFirmwareClient:
             label="startup_probe")
         frame, public = self._validated_frame_result(
             result, frame, "startup_probe")
-        status = frame["status"]
-        if status not in (0x00, 0x02, 0x04):
+        decoded = decode_frame_status(frame["status"])
+        if decoded["unknown"]:
             raise RuntimeError(
                 "unexpected startup probe status for addr=0x%02X: 0x%02X"
-                " (unknown status - not safe to proceed)"
-                % (int(addr) & 0xFF, status))
+                " (unknown status bits 0x%02X - not safe to proceed)"
+                % (int(addr) & 0xFF, decoded["status"], decoded["unknown"]))
         return {
             **public,
-            "status": status,
-            "faulted": status == 0x02,
-            "warned": status == 0x04,
+            "status": decoded["status"],
+            "faulted": decoded["faulted"],
+            "warned": decoded["warned"],
+            "stalled": decoded["stalled"],
         }
 
     def set_stall_mode(self, addr: int, mode: int,
@@ -2513,11 +2538,11 @@ class MotorControlDebugSurfaceMixin:
                 detail = result[axis]
                 err = int(detail["error_code"] or 0)
                 warn = int(detail["warning_code"] or 0)
-                status = int(detail["status_code"] or 0)
+                frame_status = int(detail.get("frame_status") or 0)
                 active = detail["active"]
                 lines.append(
-                    "%s: error=0x%04X  warning=0x%04X  status=0x%02X  active=%s"
-                    % (axis.upper(), err, warn, status, active))
+                    "%s: error=0x%08X  warning=0x%08X  frame_status=0x%02X  active=%s"
+                    % (axis.upper(), err, warn, frame_status, active))
             for line in lines:
                 gcmd.respond_info(line)
             return {"axes": result, "elapsed_ms": elapsed_ms}
@@ -3231,14 +3256,20 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             addr for addr, detail in result.items() if detail.get("faulted"))
         warned = sorted(
             addr for addr, detail in result.items() if detail.get("warned"))
+        stalled = sorted(
+            addr for addr, detail in result.items() if detail.get("stalled"))
         if faulted:
             self.gcode.respond_info(
                 "Motor control: fault active on axes %s at startup, attempting clear"
                 % faulted)
         if warned:
             self.gcode.respond_info(
-                "Motor control: warning active on axes %s at startup, reporting only"
+                "Motor control: warning active on axes %s at startup, attempting clear"
                 % warned)
+        if stalled:
+            self.gcode.respond_info(
+                "Motor control: stall latch active on axes %s at startup"
+                % stalled)
         return {
             "prepare": prepared,
             "targets": result,
@@ -3252,18 +3283,18 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                                        timeout: float):
         result = self.query_protection_status(
             axes=axes, data=PROTECTION_QUERY_DATA, timeout=timeout)
-        active_errors = {
-            axis: detail for axis, detail in result.items() if detail.get("active")
-            and detail.get("has_error")
+        active = {
+            axis: detail for axis, detail in result.items()
+            if detail.get("active")
         }
         warnings = {
-            axis: detail for axis, detail in result.items()
-            if detail.get("active") and not detail.get("has_error")
+            axis: detail for axis, detail in active.items()
+            if not detail.get("has_error")
         }
         if warnings:
             self._emit_runtime_warning(
                 {"source": "startup_check"}, warnings, status_text="ACTIVE")
-        self._startup_protection_active[label] = tuple(sorted(active_errors))
+        self._startup_protection_active[label] = tuple(sorted(active))
         return result
 
     def _startup_clear_axis_faults(
@@ -3577,9 +3608,6 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             return
         error_value = int(detail.get("error_code", 0) or 0)
         warning_value = int(detail.get("warning_code", 0) or 0)
-        status_code = int(detail.get("status_code", 0) or 0)
-        if not error_value and detail.get("active"):
-            error_value = status_code or 1
         for key in (num, str(num)):
             self.motor_error_code[key] = error_value
             self.motor_warning_code[key] = warning_value
@@ -4358,7 +4386,6 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                     "has_error": True,
                     "error_code": 0,
                     "warning_code": 0,
-                    "status_code": 1,
                     "query_error": repr(exc),
                     "unverified": True,
                 },

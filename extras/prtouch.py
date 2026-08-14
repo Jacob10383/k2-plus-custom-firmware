@@ -15,6 +15,33 @@ def _sample_range(values):
     return max(values) - min(values)
 
 
+def _decode_prtouch_frame(payload, signed_first):
+    """Decode the nozzle firmware's delta-packed integer array."""
+    payload = bytes(payload)
+    if not payload:
+        return []
+    count = payload[0]
+    descriptor_len = (count + 3) // 4
+    data_pos = 1 + descriptor_len
+    if len(payload) < data_pos:
+        raise ValueError("truncated descriptor")
+    descriptors = payload[1:data_pos]
+    values = []
+    for index in range(count):
+        descriptor = descriptors[-1 - index // 4]
+        width = ((descriptor >> (2 * (index % 4))) & 3) + 1
+        if data_pos + width > len(payload):
+            raise ValueError("truncated data")
+        raw = payload[data_pos:data_pos + width]
+        data_pos += width
+        value = int.from_bytes(
+            raw, 'little', signed=signed_first if index == 0 else True)
+        if index:
+            value += values[-1]
+        values.append(value)
+    return values
+
+
 def _best_subset(values, size):
     if len(values) < size:
         return None
@@ -179,6 +206,8 @@ class PRTouchEndstopWrapper:
         self.stop_step_cmd = None
         self.start_pres_cmd = None
         self.stop_pres_cmd = None
+        self.read_pres_cmd = None
+        self._pres_clock_freq = None
         self._pres_hold_ratio = 1.
 
         self.step_mcu.register_config_callback(self._build_step_config)
@@ -326,7 +355,13 @@ class PRTouchEndstopWrapper:
             cq=None)
         self.stop_pres_cmd = self.pres_mcu.lookup_command(
             'stop_prtouch_pres oid=%c sta_swap=%c', cq=None)
+        self.read_pres_cmd = self.pres_mcu.lookup_query_command(
+            'read_prtouch_pres oid=%c is_src=%c ch=%c idx=%c len=%c',
+            'resault_prtouch_pres oid=%c tri_chxs=%c buf_len=%c '
+            'ch=%c idx=%c len=%c ticks=%.*s datas=%.*s',
+            oid=self.pres_oid, cq=None)
         pres_freq = self.pres_mcu.get_constant_float('CLOCK_FREQ')
+        self._pres_clock_freq = pres_freq
         self._pres_acq_tick = max(
             1, int(round(self.pres_acq_tkms * .001 * pres_freq)))
 
@@ -453,9 +488,124 @@ class PRTouchEndstopWrapper:
     def probe_prepare(self, hmove):
         self._arm()
 
+    def _report_probe_diagnostic(self):
+        armed = self._armed
+        ack = dict(self._last_ack or {})
+        swap_triggered = None
+        notes = []
+        try:
+            swap_triggered = self._query_swap_triggered()
+        except Exception as exc:
+            notes.append('swap query failed: %s' % exc)
+        frozen = False
+        try:
+            self.stop_pres_cmd.send(
+                [self.pres_oid, self.pres_idle_swap_state])
+            frozen = True
+        except Exception as exc:
+            notes.append('PRES freeze failed: %s' % exc)
+
+        params = {}
+        ticks = []
+        pressures = []
+        index = 0
+        buf_len = 64
+        pages = 0
+        while index < buf_len and pages < 64:
+            try:
+                page = self.read_pres_cmd.send(
+                    [self.pres_oid, 1, 0, index, buf_len - index],
+                    retry=False)
+            except Exception as exc:
+                notes.append('PRES read failed at idx=%d: %s' % (index, exc))
+                break
+            pages += 1
+            if not params:
+                params = page
+                try:
+                    buf_len = max(0, min(64, int(page.get('buf_len', 64))))
+                except Exception:
+                    notes.append('invalid buf_len=%r' % page.get('buf_len'))
+            try:
+                page_ticks = _decode_prtouch_frame(
+                    page.get('ticks', b''), False)
+            except Exception as exc:
+                page_ticks = []
+                notes.append('tick decode failed at idx=%d: %s' % (index, exc))
+            try:
+                page_pressures = _decode_prtouch_frame(
+                    page.get('datas', b''), True)
+            except Exception as exc:
+                page_pressures = []
+                notes.append(
+                    'pressure decode failed at idx=%d: %s' % (index, exc))
+            decoded_len = max(len(page_ticks), len(page_pressures))
+            if not decoded_len:
+                notes.append('empty PRES page at idx=%d' % index)
+                break
+            try:
+                page_index = int(page.get('idx', index))
+                page_len = int(page.get('len', decoded_len))
+                if page_index != index:
+                    notes.append(
+                        'firmware idx=%d requested=%d' % (page_index, index))
+                if page_len != decoded_len:
+                    notes.append(
+                        'firmware len=%d decoded=%d at idx=%d'
+                        % (page_len, decoded_len, index))
+            except Exception:
+                notes.append('invalid page metadata at idx=%d' % index)
+            remaining = max(0, buf_len - index)
+            ticks.extend(
+                value & 0xffffffff for value in page_ticks[:remaining])
+            pressures.extend(page_pressures[:remaining])
+            index += min(decoded_len, remaining)
+
+        age_ms = span_ms = None
+        try:
+            if ticks and self._pres_clock_freq:
+                now_clock = self.pres_mcu.print_time_to_clock(
+                    self.pres_mcu.estimated_print_time(
+                        self.reactor.monotonic()))
+                age_ms = ((now_clock - ticks[-1]) & 0xffffffff)
+                age_ms *= 1000. / self._pres_clock_freq
+                span_ms = ((ticks[-1] - ticks[0]) & 0xffffffff)
+                span_ms *= 1000. / self._pres_clock_freq
+        except Exception as exc:
+            notes.append('sample timing failed: %s' % exc)
+        summary = 'pressure_samples=0'
+        if pressures:
+            summary = (
+                'pressure_samples=%d first=%d last=%d min=%d max=%d '
+                'range=%d delta=%d'
+                % (len(pressures), pressures[0], pressures[-1],
+                   min(pressures), max(pressures),
+                   max(pressures) - min(pressures),
+                   pressures[-1] - pressures[0]))
+        tri_chxs = params.get('tri_chxs')
+        tri_text = 'n/a' if tri_chxs is None else '0x%02x' % tri_chxs
+        self.gcode.respond_info(
+            'PRTouch probe diagnostic:\n'
+            'armed=%s arm_ack=(err=%s expar0=%s expar1=%s) '
+            'swap_triggered=%s buffer_frozen=%s tri_chxs=%s '
+            'buf_len=%s ch=%s pages=%d ticks=%d pressure=%d target=%d\n'
+            'last_sample_age_ms=%s sample_span_ms=%s %s\n'
+            'notes=%s\nticks=%s\npressure=%s'
+            % (armed, ack.get('err'), ack.get('expar0'), ack.get('expar1'),
+               swap_triggered, frozen, tri_text, params.get('buf_len'),
+               params.get('ch'), pages, len(ticks), len(pressures), buf_len,
+               'n/a' if age_ms is None else '%.3f' % age_ms,
+               'n/a' if span_ms is None else '%.3f' % span_ms,
+               summary, '; '.join(notes) if notes else 'none',
+               ticks, pressures))
+
     def probe_finish(self, hmove):
         if self._armed:
-            self._disarm(verify_release=True)
+            try:
+                if not getattr(hmove, 'triggered_endstops', ()):
+                    self._report_probe_diagnostic()
+            finally:
+                self._disarm(verify_release=True)
 
     def multi_probe_begin(self, always_restore_toolhead=False):
         pass
