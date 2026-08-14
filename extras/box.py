@@ -22,7 +22,6 @@ from extras.box_catalog import resolve_material
 from extras.motion_limits import restore_motion_limits, save_motion_limits
 
 
-STATE_PATH = "/mnt/UDISK/printer_data/filament_box.json"
 SLOTS_PER_BOX = 4
 EXTERNAL_PROFILE_KEY = "external"
 API_VERSION = 1
@@ -62,7 +61,6 @@ UNLOAD_RETRACT_MM = 25.0
 UNLOAD_CLEAR_MIN_MM = 50.0
 UNLOAD_RETRY_MM = 25.0
 UNLOAD_RETRIES = 3
-EXTRUDER_RETRACT_F = 3000
 ENCODER_CLEAR_MM = 20.0
 
 CLOG_EXTRUDER_MM = 80.0
@@ -93,25 +91,15 @@ CFS_ADVISORY_STATUSES = frozenset((
 ))
 
 CLEAN_LIMIT_VELOCITY = 800
-CLEAN_LIMIT_ACCEL = 30000
+CLEAN_LIMIT_ACCEL = 10000
 CLEAN_MINIMUM_CRUISE_RATIO = 0.5
-CLEAN_LIMIT_SCV = 10
-CLEAN_TRAVEL_F = 18000
-CLEAN_WIPE_PASSES = 4
-CLEAN_CIRCLE_RADIUS = 4.0
-CLEAN_CIRCLE_SEGMENTS = 16
-
-WASTEBIN_X = 133
-WASTEBIN_Y = 378
-WASTEBIN_MOVE_F = 18000
+CLEAN_LIMIT_SCV = 5
+CLEAN_SERPENTINE_Y_STEP = 2.0
+CLEAN_SCRAPER_PASSES = 3
 
 SNAP_RETRACT_MM = 1.2
-SNAP_RETRACT_F = 2000
-SNAP_FAN_SPEED = 1.0
-SNAP_FAN_DWELL_MS = 2000
 
 CUT_SAFE_Z = 2.0
-CUT_SAFE_Z_F = 600
 CUT_LIMIT_VELOCITY = 800
 CUT_LIMIT_ACCEL = 7500
 CUT_LIMIT_CRUISE = 1.0 / 3.0
@@ -119,9 +107,6 @@ CUT_LIMIT_SCV = 10
 CUT_RETURN_WAIT = 3.0
 CUT_RETRY_SETTLE = 0.15
 CUT_POST_RETRACT_MM = 3.0
-CUT_POST_RETRACT_F = 600
-CUT_FINAL_SNAP_MM = 7.0
-CUT_FINAL_SNAP_F = 1200
 
 SPOOLMAN_PROXY_URL = "http://127.0.0.1:7125/server/spoolman/proxy"
 SPOOLMAN_TIMEOUT = 2.0
@@ -154,7 +139,8 @@ class _VirtualSDGCodeObserver:
 
 def _spool_id_from_reserve(value):
     value = str(value or "").strip()
-    return int(value) if value.isdigit() and int(value) > 0 else None
+    # Some stock spools have 1 in this field, so it can't be used as a spool ID.
+    return int(value) if value.isdigit() and int(value) > 1 else None
 
 
 def _fetch_spoolman_spool(spool_id):
@@ -405,20 +391,42 @@ class Box:
         self.pause_resume = self.printer.load_object(config, "pause_resume")
         self.box_count = config.getint(
             "box_count", MAX_ADDRESSES, minval=1, maxval=MAX_ADDRESSES)
-        self.store = BoxStore(config.get("state_path", STATE_PATH))
+        self.store = BoxStore(config.get(
+            "state_path", "/mnt/UDISK/printer_data/filament_box.json"))
 
-        self.clean_left_x = config.getfloat("clean_left_pos_x", 137.0)
-        self.clean_right_x = config.getfloat("clean_right_pos_x", 170.0)
-        self.clean_right_y = config.getfloat("clean_right_pos_y", 378.0)
-        self.clean_velocity = config.getfloat("clean_velocity", 12000.0, above=0.0)
+        self.clean_pad_left_x = config.getfloat("clean_pad_left_x", 154.0)
+        self.clean_pad_right_x = config.getfloat("clean_pad_right_x", 166.0)
+        self.clean_pad_front_y = config.getfloat("clean_pad_front_y", 367.0)
+        self.clean_pad_back_y = config.getfloat("clean_pad_back_y", 378.0)
+        self.clean_pad_passes = config.getint(
+            "clean_pad_passes", 1, minval=1)
+        for legacy_name in (
+                "clean_left_pos_x", "clean_right_pos_x", "clean_right_pos_y"):
+            config.get(legacy_name, None)
+        if (self.clean_pad_left_x >= self.clean_pad_right_x
+                or self.clean_pad_front_y >= self.clean_pad_back_y):
+            raise config.error("Invalid clean pad boundaries")
+        self.wastebin_x = config.getfloat("wastebin_pos_x", 133.0)
+        self.wastebin_y = config.getfloat("wastebin_pos_y", 378.0)
+        self.travel_velocity = config.getfloat(
+            "travel_velocity", 18000.0, above=0.0)
+        self.z_velocity = config.getfloat(
+            "z_velocity", 600.0, above=0.0)
+        self.clean_velocity = config.getfloat(
+            "clean_velocity", 12000.0, above=0.0)
         self.snap_fan_speed = config.getfloat(
-            "snap_fan_speed", SNAP_FAN_SPEED, minval=0.0, maxval=1.0)
+            "snap_fan_speed", 1.0, minval=0.0, maxval=1.0)
         self.snap_fan_dwell_ms = config.getint(
-            "snap_fan_dwell_ms", SNAP_FAN_DWELL_MS, minval=0)
+            "snap_fan_dwell_ms", 2000, minval=0)
         self.pre_cut_x = config.getfloat("pre_cut_pos_x", 10.0)
         self.cut_x = config.getfloat("cut_pos_x", None)
         self.cut_y = config.getfloat("cut_pos_y", 200.0)
-        self.cut_velocity = config.getfloat("cut_velocity", 30000.0, above=0.0)
+        self.cut_velocity = config.getfloat(
+            "cut_velocity", 30000.0, above=0.0)
+        self.retract_velocity = config.getfloat(
+            "retract_velocity", 3000.0, above=0.0)
+        self.external_feed_velocity = config.getfloat(
+            "external_feed_velocity", 600.0, above=0.0)
         self.pre_cut_cal_x = config.getfloat("pre_cut_cal_pos_x", -5.0)
         self.cut_check_max_x = config.getfloat("check_cut_pos_x_max", -5.5)
         self.cut_check_min_x = config.getfloat("check_cut_pos_x_min", -9.5)
@@ -1757,48 +1765,52 @@ class Box:
         save_motion_limits(
             self.printer, self.gcode, "_box_clean_limits", include_gcode=True)
         try:
+            self.move_to_wastebin()
             self.gcode.run_script_from_command("G90")
-            self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            radius = CLEAN_CIRCLE_RADIUS
-            segments = CLEAN_CIRCLE_SEGMENTS
-            circle_y = self.clean_right_y - radius
-            first_start = self.clean_right_x - 2 * radius - 2.0
-            first_center = first_start + radius
+            left = self.clean_pad_left_x
+            right = self.clean_pad_right_x
+            front = self.clean_pad_front_y
+            back = self.clean_pad_back_y
+            y_steps = max(
+                1, int(round((back - front) / CLEAN_SERPENTINE_Y_STEP)))
+            center_x = (left + right) / 2.0
+            amplitude_x = (right - left) / 2.0
+            segments = y_steps * 8
             self.gcode.run_script_from_command(
-                "G0 X%.3f Y%.3f F%d" % (first_start, circle_y, CLEAN_TRAVEL_F))
-            for index in range(1, segments + 1):
-                angle = math.pi - 2.0 * math.pi * index / segments
-                self.gcode.run_script_from_command(
-                    "G0 X%.3f Y%.3f F%.0f" % (
-                        first_center + radius * math.cos(angle),
-                        circle_y + radius * math.sin(angle),
-                        self.clean_velocity))
-            second_center = self.clean_right_x - radius
+                "G0 Y%g F%.0f" % (back, self.travel_velocity))
             self.gcode.run_script_from_command(
-                "G0 X%.3f F%.0f" % (self.clean_right_x, self.clean_velocity))
-            for index in range(1, segments + 1):
-                angle = 2.0 * math.pi * index / segments
+                "G0 X%g F%.0f" % (left, self.clean_velocity))
+            for _index in range(CLEAN_SCRAPER_PASSES):
                 self.gcode.run_script_from_command(
-                    "G0 X%.3f Y%.3f F%.0f" % (
-                        second_center + radius * math.cos(angle),
-                        circle_y + radius * math.sin(angle),
-                        self.clean_velocity))
-            right = self.clean_right_x - (2 * radius + 1.0)
+                    "G0 X%g F%.0f" % (
+                        self.wastebin_x, self.clean_velocity))
+                self.gcode.run_script_from_command(
+                    "G0 X%g F%.0f" % (left, self.clean_velocity))
             self.gcode.run_script_from_command(
-                "G0 X%.1f Y%.1f F%.0f" % (
-                    right, self.clean_right_y, self.clean_velocity))
-            for _index in range(CLEAN_WIPE_PASSES):
+                "G0 X%g F%.0f" % (right, self.clean_velocity))
+            for pass_index in range(self.clean_pad_passes):
+                direction = -1.0 if (pass_index * y_steps) % 2 else 1.0
+                for index in range(1, segments + 1):
+                    progress = index / float(segments)
+                    x = center_x + direction * amplitude_x * math.cos(
+                        math.pi * y_steps * progress)
+                    y = back + (front - back) * progress
+                    self.gcode.run_script_from_command(
+                        "G0 X%.3f Y%.3f F%.0f" % (
+                            x, y, self.clean_velocity))
                 self.gcode.run_script_from_command(
-                    "G0 X%.1f F%.0f" % (self.clean_left_x, self.clean_velocity))
+                    "G0 X%g F%.0f" % (center_x, self.clean_velocity))
                 self.gcode.run_script_from_command(
-                    "G0 X%.1f F%.0f" % (right, self.clean_velocity))
+                    "G0 Y%g F%.0f" % (back, self.clean_velocity))
             self.gcode.run_script_from_command(
-                "G0 X%d F%.0f" % (WASTEBIN_X, self.clean_velocity))
+                "G0 X%g F%.0f" % (self.wastebin_x, self.clean_velocity))
+            self.gcode.run_script_from_command(
+                "G0 Y%g F%.0f" % (self.wastebin_y, self.travel_velocity))
             toolhead.wait_moves()
         finally:
             restore_motion_limits(
@@ -1815,7 +1827,8 @@ class Box:
                 self.gcode.run_script_from_command("M83")
                 if retract:
                     self.gcode.run_script_from_command(
-                        "G1 E-%.1f F%d" % (SNAP_RETRACT_MM, SNAP_RETRACT_F))
+                        "G1 E-%.1f F%.0f" % (
+                            SNAP_RETRACT_MM, self.retract_velocity))
                     toolhead.wait_moves()
                 self.nozzle_clean()
                 toolhead.wait_moves()
@@ -1835,7 +1848,8 @@ class Box:
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
             self.gcode.run_script_from_command(
-                "G0 X%d Y%d F%d" % (WASTEBIN_X, WASTEBIN_Y, WASTEBIN_MOVE_F))
+                "G0 X%g Y%g F%.0f" % (
+                    self.wastebin_x, self.wastebin_y, self.travel_velocity))
         finally:
             restore_motion_limits(
                 self.gcode, "_box_wastebin_limits", include_gcode=True, move=0)
@@ -1857,11 +1871,11 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            wastebin = "X%d Y%d" % (WASTEBIN_X, WASTEBIN_Y)
+            wastebin = "X%g Y%g" % (self.wastebin_x, self.wastebin_y)
             for move in (
                     wastebin, "Y350", "X300", "Y50", "X50", wastebin):
                 self.gcode.run_script_from_command(
-                    "G0 %s F%d" % (move, WASTEBIN_MOVE_F))
+                    "G0 %s F%.0f" % (move, self.travel_velocity))
             toolhead.wait_moves()
         finally:
             restore_motion_limits(
@@ -1898,7 +1912,8 @@ class Box:
                 % (CUT_LIMIT_VELOCITY, CUT_LIMIT_ACCEL,
                    CUT_LIMIT_CRUISE, CUT_LIMIT_SCV))
             self.gcode.run_script_from_command(
-                "G0 X%.2f Y%.2f F24000" % (self.pre_cut_x, self.cut_y))
+                "G0 X%.2f Y%.2f F%.0f" % (
+                    self.pre_cut_x, self.cut_y, self.travel_velocity))
             toolhead.wait_moves()
             if not self.get_cut_sensor_state():
                 raise BoxError("Cut sensor is not in standby")
@@ -1912,27 +1927,21 @@ class Box:
                     "G0 X%.2f F%.0f" % (self.cut_x, self.cut_velocity))
                 toolhead.wait_moves()
                 self.gcode.run_script_from_command(
-                    "G0 X%.2f F24000" % self.pre_cut_x)
+                    "G0 X%.2f F%.0f" % (self.pre_cut_x, self.travel_velocity))
                 toolhead.wait_moves()
                 if self._wait_cut_return(1.0):
                     returned = True
                 self._cut_extruder_jog(
-                    toolhead, -CUT_POST_RETRACT_MM, CUT_POST_RETRACT_F)
+                    toolhead, -CUT_POST_RETRACT_MM, self.retract_velocity)
                 if self._wait_cut_return(CUT_RETURN_WAIT):
                     returned = True
                     break
                 if attempt < 2:
                     self._cut_extruder_jog(
-                        toolhead, CUT_POST_RETRACT_MM, CUT_POST_RETRACT_F)
+                        toolhead, CUT_POST_RETRACT_MM, self.retract_velocity)
                     self.reactor.pause(
                         self.reactor.monotonic() + CUT_RETRY_SETTLE)
 
-            if not returned:
-                for _index in range(int(CUT_FINAL_SNAP_MM)):
-                    self._cut_extruder_jog(toolhead, -1.0, CUT_FINAL_SNAP_F)
-                    if self._wait_cut_return(0.12):
-                        returned = True
-                        break
             if returned:
                 return
 
@@ -1948,7 +1957,7 @@ class Box:
                 try:
                     self.gcode.run_script_from_command("G90")
                     self.gcode.run_script_from_command(
-                        "G0 Z%.3f F%d" % (lifted_z, CUT_SAFE_Z_F))
+                        "G0 Z%.3f F%.0f" % (lifted_z, self.z_velocity))
                     toolhead.wait_moves()
                 except Exception:
                     _klog("failed restoring cut Z", level=logging.exception)
@@ -1968,7 +1977,7 @@ class Box:
             return None
         self.gcode.run_script_from_command("G90")
         self.gcode.run_script_from_command(
-            "G0 Z%.3f F%d" % (CUT_SAFE_Z, CUT_SAFE_Z_F))
+            "G0 Z%.3f F%.0f" % (CUT_SAFE_Z, self.z_velocity))
         toolhead.wait_moves()
         return current
 
@@ -2664,7 +2673,8 @@ class Box:
                         self.check_operation_abort(fault_generation)
                         amount = UNLOAD_RETRACT_MM if attempt == 0 else UNLOAD_RETRY_MM
                         self.gcode.run_script_from_command(
-                            "G1 E-%.0f F%d" % (amount, EXTRUDER_RETRACT_F))
+                            "G1 E-%.0f F%.0f" % (
+                                amount, self.retract_velocity))
                         retract_toolhead.wait_moves()
                         self.check_operation_abort(fault_generation)
                         total += amount
@@ -2681,8 +2691,8 @@ class Box:
                         previous_encoder = current
                     self.check_operation_abort(fault_generation)
                     self.gcode.run_script_from_command(
-                        "G1 E-%.0f F%d"
-                        % (UNLOAD_RETRACT_MM, EXTRUDER_RETRACT_F))
+                        "G1 E-%.0f F%.0f"
+                        % (UNLOAD_RETRACT_MM, self.retract_velocity))
                     retract_toolhead.flush_step_generation()
                     self.gcode.run_script_from_command(
                         "RESTORE_GCODE_STATE NAME=_box_unload_retract MOVE=0")
@@ -2766,7 +2776,7 @@ class Box:
                     self._buffer_retract(driver, "cut retract")
                     amount = min(15.0, remaining)
                     self.gcode.run_script_from_command(
-                        "G1 E-%.4f F%d" % (amount, EXTRUDER_RETRACT_F))
+                        "G1 E-%.4f F%.0f" % (amount, self.retract_velocity))
                     self.printer.lookup_object("toolhead").wait_moves()
                     self.check_operation_abort(fault_generation)
                     remaining -= amount

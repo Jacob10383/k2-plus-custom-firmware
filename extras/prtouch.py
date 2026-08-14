@@ -1,15 +1,14 @@
 # Copyright (C) 2026  36573259+Jacob10383@users.noreply.github.com
 # This file may be distributed under the terms of the GNU GPLv3 license.
 # prtouch - K2 nozzle load-cell Z probe (CS1237 + cross-MCU swap endstop)
-#
-# This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import random
 from statistics import median
+from types import SimpleNamespace
 
 from . import probe
 
 _POST_HOME_LIFT = 3.0
-_POST_HOME_LIFT_SPEED = 10.0
 
 
 def _sample_range(values):
@@ -110,6 +109,28 @@ class PRTouchEndstopWrapper:
         self.thermal_expansion = config.getfloat(
             'thermal_expansion', 0., minval=0.)
 
+        # PRTOUCH_SCRUB: detect the flexible rear tab, then scrub its surface.
+        self.scrub_x_start = config.getfloat('scrub_x_start', 173.)
+        self.scrub_x_end = config.getfloat('scrub_x_end', 223.)
+        self.scrub_y_min = config.getfloat('scrub_y_min', 353.)
+        self.scrub_y_max = config.getfloat('scrub_y_max', 356.)
+        if self.scrub_y_min > self.scrub_y_max:
+            raise config.error(
+                "prtouch: scrub_y_min must not exceed scrub_y_max")
+        self.scrub_detect_hold_ratio = config.getfloat(
+            'scrub_detect_hold_ratio', 2.5, above=1.)
+        self.scrub_detect_deflection = config.getfloat(
+            'scrub_detect_deflection', .035, above=0.)
+        self.scrub_tab_depth = config.getfloat(
+            'scrub_tab_depth', .15, minval=0., maxval=.20)
+        self.scrub_no_tab_depth = config.getfloat(
+            'scrub_no_tab_depth', .05, minval=0., maxval=.20)
+        if self.scrub_no_tab_depth > self.scrub_tab_depth:
+            raise config.error(
+                "prtouch: scrub_no_tab_depth must not exceed scrub_tab_depth")
+        self.scrub_speed = config.getfloat(
+            'scrub_speed', 10., above=0.)
+
         if config.has_section('stepper_z'):
             zconfig = config.getsection('stepper_z')
             self.z_position = zconfig.getfloat(
@@ -158,6 +179,7 @@ class PRTouchEndstopWrapper:
         self.stop_step_cmd = None
         self.start_pres_cmd = None
         self.stop_pres_cmd = None
+        self._pres_hold_ratio = 1.
 
         self.step_mcu.register_config_callback(self._build_step_config)
         self.pres_mcu.register_config_callback(self._build_pres_config)
@@ -181,6 +203,13 @@ class PRTouchEndstopWrapper:
         self.gcode.register_command(
             'PRTOUCH_SCAN_CALIBRATE', self.cmd_PRTOUCH_SCAN_CALIBRATE,
             desc=self.cmd_PRTOUCH_SCAN_CALIBRATE_help)
+        self.gcode.register_command(
+            'PRTOUCH_AXIS_TWIST_COMPENSATION',
+            self.cmd_PRTOUCH_AXIS_TWIST_COMPENSATION,
+            desc=self.cmd_PRTOUCH_AXIS_TWIST_COMPENSATION_help)
+        self.gcode.register_command(
+            'PRTOUCH_SCRUB', self.cmd_PRTOUCH_SCRUB,
+            desc=self.cmd_PRTOUCH_SCRUB_help)
 
         if not self.register_as_probe:
             # Alternate chip so carto (or another probe) can own "probe".
@@ -383,6 +412,8 @@ class PRTouchEndstopWrapper:
         lmt_dead = max(
             0, int(round(self.pres_ded_tkms / self.pres_acq_tkms)))
         min_hold, max_hold, add_hold = self.pres_tri_hold
+        min_hold = int(round(min_hold * self._pres_hold_ratio))
+        max_hold = int(round(max_hold * self._pres_hold_ratio))
 
         try:
             # Step capture first so a swap trigger can't beat the timestamp stream.
@@ -452,7 +483,7 @@ class PRTouchEndstopWrapper:
             self, pos, speed)
 
     def _probe_one(self, gcmd):
-        """Single touch sample for PRTOUCH_HOME."""
+        """Single touch sample."""
         if self._printer_probe is not None:
             return self._printer_probe.run_probe(gcmd)
         toolhead = self.printer.lookup_object('toolhead')
@@ -462,11 +493,7 @@ class PRTouchEndstopWrapper:
         speed = gcmd.get_float('PROBE_SPEED', self.speed, above=0.)
         pos = toolhead.get_position()
         pos[2] = self.z_position
-        result = self.probing_move(pos, speed, gcmd)
-        if isinstance(result, tuple) and len(result) == 2:
-            epos = result[0]
-        else:
-            epos = result
+        epos = self.probing_move(pos, speed, gcmd)
         self.gcode.respond_info(
             "probe at %.3f,%.3f is z=%.6f" % (epos[0], epos[1], epos[2]))
         return epos[:3]
@@ -529,7 +556,7 @@ class PRTouchEndstopWrapper:
         toolhead.set_position(pos, homing_axes='z')
         return True
 
-    def _lookup_scan_calibrate_macro(self):
+    def _lookup_carto_macro(self, class_name, *need_attrs):
         carto = self.printer.lookup_object('cartographer', None)
         if carto is None:
             return None
@@ -537,23 +564,27 @@ class PRTouchEndstopWrapper:
             macro = getattr(reg, 'macro', None)
             if (
                     macro is not None
-                    and type(macro).__name__ == 'ScanCalibrateMacro'
-                    and hasattr(macro, '_calibrate')):
+                    and type(macro).__name__ == class_name
+                    and all(hasattr(macro, name) for name in need_attrs)):
                 return macro
         return None
 
     def _establish_nozzle_z_zero(self, gcmd=None):
         toolhead = self.printer.lookup_object('toolhead')
-        self._seed_z_homed_if_needed(toolhead)
-        pos = toolhead.get_position()
-        if pos[2] < self.sample_retract_dist:
-            toolhead.manual_move(
-                [None, None, self.sample_retract_dist], self.lift_speed)
-            toolhead.wait_moves()
-        trigger_z, _collected, best = self._multi_sample_probe_z(gcmd)
-        toolhead.get_last_move_time()
-        pos = toolhead.get_position()
-        pos[2] = pos[2] - trigger_z + self.position_endstop
+        seeded = self._seed_z_homed_if_needed(toolhead)
+        try:
+            pos = toolhead.get_position()
+            if pos[2] < self.sample_retract_dist:
+                toolhead.manual_move(
+                    [None, None, self.sample_retract_dist], self.lift_speed)
+                toolhead.wait_moves()
+            trigger_z, _collected, best = self._multi_sample_probe_z(gcmd)
+            toolhead.get_last_move_time()  # sync print_time before rewriting Z
+            pos = toolhead.get_position()
+            pos[2] = pos[2] - trigger_z + self.position_endstop
+        finally:
+            if seeded:
+                toolhead.get_kinematics().clear_homing_state('z')
         toolhead.set_position(pos, homing_axes='z')
         return trigger_z, best
 
@@ -566,6 +597,9 @@ class PRTouchEndstopWrapper:
         "Calibrate Cartographer scan model using prtouch for nozzle Z=0. "
         "Requires cartographer. Optional MODEL=default.")
 
+    cmd_PRTOUCH_AXIS_TWIST_COMPENSATION_help = (
+        "Calibrate axis twist using Cartographer scans and prtouch contacts.")
+
     def _get_extruder_temp(self):
         pheaters = self.printer.lookup_object('heaters')
         heater = pheaters.lookup_heater('extruder')
@@ -573,7 +607,7 @@ class PRTouchEndstopWrapper:
         return float(temp)
 
     def cmd_PRTOUCH_SCAN_CALIBRATE(self, gcmd):
-        macro = self._lookup_scan_calibrate_macro()
+        macro = self._lookup_carto_macro('ScanCalibrateMacro', '_calibrate')
         if macro is None:
             raise gcmd.error(
                 "prtouch: cartographer ScanCalibrateMacro not loaded")
@@ -595,6 +629,30 @@ class PRTouchEndstopWrapper:
             % (self.position_endstop, trigger_z, _sample_range(best)))
         macro._calibrate(model)
         self.gcode.run_script_from_command('SAVE_CONFIG RESTART=0')
+
+    def cmd_PRTOUCH_AXIS_TWIST_COMPENSATION(self, gcmd):
+        macro = self._lookup_carto_macro(
+            'AxisTwistCompensationMacro', 'run', 'probe')
+        if macro is None:
+            raise gcmd.error(
+                "prtouch: cartographer AxisTwistCompensationMacro not loaded")
+        original_probe = macro.probe
+
+        def prtouch_contact():
+            trigger_z, _collected, _best = self._multi_sample_probe_z(gcmd)
+            self._retract_home_sample(gcmd)
+            return trigger_z - self.position_endstop
+
+        macro.probe = SimpleNamespace(
+            touch=original_probe.touch,
+            perform_scan=original_probe.perform_scan,
+            perform_touch=prtouch_contact)
+        try:
+            macro.run(gcmd)
+        except (RuntimeError, ValueError) as error:
+            raise gcmd.error(str(error)) from error
+        finally:
+            macro.probe = original_probe
 
     def cmd_PRTOUCH_HOME(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
@@ -632,7 +690,7 @@ class PRTouchEndstopWrapper:
             toolhead.wait_moves()
 
             trigger_z, collected, best = self._multi_sample_probe_z(gcmd)
-            toolhead.get_last_move_time()
+            toolhead.get_last_move_time()  # sync print_time before rewriting Z
             pos = toolhead.get_position()
             # Contact becomes z_offset - thermal_comp so hotter print tip
             # lands at z_offset after nozzle growth.
@@ -645,7 +703,7 @@ class PRTouchEndstopWrapper:
         toolhead.set_position(pos, homing_axes='z')
         pos = toolhead.get_position()
         pos[2] = _POST_HOME_LIFT
-        toolhead.manual_move([None, None, pos[2]], _POST_HOME_LIFT_SPEED)
+        toolhead.manual_move([None, None, pos[2]], self.lift_speed)
         toolhead.wait_moves()
         gcode_move = self.printer.lookup_object('gcode_move', None)
         if gcode_move is not None:
@@ -669,6 +727,140 @@ class PRTouchEndstopWrapper:
         toolhead = self.printer.lookup_object('toolhead')
         pos = toolhead.get_position()
         toolhead.manual_move([None, None, pos[2] + retract], lift_speed)
+
+    def _zone_manual_move(self, coord, speed):
+        self.printer.lookup_object(
+            'extended_zone_transform').manual_move(coord, speed)
+
+    def _scrub_probe(self, probe_gcmd, hold_ratio=1.):
+        previous = self._pres_hold_ratio
+        self._pres_hold_ratio = hold_ratio
+        try:
+            return self._probe_one(probe_gcmd)[2]
+        finally:
+            self._pres_hold_ratio = previous
+
+    def _scrub_probe_line(self, toolhead, probe_gcmd, start, end):
+        values = []
+        for point in (start, end):
+            self._zone_manual_move(
+                [point[0], point[1], None], self.home_travel_speed)
+            toolhead.wait_moves()
+            values.append(self._scrub_probe(probe_gcmd))
+            self._retract_home_sample(probe_gcmd)
+        if abs(values[1] - values[0]) > .5:
+            raise self.printer.command_error(
+                "prtouch: scrub endpoints differ by more than 0.500mm")
+        return values
+
+    def _scrub_round_trip(
+            self, toolhead, start, end, z_start, z_center, z_end, depth):
+        center = [
+            .5 * (start[0] + end[0]),
+            .5 * (start[1] + end[1]),
+        ]
+        clear_z = max(z_start, z_center, z_end) + self.sample_retract_dist
+        self._zone_manual_move([None, None, clear_z], self.lift_speed)
+        self._zone_manual_move(
+            [start[0], start[1], None], self.home_travel_speed)
+        self._zone_manual_move(
+            [None, None, z_start - depth], self.lift_speed)
+        toolhead.wait_moves()
+        self._zone_manual_move(
+            [center[0], center[1], z_center - depth], self.scrub_speed)
+        self._zone_manual_move(
+            [end[0], end[1], z_end - depth], self.scrub_speed)
+        self._zone_manual_move(
+            [center[0], center[1], z_center - depth], self.scrub_speed)
+        self._zone_manual_move(
+            [start[0], start[1], z_start - depth], self.scrub_speed)
+        toolhead.wait_moves()
+        self._zone_manual_move([None, None, clear_z], self.lift_speed)
+        toolhead.wait_moves()
+
+    def _scrub_lift(self, toolhead):
+        pos = toolhead.get_position()
+        z_max = self.config.getsection('stepper_z').getfloat('position_max')
+        lift_z = min(pos[2] + self.sample_retract_dist, z_max)
+        if lift_z > pos[2]:
+            self._zone_manual_move([None, None, lift_z], self.lift_speed)
+            toolhead.wait_moves()
+
+    cmd_PRTOUCH_SCRUB_help = (
+        "Detect the flexible rear bed tab and scrub the nozzle against it.")
+
+    def cmd_PRTOUCH_SCRUB(self, gcmd):
+        self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XYZ")
+        toolhead = self.printer.lookup_object('toolhead')
+        probe_gcmd = self.gcode.create_gcode_command(
+            'PRTOUCH_SCRUB_PROBE', 'PRTOUCH_SCRUB_PROBE', {
+                'SAMPLES': '1',
+                'SAMPLES_RESULT': 'median',
+                'SAMPLES_TOLERANCE': '999',
+                'SAMPLES_TOLERANCE_RETRIES': '0',
+            })
+        try:
+            y = random.uniform(self.scrub_y_min, self.scrub_y_max)
+            start = (self.scrub_x_start, y)
+            end = (self.scrub_x_end, y)
+            self._scrub_lift(toolhead)
+
+            center = [
+                .5 * (start[0] + end[0]),
+                .5 * (start[1] + end[1]),
+            ]
+            self._zone_manual_move(
+                [center[0], center[1], None], self.home_travel_speed)
+            toolhead.wait_moves()
+            deflections = []
+            normal_zs = []
+            for _sample in range(3):
+                normal_z = self._scrub_probe(probe_gcmd)
+                normal_zs.append(normal_z)
+                self._retract_home_sample(probe_gcmd)
+                high_z = self._scrub_probe(
+                    probe_gcmd, self.scrub_detect_hold_ratio)
+                self._retract_home_sample(probe_gcmd)
+                deflections.append(abs(normal_z - high_z))
+            deflection = round(float(median(deflections)), 6)
+            tab_detected = deflection > self.scrub_detect_deflection
+            depth = (
+                self.scrub_tab_depth if tab_detected
+                else self.scrub_no_tab_depth)
+            gcmd.respond_info(
+                "prtouch: %s: deflection %.4fmm %s %.4fmm; "
+                "wiping %.3fmm deep at %.1fmm/s"
+                % ("tab detected" if tab_detected else "no tab",
+                   deflection, ">" if tab_detected else "<=",
+                   self.scrub_detect_deflection, depth, self.scrub_speed))
+
+            z_start, z_end = self._scrub_probe_line(
+                toolhead, probe_gcmd, start, end)
+            z_center = float(median(normal_zs))
+            center_offset = z_center - .5 * (z_start + z_end)
+            passes = 0
+            shortened = 0.
+            for passes in range(1, 4):
+                self._scrub_round_trip(
+                    toolhead, start, end, z_start, z_center, z_end, depth)
+                next_start, next_end = self._scrub_probe_line(
+                    toolhead, probe_gcmd, start, end)
+                shortened = (
+                    .5 * (z_start + z_end)
+                    - .5 * (next_start + next_end))
+                z_start, z_end = next_start, next_end
+                z_center = .5 * (z_start + z_end) + center_offset
+                if shortened < .01:
+                    break
+            gcmd.respond_info(
+                "prtouch: scrub tab=%s deflection=%.4fmm depth=%.3fmm "
+                "passes=%d shorten=%.4fmm"
+                % (tab_detected, deflection, depth, passes, shortened))
+        finally:
+            try:
+                self._scrub_lift(toolhead)
+            except Exception:
+                logging.exception("prtouch: scrub cleanup lift")
 
 
 def load_config(config):

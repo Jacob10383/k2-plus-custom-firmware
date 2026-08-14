@@ -8,28 +8,23 @@ steps are checkpointed for safe same-command retries.
 
 import math
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 
 FILAMENT_AREA = math.pi * (1.75 / 2.0) ** 2
-DEFAULT_FALLBACK_PURGE_MM = 100.0
 PURGE_CHUNK_MM = 100.0
 GCODE_TAIL_BYTES = 50000
-RETRACT_SPEED_F = 1500
-EXTERNAL_RETRACT_F = 3000
 EXTERNAL_PULL_MM = 125.0
 EXTERNAL_FEED_MM = 30.0
-EXTERNAL_FEED_F = 600
 RUNOUT_RETRACT_MM = 3.0
 EXTERNAL_WAIT = 30.0
 SENSOR_POLL = 0.1
-TEMP_TOLERANCE = 4.0
+TEMP_TOLERANCE = 2.0
 TEMP_POLL = 0.5
 LONG_TEMP_WAIT = 5.0
 SNAP_RETRACT_MM = 1.2
 SERVICE_STATE = "box_change_recovery"
-SERVICE_XY_F = 18000
-SERVICE_Z_F = 600
 
 
 @dataclass
@@ -51,13 +46,6 @@ class ChangeRequest:
     return_position: object = None
     service_z: object = None
     rebase_pause: bool = False
-
-
-@dataclass(frozen=True)
-class TemperaturePlan:
-    target: int
-    minimum: int
-    final: int
 
 
 @dataclass(frozen=True)
@@ -94,7 +82,7 @@ class BoxChangeEngine:
         self.print_prime_length = config.getfloat(
             "print_prime_length", 20.0, minval=0.0)
         self.fallback_purge_length = config.getfloat(
-            "fallback_purge_length", DEFAULT_FALLBACK_PURGE_MM, minval=0.0)
+            "fallback_purge_length", 100.0, minval=0.0)
         self.default_temp = config.getint("default_temp", 220, minval=170, maxval=350)
         self.toolchange_z_hop = config.getfloat(
             "toolchange_z_hop", 2.0, minval=0.0)
@@ -122,17 +110,25 @@ class BoxChangeEngine:
         if (not self._target_ready(target, live)
                 or self.box.hotend_feed_pending(target)):
             raise RuntimeError("Power-loss filament path is not ready")
-        plan = TemperaturePlan(final + 5, final, final)
         self.box.move_to_wastebin()
-        self._start_heat(plan)
+        self._start_heat(final)
         return self._prepare_filament(
             gcmd, target, target, allow_purge=False,
-            prime_reason="power-loss recovery", prepared_plan=plan,
+            prime_reason="power-loss recovery", prepared_temperature=final,
             fault_generation=generation, force_prime=True)
+
+    def wait_for_power_loss_recovery_temperature(self, temperature):
+        final = int(round(float(temperature)))
+        if not 170 <= final <= 350:
+            raise RuntimeError("Invalid power-loss recovery temperature")
+        generation = self.box.fault_generation
+        elapsed = self._wait_for_temperature_target(final, generation, None)
+        self._clean_after_temperature_wait(elapsed, generation, None)
 
     def repush_after_filament_prepare(self):
         if self.last_purge_length or self.print_prime_length:
-            self._relative_extrude("box_prepare_repush", SNAP_RETRACT_MM, RETRACT_SPEED_F)
+            self._relative_extrude(
+                "box_prepare_repush", SNAP_RETRACT_MM, self.box.retract_velocity)
 
     def change(self, gcmd, target, flush=True, within_resume=False):
         if not self.box.is_valid_slot(target):
@@ -297,10 +293,10 @@ class BoxChangeEngine:
                         fault_generation=fault_generation)
                 else:
                     heater_used = True
-                    plan = self._temperature_plan(source, None)
+                    temperature = self._purge_temperature(source, None)
                     can_cut = self._cutter_ready()
                     self._start_heat_home_and_wait(
-                        gcmd, plan, fault_generation)
+                        gcmd, temperature, fault_generation)
                     if can_cut:
                         self.box.retract_for_cut(
                             self.retract_length,
@@ -598,7 +594,7 @@ class BoxChangeEngine:
         self._check_abort(fault_generation, request)
         target = request.target
         source = request.source
-        prepared_plan = None
+        prepared_temperature = None
         ready = self._target_ready(target, live)
         external_capture = (
             target == self.box.external_slot
@@ -649,12 +645,12 @@ class BoxChangeEngine:
             request.last_step = "load"
             if self.box.is_physical_slot(target):
                 if request.flush:
-                    prepared_plan = self._prepare_hotend(
+                    prepared_temperature = self._prepare_hotend(
                         source, target, fault_generation, request)
                 self.box.physical_load(
                     target, fault_generation=fault_generation)
             else:
-                prepared_plan = self._load_external(
+                prepared_temperature = self._load_external(
                     gcmd, source, fault_generation, request)
             live = self.box.read_live_state()
             self._check_abort(fault_generation, request)
@@ -666,7 +662,8 @@ class BoxChangeEngine:
         if request.flush and not request.flush_done:
             request.last_step = "flush"
             prepared = self._prepare_filament(
-                gcmd, source, target, prepared_plan=prepared_plan,
+                gcmd, source, target,
+                prepared_temperature=prepared_temperature,
                 fault_generation=fault_generation, request=request)
             request.prepared_filament = bool(
                 request.prepared_filament or prepared)
@@ -686,7 +683,7 @@ class BoxChangeEngine:
         self._check_abort(fault_generation, request)
         source = request.source
         target = request.target
-        prepared_plan = None
+        prepared_temperature = None
         if live.loaded_slot is None:
             raise RuntimeError("CFS loaded-slot state is unavailable")
         if live.loaded_slot != target:
@@ -706,7 +703,7 @@ class BoxChangeEngine:
 
         if not self._target_ready(target, live):
             request.last_step = "load"
-            prepared_plan = self._prepare_hotend(
+            prepared_temperature = self._prepare_hotend(
                 source, target, fault_generation, request)
             self.box.physical_load(
                 target, fault_generation=fault_generation)
@@ -723,7 +720,7 @@ class BoxChangeEngine:
             prepared = self._prepare_filament(
                 gcmd, target, target, temperature_source=source,
                 allow_purge=False, prime_reason="runout replacement",
-                prepared_plan=prepared_plan,
+                prepared_temperature=prepared_temperature,
                 fault_generation=fault_generation, request=request)
             request.prepared_filament = bool(
                 request.prepared_filament or prepared)
@@ -763,7 +760,7 @@ class BoxChangeEngine:
             if not sensor_clear and request.retracted_source != source:
                 request.last_step = "retract"
                 self._start_heat_home_and_wait(
-                    gcmd, self._temperature_plan(source, None),
+                    gcmd, self._purge_temperature(source, None),
                     fault_generation, request)
                 self.box.retract_for_cut(
                     self.retract_length,
@@ -803,11 +800,11 @@ class BoxChangeEngine:
         try:
             if request is None or request.retracted_source != source:
                 self._start_heat_home_and_wait(
-                    gcmd, self._temperature_plan(source, None),
+                    gcmd, self._purge_temperature(source, None),
                     fault_generation, request)
                 self._relative_extrude(
                     "box_external_unload", -self.retract_length,
-                    EXTERNAL_RETRACT_F)
+                    self.box.retract_velocity)
                 if request:
                     request.retracted_source = source
             if request is None or request.cut_source != source:
@@ -820,7 +817,7 @@ class BoxChangeEngine:
             self._move_to_wastebin(request)
             self._check_abort(fault_generation, request)
             self._relative_extrude(
-                "box_external_pull", -EXTERNAL_PULL_MM, EXTERNAL_RETRACT_F)
+                "box_external_pull", -EXTERNAL_PULL_MM, self.box.retract_velocity)
             self.gcode.run_script_from_command(
                 "SET_STEPPER_ENABLE STEPPER=extruder ENABLE=0")
             try:
@@ -840,9 +837,10 @@ class BoxChangeEngine:
                 self.box.disable_filament_sensor()
 
     def _load_external(self, gcmd, source, fault_generation, request):
-        plan = self._temperature_plan(source, self.box.external_slot)
+        temperature = self._purge_temperature(
+            source, self.box.external_slot)
         self._start_heat_home_and_wait(
-            gcmd, plan, fault_generation, request)
+            gcmd, temperature, fault_generation, request)
         self._check_abort(fault_generation, request)
         self._move_to_wastebin(request)
         self.box.enable_filament_sensor()
@@ -850,15 +848,16 @@ class BoxChangeEngine:
             gcmd, True, timeout=EXTERNAL_WAIT,
             fault_generation=fault_generation, request=request)
         self._check_abort(fault_generation, request)
-        self._relative_extrude("box_external_feed", EXTERNAL_FEED_MM, EXTERNAL_FEED_F)
+        self._relative_extrude(
+            "box_external_feed", EXTERNAL_FEED_MM, self.box.external_feed_velocity)
         self.box.mark_hotend_feed_pending(self.box.external_slot)
-        return plan
+        return temperature
 
     # ------------------------------------------------------------------
     # Flush and temperature policy
     # ------------------------------------------------------------------
 
-    def _temperature_plan(self, source, target):
+    def _purge_temperature(self, source, target):
         source_temp = self._effective_temp(source) if self.box.is_valid_slot(source) else None
         hotend = self.box.hotend_filament()
         if hotend and hotend["temperature"] is not None:
@@ -866,44 +865,46 @@ class BoxChangeEngine:
         target_temp = self._effective_temp(target) if self.box.is_valid_slot(target) else None
         if target_temp is None and source_temp is None:
             target_temp = source_temp = self.default_temp
-        final = target_temp if target_temp is not None else source_temp
-        minimum = max(value for value in (source_temp, target_temp) if value is not None)
-        return TemperaturePlan(minimum + 5, minimum, final)
+        return max(
+            value for value in (source_temp, target_temp)
+            if value is not None)
 
     def _start_heat_home_and_wait(
-            self, gcmd, plan, fault_generation, request=None):
-        self._start_heat(plan)
+            self, gcmd, temperature, fault_generation, request=None):
+        self._start_heat(temperature)
         self._enter_service(request)
         self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
         self._check_abort(fault_generation, request)
-        self._wait_for_heat(gcmd, plan, fault_generation, request)
+        self._wait_for_heat(gcmd, temperature, fault_generation, request)
 
-    def _start_heat(self, plan):
-        self.gcode.run_script_from_command("M104 S%d" % plan.target)
+    def _start_heat(self, temperature):
+        self.gcode.run_script_from_command("M104 S%d" % temperature)
 
-    def _wait_for_heat(self, gcmd, plan, fault_generation, request=None):
+    def _wait_for_heat(
+            self, gcmd, temperature, fault_generation, request=None):
+        minimum = temperature - TEMP_TOLERANCE
         heater = self.printer.lookup_object("heaters").lookup_heater("extruder")
         current, _target = heater.get_temp(self.printer.get_reactor().monotonic())
-        if current < plan.minimum:
-            self._info(gcmd, "Waiting for extruder >=%dC" % plan.minimum)
+        if current < minimum:
+            self._info(gcmd, "Waiting for extruder >=%dC" % minimum)
         self._wait_for_temperature(
-            plan.minimum, None, fault_generation, request)
+            minimum, None, fault_generation, request)
 
     def _prepare_hotend(
             self, source, target, fault_generation, request,
             temperature_source=None):
-        plan = self._temperature_plan(
+        temperature = self._purge_temperature(
             source if temperature_source is None else temperature_source,
             target)
-        self._start_heat(plan)
+        self._start_heat(temperature)
         self._check_abort(fault_generation, request)
         self._move_to_wastebin(request)
         self._check_abort(fault_generation, request)
-        return plan
+        return temperature
 
     def _prepare_filament(
             self, gcmd, source, target, temperature_source=None,
-            allow_purge=True, prime_reason=None, prepared_plan=None,
+            allow_purge=True, prime_reason=None, prepared_temperature=None,
             fault_generation=None, request=None, force_prime=False):
         if fault_generation is None:
             fault_generation = self.box.fault_generation
@@ -922,18 +923,16 @@ class BoxChangeEngine:
 
         if feed <= 0.0 and purge <= 0.0 and prime <= 0.0:
             return False
-        plan = prepared_plan
-        if plan is None:
-            plan = self._temperature_plan(
+        temperature = prepared_temperature
+        if temperature is None:
+            temperature = self._purge_temperature(
                 source if temperature_source is None else temperature_source,
                 target)
             self._move_to_wastebin(request)
             self._check_abort(fault_generation, request)
-            self._start_heat(plan)
-        self._wait_for_heat(gcmd, plan, fault_generation, request)
-        if plan.final != plan.target:
-            # Preserve the accepted policy: restore destination target before extrusion.
-            self.gcode.run_script_from_command("M104 S%d" % plan.final)
+            self._start_heat(temperature)
+        self._wait_for_heat(
+            gcmd, temperature, fault_generation, request)
 
         self.last_purge_length = purge
         feed_f = self.hotend_feed_speed / FILAMENT_AREA * 60.0
@@ -1023,18 +1022,35 @@ class BoxChangeEngine:
 
     def _wait_for_final_temperature(self, target, fault_generation, request):
         final = self._effective_temp(target)
+        elapsed = self._wait_for_temperature_target(
+            final, fault_generation, request)
+        self._clean_after_temperature_wait(
+            elapsed, fault_generation, request)
+        self.repush_after_filament_prepare()
+        self._check_abort(fault_generation, request)
+
+    def _wait_for_temperature_target(
+            self, final, fault_generation, request):
         reactor = self.printer.get_reactor()
         started = reactor.monotonic()
         self.gcode.run_script_from_command("M104 S%d" % final)
-        self._wait_for_temperature(
-            final - TEMP_TOLERANCE, final + TEMP_TOLERANCE,
-            fault_generation, request)
-        if reactor.monotonic() - started > LONG_TEMP_WAIT:
+        heater = self.printer.lookup_object("heaters").lookup_heater("extruder")
+        current, _target = heater.get_temp(reactor.monotonic())
+        fan_guard = (
+            self.box.part_fan_override(1.0)
+            if current > final + TEMP_TOLERANCE else nullcontext())
+        with fan_guard:
+            self._wait_for_temperature(
+                final - TEMP_TOLERANCE, final + TEMP_TOLERANCE,
+                fault_generation, request)
+        return reactor.monotonic() - started
+
+    def _clean_after_temperature_wait(
+            self, elapsed, fault_generation, request):
+        if elapsed > LONG_TEMP_WAIT:
             self._check_abort(fault_generation, request)
             self._enter_service(request)
             self.box.nozzle_clean()
-        self._check_abort(fault_generation, request)
-        self.repush_after_filament_prepare()
         self._check_abort(fault_generation, request)
 
     # ------------------------------------------------------------------
@@ -1199,7 +1215,7 @@ class BoxChangeEngine:
         try:
             self.gcode.run_script_from_command("G90")
             self.gcode.run_script_from_command(
-                "G0 Z%.3f F%d" % (request.service_z, SERVICE_Z_F))
+                "G0 Z%.3f F%.0f" % (request.service_z, self.box.z_velocity))
             self.printer.lookup_object("toolhead").wait_moves()
         finally:
             if restore:
@@ -1216,10 +1232,10 @@ class BoxChangeEngine:
         toolhead = self.printer.lookup_object("toolhead")
         self.gcode.run_script_from_command("G90")
         self.gcode.run_script_from_command(
-            "G0 X%.3f Y%.3f F%d" % (x, y, SERVICE_XY_F))
+            "G0 X%.3f Y%.3f F%.0f" % (x, y, self.box.travel_velocity))
         toolhead.wait_moves()
         self.gcode.run_script_from_command(
-            "G0 Z%.3f F%d" % (z, SERVICE_Z_F))
+            "G0 Z%.3f F%.0f" % (z, self.box.z_velocity))
         toolhead.wait_moves()
         self.gcode.run_script_from_command(
             "RESTORE_GCODE_STATE NAME=%s MOVE=0" % SERVICE_STATE)
@@ -1269,7 +1285,8 @@ class BoxChangeEngine:
         self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=%s" % name)
         try:
             self.gcode.run_script_from_command("M83")
-            self.gcode.run_script_from_command("G1 E%.4f F%d" % (distance, speed))
+            self.gcode.run_script_from_command(
+                "G1 E%.4f F%.0f" % (distance, speed))
             self.printer.lookup_object("toolhead").wait_moves()
         finally:
             self.gcode.run_script_from_command(
@@ -1338,7 +1355,8 @@ class BoxChangeEngine:
         if not can_extrude:
             return
         self._info(gcmd, "Feeding %.0fmm to clear the extruder gears" % distance)
-        self._relative_extrude("box_runout_tail", distance, EXTERNAL_FEED_F)
+        self._relative_extrude(
+            "box_runout_tail", distance, self.box.external_feed_velocity)
 
     def _extruder_target(self):
         try:

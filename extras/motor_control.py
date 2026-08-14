@@ -832,6 +832,7 @@ FUNC_ENCODER_CALIBRATE = 0x03
 FUNC_ELEC_OFFSET_CALIBRATE = 0x04
 FUNC_SYS_PARAM = 0x06
 FUNC_FLASH_PARAM = 0x07
+FUNC_GET = 0x08
 FUNC_PROTECTION = 0x0C
 FUNC_READ_ADDR = 0x0E
 FUNC_STALL_MODE = 0x11
@@ -1291,6 +1292,20 @@ class MotorFirmwareClient:
             "mode": mode,
             "raw_mode": mode,
         }
+
+    def get_value(
+            self, addr: int, index: int, *,
+            timeout: float = MOTOR_COMMAND_TIMEOUT,
+            attempts: int = DEFAULT_ATTEMPTS) -> float:
+        result, frame = self._acked_command(
+            addr, FUNC_GET, bytes([int(index) & 0xFF]),
+            timeout=timeout, attempts=attempts, label="get")
+        frame, _public = self._validated_frame_result(result, frame, "get")
+        if len(frame["payload"]) != 4:
+            raise RuntimeError(
+                "unexpected get payload length=%d hex=%s"
+                % (len(frame["payload"]), frame["payload"].hex()))
+        return struct.unpack("<f", frame["payload"])[0]
 
     def elec_offset_calibrate(self, addr: int,
                               timeout: float = MOTOR_CALIBRATION_TIMEOUT) -> dict:
@@ -2101,6 +2116,77 @@ class MotorStallMonitor:
         return dict(self.states)
 
 # ──────────────────────────────────────────────────────────────────────────
+# motor_temp_sensors
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Expose MOT2 MCU temperatures as Fluidd-visible sensors."""
+
+
+
+
+GET_MCU_TEMP_INDEX = 17
+POLL_INTERVAL = 6.0
+POLL_TIMEOUT = 0.25
+
+
+class Mot2AxisTempSensor:
+    def __init__(self):
+        self.temperature = 0.0
+        self.measured_min = 99999999.0
+        self.measured_max = 0.0
+
+    def note(self, temp: float):
+        self.temperature = float(temp)
+        if temp:
+            self.measured_min = min(self.measured_min, self.temperature)
+            self.measured_max = max(self.measured_max, self.temperature)
+
+    def get_status(self, _eventtime):
+        return {
+            "temperature": round(self.temperature, 2),
+            "measured_min_temp": round(self.measured_min, 2),
+            "measured_max_temp": round(self.measured_max, 2),
+        }
+
+
+class Mot2TempSensorHub:
+    def __init__(self, replacement):
+        self.replacement = replacement
+        self.reactor = replacement.reactor
+        self.sensors = {}
+        for axis in ALL_AXES:
+            sensor = Mot2AxisTempSensor()
+            name = "temperature_sensor motor_%s_MCU" % (axis.upper(),)
+            replacement.printer.add_object(name, sensor)
+            self.sensors[axis] = sensor
+        self._timer = self.reactor.register_timer(self._poll)
+        self._started = False
+        self._axis_index = 0
+
+    def start(self):
+        self._started = True
+        self.reactor.update_timer(self._timer, self.reactor.monotonic())
+
+    def stop(self):
+        self._started = False
+        self.reactor.update_timer(self._timer, self.reactor.NEVER)
+
+    def _poll(self, _eventtime):
+        if not self._started:
+            return self.reactor.NEVER
+        if self.replacement.is_ready and self.replacement.motor_params_init:
+            axis = ALL_AXES[self._axis_index]
+            self._axis_index = (self._axis_index + 1) % len(ALL_AXES)
+            try:
+                target = self.replacement.axes.target(axis)
+                self.sensors[axis].note(target.client.get_value(
+                    target.addr, GET_MCU_TEMP_INDEX,
+                    timeout=POLL_TIMEOUT, attempts=1))
+            except Exception:
+                pass
+        return self.reactor.monotonic() + POLL_INTERVAL
+
+# ──────────────────────────────────────────────────────────────────────────
 # motor_control_debug_surface
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2574,6 +2660,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         self._startup_auto_retry_count = 0
         self._startup_allow_auto_retry = True
         self._startup_timer = self.reactor.register_timer(self._startup_handler)
+        self.temp_sensors = Mot2TempSensorHub(self)
 
         for axis, pin_cfg in self.stall_monitor.pin_map.items():
             if pin_cfg is not None:
@@ -3354,6 +3441,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             self.reactor.update_timer(
                 self._protection_poll_timer,
                 self.reactor.monotonic() + PROTECTION_POLL_INTERVAL)
+            self.temp_sensors.start()
             _klog("startup complete")
             self.gcode.respond_info(
                 "Motor control startup succeeded on attempt %d."
@@ -3444,6 +3532,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         self._startup_complete = False
         self.is_ready = False
         self.motor_params_init = False
+        self.temp_sensors.stop()
         self._startup_error = ""
         self._startup_step_index = 0
         self._fault_cleanup_pending = False
@@ -3475,6 +3564,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
     def _handle_shutdown(self):
         self.is_ready = False
         self.motor_params_init = False
+        self.temp_sensors.stop()
         for timer in (
                 self._startup_timer,
                 self._fault_cleanup_timer,

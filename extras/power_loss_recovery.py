@@ -1694,20 +1694,15 @@ class PowerLossRecovery:
         live = box.read_live_state(include_topology=False)
         ready = (engine.pending is None and engine._target_ready(target, live)
                  and not box.hotend_feed_pending(target))
-        if ready:
-            prepared = engine.prime_for_power_loss_recovery(
-                gcmd, target, temperature)
-            if not prepared:
-                self._run("M109 S%.3f" % temperature)
-            return prepared
-        if not engine.change(gcmd, target, flush=True):
-            raise ValueError("CFS could not restore T%d" % target)
-        prepared = engine.resume_prepared
+        prepared = False
+        if not ready:
+            if not engine.change(gcmd, target, flush=True):
+                raise ValueError("CFS could not restore T%d" % target)
+            prepared = engine.resume_prepared
         if not prepared:
             prepared = engine.prime_for_power_loss_recovery(
                 gcmd, target, temperature)
-        if not prepared:
-            self._run("M109 S%.3f" % temperature)
+        engine.wait_for_power_loss_recovery_temperature(temperature)
         return prepared
 
     def _clear_references(self):
