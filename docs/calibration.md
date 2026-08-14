@@ -28,6 +28,7 @@ CALIBRATE_CUT_POS
 
 ```gcode
 SHAPER_CALIBRATE
+SAVE_CONFIG
 ```
 
 The analysis step can take a while because the printer's SoC is slow at
@@ -70,6 +71,18 @@ PRTOUCH_SCAN_CALIBRATE
 
 This uses PRTouch to calibrate the Cartographer scan model. It does not
 calibrate PRTouch itself.
+
+#### PRTouch axis-twist calibration
+
+Run this once after mixed-mode calibration, before generating a new mesh:
+
+```gcode
+G28
+PRTOUCH_AXIS_TWIST_COMPENSATION AXIS=X USE_TOUCH_BOUNDARIES=1 SAMPLE_COUNT=11
+SAVE_CONFIG
+```
+
+Regenerate the bed mesh after saving the compensation.
 
 #### PRTouch-only mode
 

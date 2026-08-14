@@ -12,7 +12,6 @@ Klipper and Cartographer commands remain in their own documentation.
 | `BEDPID` | Calibrates the bed PID at 100°C and saves the result. |
 | `NOZZLE_PID` | Calibrates the nozzle PID at 230°C and saves the result. |
 | `NOZZLE_PID_HIGH` | Calibrates the nozzle PID at 320°C and saves the result. |
-| `TUNOFFINPUTSHAPER` | Disables both configured input shapers for the current session. |
 
 ## CFS and tool changes
 
@@ -36,9 +35,11 @@ Klipper and Cartographer commands remain in their own documentation.
 | Command | Behavior |
 | --- | --- |
 | `RFID_READER_READ` | Reads the most recent record from the external RFID reader. |
-| `_BOX_SLOT_SET SLOT= MATERIAL= COLOR=#RRGGBB [BRAND=] [NAME=] [SPOOLMAN_ID=]` | Saves a physical CFS slot profile. |
+| `_BOX_SLOT_SET SLOT= MATERIAL= COLOR=#RRGGBB [BRAND=] [NAME=] [SPOOLMAN_ID=]` | Saves a CFS or external-slot profile. |
+| `_BOX_SLOT_CLEAR SLOT=` | Clears a CFS or external-slot profile. |
 | `_BOX_MATERIAL_SET MATERIAL= TARGET_TEMP=170..350` | Saves a material target temperature. |
 | `_BOX_SET_RUNOUT_SWAP [ENABLE=0\|1]` | Enables or disables automatic matching-slot runout swaps. |
+| `_BOX_SET_UNLOAD_AFTER_PRINT [ENABLE=0\|1]` | Persistently enables or disables unloading after a completed print. |
 | `_BOX_SET_RFID_INSERT_READING [ENABLE=0\|1]` | Enables or disables reads when a spool is inserted. |
 | `_BOX_SET_RFID_STARTUP_READING [ENABLE=0\|1]` | Enables or disables RFID reads during CFS startup. |
 | `_BOX_RFID_MAP_SET CODE= MATERIAL= BRAND= NAME= [TARGET_TEMP=]` | Saves an unknown-tag mapping. |
@@ -50,6 +51,8 @@ Klipper and Cartographer commands remain in their own documentation.
 | --- | --- |
 | `PRTOUCH_HOME [TRAVEL_SPEED=] [Z_HOP=] [PRINT_TEMP=]` | Runs a multi-sample PRTouch Z home; optional print temperature applies thermal compensation. |
 | `PRTOUCH_SCAN_CALIBRATE [MODEL=default]` | Uses PRTouch to establish nozzle Z=0 for the Cartographer scan model. |
+| `PRTOUCH_AXIS_TWIST_COMPENSATION [AXIS=X\|Y] [USE_TOUCH_BOUNDARIES=0\|1] [SAMPLE_COUNT=] [START=] [END=] [LINE=]` | Uses Cartographer scans and PRTouch contacts to calibrate axis twist. Run `SAVE_CONFIG`, then regenerate the bed mesh. |
+| `PRTOUCH_SCRUB` | Homes if needed, detects the rear tab, and wipes the nozzle across it. |
 
 ## Motor control
 

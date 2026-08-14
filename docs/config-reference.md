@@ -31,14 +31,20 @@ slot metadata, RFID, cutter motion, and nozzle cleaning.
 box_count: 4                # Discovery target, 1-4; lower values shorten startup
 state_path: /mnt/UDISK/printer_data/filament_box.json # Persistent box data
 purge_speed: 20             # Purge volumetric flow rate, mm3/s
-hotend_feed_speed: 15       # Feed volumetric flow rate, mm3/s
+hotend_feed_speed: 20       # Feed volumetric flow rate, mm3/s
 hotend_feed_length: 63      # Printhead gears to hotend, mm
-print_prime_speed: 15       # Print-start prime flow rate, mm3/s
+print_prime_speed: 10       # Print-start prime flow rate, mm3/s
 print_prime_length: 20      # Print-start prime filament, mm
 fallback_purge_length: 100  # Purge when no slicer matrix is available, mm
 default_temp: 220           # Fallback nozzle temp when print data is unavailable
 retract_length: 30          # Retract before cutting, mm
+retract_velocity: 3000.0    # Retraction/snap/cut-assist feedrate, mm/min
+external_feed_velocity: 600.0 # External/manual feedrate, mm/min
 toolchange_z_hop: 2.0       # Z clearance for toolchange travel, mm
+wastebin_pos_x: 133.0       # Wastebin X coordinate
+wastebin_pos_y: 378.0       # Wastebin Y coordinate
+travel_velocity: 18000.0    # XY service-move feedrate, mm/min
+z_velocity: 600.0           # Z service-move feedrate, mm/min
 pre_cut_pos_x: 10.0         # X position used before/after the cut stroke
 # cut_pos_x: <unset>        # Cutter X position; normally saved by calibration
 cut_pos_y: 200.0            # Y position used for the cut sequence
@@ -46,12 +52,14 @@ cut_velocity: 30000.0       # Cut move feedrate, mm/min
 pre_cut_cal_pos_x: -5.0     # Starting X position for cut-position calibration
 check_cut_pos_x_max: -5.5   # Highest accepted X hit during cutter check/calibration
 check_cut_pos_x_min: -9.5   # Lowest accepted X hit during cutter check/calibration
-clean_left_pos_x: 137.0     # Left wipe X position
-clean_right_pos_x: 170.0    # Right wipe X position
-clean_right_pos_y: 378.0    # Right wipe Y position
+clean_pad_left_x: 154.0     # Silicone pad left X edge
+clean_pad_right_x: 166.0    # Silicone pad right X edge
+clean_pad_front_y: 367.0    # Silicone pad front Y edge
+clean_pad_back_y: 378.0     # Silicone pad back Y edge
+clean_pad_passes: 1         # Complete silicone scrub passes
 clean_velocity: 12000.0     # Nozzle-clean feedrate, mm/min
 snap_fan_speed: 1.0         # Part-fan speed during flush-clean-snap, 0-1
-snap_fan_dwell_ms: 2000     # Part-fan dwell before snap retract, ms
+snap_fan_dwell_ms: 3000     # Part-fan dwell before snap retract, ms
 ```
 
 ## External RFID Reader
@@ -68,7 +76,7 @@ K2 load-cell probe and multi-sample Z-home settings.
 ```ini
 [prtouch]
 z_offset: 0                 # Probe offset; required
-register_as_probe: False    # Expose the standard Klipper probe object
+register_as_probe: False    # Keep PRTouch as an alternate prtouch: chip
 speed: 5                    # Probe speed, mm/s
 lift_speed: 40              # Probe lift speed, mm/s
 samples: 1                  # Standard probe samples
@@ -83,7 +91,16 @@ home_max_noisy: 3
 home_sample_range: 0.010    # Maximum accepted home spread, mm
 home_travel_speed: 200      # XY travel speed, mm/s
 home_z_hop: 2               # Lift between home samples, mm
-thermal_expansion: 0.0005   # Nozzle/stack growth, mm/°C
+thermal_expansion: 0.00083  # Nozzle/stack growth, mm/°C
+scrub_x_start: 173          # Rear-tab wipe start X
+scrub_x_end: 223            # Rear-tab wipe end X
+scrub_y_min: 353            # Random wipe Y range, minimum
+scrub_y_max: 356            # Random wipe Y range, maximum
+scrub_detect_hold_ratio: 2.5
+scrub_detect_deflection: 0.035
+scrub_tab_depth: 0.15
+scrub_no_tab_depth: 0.05
+scrub_speed: 10
 step_swap_pin: !PC7         # Stepper-MCU synchronization pin
 pres_swap_pin: nozzle_mcu:PA15 # Nozzle-MCU pressure synchronization pin
 pres_cfg_regs: 60           # CS1237 configuration byte
@@ -282,7 +299,6 @@ standard_y_max: 352.0      # Normal Y envelope
 extended_y_max: 380.0      # Extended Y envelope
 safe_x_min: 122.0          # Minimum X allowed while entering extended Y
 safe_x_max: 230.0          # Maximum X allowed while entering extended Y
-debug: True                # Log extended-zone routing/envelope changes
 ```
 
 ## Power-Loss Recovery
