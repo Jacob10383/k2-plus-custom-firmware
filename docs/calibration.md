@@ -72,18 +72,6 @@ PRTOUCH_SCAN_CALIBRATE
 This uses PRTouch to calibrate the Cartographer scan model. It does not
 calibrate PRTouch itself.
 
-#### PRTouch axis-twist calibration
-
-Run this once after mixed-mode calibration, before generating a new mesh:
-
-```gcode
-G28
-PRTOUCH_AXIS_TWIST_COMPENSATION AXIS=X USE_TOUCH_BOUNDARIES=1 SAMPLE_COUNT=11
-SAVE_CONFIG
-```
-
-Regenerate the bed mesh after saving the compensation.
-
 #### PRTouch-only mode
 
 No probe calibration is required.
@@ -125,7 +113,7 @@ Use `BELT_TENSION AXES=X` or `BELT_TENSION AXES=Y` to tension one axis.
 #### Belt tension sensor recalibration
 
 Do not run this as routine setup. It is only for incorrect tension readings or
-specific troubleshooting, and requires the printed calibration jig. Normal
+specific troubleshooting, and requires the [printed calibration jig](https://www.crealitycloud.com/model-detail/belt-tensioning-module-calibration-tool). Normal
 automatic belt tensioning does not require it.
 
 Home and park the carriage where the middle of the selected belt is accessible,

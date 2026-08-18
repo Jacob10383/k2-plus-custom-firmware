@@ -1,4 +1,4 @@
-site_name: Jacobeans K2 Plus firmware
+site_name: Jacobean's K2 Plus firmware
 site_description: Documentation for the Creality K2 Plus firmware
 site_url: https://jacob10383.github.io/k2-plus-custom-firmware/
 
@@ -28,10 +28,11 @@ markdown_extensions:
   - pymdownx.superfences
 
 nav:
-  - Install: index.md
+  - Home: index.md
+  - Install: install.md
   - Calibration: calibration.md
   - OrcaSlicer: setup.md
-  - RFID: rfid.md
+  - CFS and RFID: cfs.md
   - Error explanation: error-explanation.md
   - Updates & Recovery: updates-recovery.md
   - Reference:
