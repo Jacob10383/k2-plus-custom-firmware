@@ -649,6 +649,18 @@ def install_k2_configs() -> None:
     log(f"copied {src} -> {CONFIG_DIR}")
 
 
+SAVE_CONFIG_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
+
+
+def split_save_config(text: str) -> tuple[str, str | None]:
+    idx = text.find(SAVE_CONFIG_MARKER)
+    if idx < 0:
+        return text, None
+    if idx > 0 and text[idx - 1] == "\n":
+        idx -= 1
+    return text[:idx], text[idx:]
+
+
 def install_moonraker_asvc() -> None:
     PRINTER_DATA.mkdir(parents=True, exist_ok=True)
     asvc = PRINTER_DATA / "moonraker.asvc"
@@ -735,15 +747,15 @@ PROBE_CONFIG_FILES = ("prtouch.cfg", "cartographer.cfg")
 # mode: (label, active config -> register_as_probe)
 PROBE_MODES = {
     "carto": (
-        "Cartographer as exclusive probe",
+        "carto (owns probe, prtouch not loaded)",
         {"cartographer.cfg": True},
     ),
     "mix": (
-        "Cartographer as primary probe (prtouch still active)",
+        "mix (carto owns probe, prtouch still loaded)",
         {"cartographer.cfg": True, "prtouch.cfg": False},
     ),
     "prtouch": (
-        "prtouch as exclusive probe",
+        "prtouch (owns probe, carto not loaded)",
         {"prtouch.cfg": True},
     ),
 }
@@ -865,7 +877,7 @@ def report_probe_mode() -> None:
         log_warn("register_as_probe flags do not match this stack; re-run with an explicit mode to fix")
 
 
-def set_probe_mode(mode: str) -> None:
+def set_probe_mode(mode: str, *, restart: bool = True, quiet: bool = False) -> bool:
     if mode not in PROBE_MODES:
         raise SystemExit(f"invalid probe mode {mode!r}; expected one of {tuple(PROBE_MODES)}")
     if not CONFIG_DIR.is_dir():
@@ -874,11 +886,13 @@ def set_probe_mode(mode: str) -> None:
     warning = "Default Cartographer config (applies to carto/mix) expects a 5.8mm Y-endstop spacer; PRTouch does not."
     if mode == "prtouch":
         warning += "\n  Remove any Cartographer entries from printer.cfg's SAVE_CONFIG block before using PRTouch."
-    log_warn(warning)
+    if not quiet:
+        log_warn(warning)
     label, configs = PROBE_MODES[mode]
     if get_probe_mode() == mode and _probe_mode_rap_matches(mode):
-        success(f"Already set to {label}")
-        return
+        if not quiet:
+            success(f"Already set to {label}")
+        return False
 
     config_updates = [
         (CONFIG_DIR / filename, enabled)
@@ -887,14 +901,77 @@ def set_probe_mode(mode: str) -> None:
     for path, _enabled in config_updates:
         _validate_probe_config(path)
 
-    log(f"Switching to {label}")
+    if not quiet:
+        log(f"Switching to {label}")
     _rewrite_probe_stack(mode)
     for path, enabled in config_updates:
         _set_rap(path, enabled)
 
-    with step("Restarting Klipper"):
-        service_control("restart", ["klipper"])
-    success(f"Switched to {label}")
+    if restart:
+        with step("Restarting Klipper"):
+            service_control("restart", ["klipper"])
+    if not quiet:
+        success(f"Switched to {label}")
+    return True
+
+
+def update_k2_configs() -> None:
+    src = ROOT / "klipper" / "config" / "k2"
+    if not src.is_dir():
+        raise SystemExit(f"k2 config dir not found: {src}")
+    if not CONFIG_DIR.is_dir():
+        raise SystemExit(f"config dir not found: {CONFIG_DIR}")
+
+    probe_mode = None
+    detect_error = None
+    try:
+        probe_mode = get_probe_mode()
+    except SystemExit as exc:
+        detect_error = str(exc).replace(str(CONFIG_DIR / "printer.cfg"), "printer.cfg")
+    if probe_mode is None:
+        if detect_error is None:
+            detect_error = "printer.cfg probe stack is not carto, mix, or prtouch"
+        log_warn(f"Could not detect current probe mode ({detect_error})")
+        log_warn(f"Probe mode is now set to {PROBE_MODES['carto'][0]}")
+
+    printer_cfg = CONFIG_DIR / "printer.cfg"
+    blob = None
+    if printer_cfg.is_file():
+        _, blob = split_save_config(printer_cfg.read_text(encoding="utf-8"))
+
+    service_control("stop", ["moonraker", "klipper"])
+    backup = backup_config_dir()
+    install_k2_configs()
+
+    if backup is not None:
+        stock_names = {path.name for path in src.iterdir()}
+        for item in backup.iterdir():
+            if item.name != "overrides.cfg" and item.name in stock_names:
+                continue
+            dest = CONFIG_DIR / item.name
+            if dest.exists():
+                if dest.is_dir() and not dest.is_symlink():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            if item.is_dir() and not item.is_symlink():
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+            log(f"restored {item.name}")
+
+    if blob:
+        dest = CONFIG_DIR / "printer.cfg"
+        body, _ = split_save_config(dest.read_text(encoding="utf-8"))
+        dest.write_text(body.rstrip() + "\n" + blob.lstrip("\n"), encoding="utf-8")
+        log("restored SAVE_CONFIG block")
+
+    if probe_mode:
+        changed = set_probe_mode(probe_mode, restart=False, quiet=True)
+        if changed:
+            log(f"restored probe mode {PROBE_MODES[probe_mode][0]}")
+
+    service_control("start", ["klipper", "moonraker"])
 
 
 def main() -> None:
@@ -911,8 +988,8 @@ def main() -> None:
         "--update",
         nargs="*",
         metavar="TARGET",
-        choices=["bootstrap", "extras"],
-        help="update bootstrap and/or changed R2-managed Kalico extras files",
+        choices=["bootstrap", "extras", "configs"],
+        help="update bootstrap, R2-managed Kalico extras, and/or k2 configs (configs keep SAVE_CONFIG, overrides.cfg, extra files, and probe mode)",
     )
     mode.add_argument(
         "--set-timezone",
@@ -973,6 +1050,7 @@ def main() -> None:
     if args.update is not None:
         update_bootstrap = not args.update or "bootstrap" in args.update
         update_extras = not args.update or "extras" in args.update
+        update_configs = "configs" in args.update
         index = None
         bootstrap_changed = False
         changed = []
@@ -983,7 +1061,7 @@ def main() -> None:
             index = fetch_release_index()
             with step("Updating bootstrap"):
                 bootstrap_changed = install_bootstrap_update(index)
-            if bootstrap_changed and update_extras:
+            if bootstrap_changed and (update_extras or update_configs):
                 log("Relaunching updated bootstrap...")
                 os.execv(sys.argv[0], sys.argv)
                 return
@@ -993,23 +1071,27 @@ def main() -> None:
             index = index or fetch_release_index()
             with step("Updating Kalico extras"):
                 changed = install_kalico_extras(index)
-            if changed:
+            if changed and not update_configs:
                 with step("Restarting Klipper"):
                     service_control("restart", ["klipper"])
 
-        if update_bootstrap and update_extras:
-            if changed:
-                success(f"Updated {len(changed)} Kalico extras file(s)")
-            elif bootstrap_changed:
-                success("Bootstrap updated; Kalico extras already current")
-            else:
-                success("Bootstrap and Kalico extras already current")
-        elif update_bootstrap:
-            success("Bootstrap updated" if bootstrap_changed else "Bootstrap already current")
-        elif changed:
-            success(f"Updated {len(changed)} Kalico extras file(s)")
-        else:
-            success("Kalico extras already current")
+        if update_configs:
+            require_root()
+            with step("Updating configs"):
+                update_k2_configs()
+
+        notes = []
+        if update_bootstrap:
+            notes.append("Bootstrap updated" if bootstrap_changed else "Bootstrap already current")
+        if update_extras:
+            notes.append(
+                f"Updated {len(changed)} Kalico extras file(s)"
+                if changed
+                else "Kalico extras already current"
+            )
+        if update_configs:
+            notes.append("Configs updated")
+        success("; ".join(notes))
         return
 
     preflight_bootstrap(replace=args.replace)

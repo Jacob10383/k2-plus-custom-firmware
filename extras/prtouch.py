@@ -97,6 +97,10 @@ class PRTouchEndstopWrapper:
             'samples_tolerance', 0.100, minval=0.)
         self.samples_retries = config.getint(
             'samples_tolerance_retries', 0, minval=0)
+        self.no_trigger_retries = config.getint(
+            'no_trigger_retries', 1, minval=0, maxval=3)
+        self.no_trigger_retry_max_distance = config.getfloat(
+            'no_trigger_retry_max_distance', 10., above=0.)
         self.step_swap_pin = config.get('step_swap_pin', '!PC7')
         self.pres_swap_pin = config.get('pres_swap_pin', 'nozzle_mcu:PA15')
         self.pres_cfg_regs = config.getint(
@@ -194,10 +198,14 @@ class PRTouchEndstopWrapper:
         self.add_stepper = self.mcu_endstop.add_stepper
         self.get_steppers = self.mcu_endstop.get_steppers
         self.query_endstop = self.mcu_endstop.query_endstop
-        self.home_wait = self.mcu_endstop.home_wait
+        self._mcu_home_wait = self.mcu_endstop.home_wait
 
         # _armed means both MCUs acked start with err=0 — not "we sent start".
         self._armed = False
+        self._last_probe_no_trigger = False
+        self._last_probe_cleanup_ok = False
+        self._last_home_wait_result = None
+        self._probing_move_active = False
         self._step_acq_tick = None
         self._pres_acq_tick = None
         self._ack_by_source_oid = {}
@@ -477,6 +485,7 @@ class PRTouchEndstopWrapper:
 
     def home_start(self, print_time, sample_time, sample_count, rest_time,
                    triggered=True):
+        self._last_home_wait_result = None
         try:
             return self.mcu_endstop.home_start(
                 print_time, sample_time, sample_count, rest_time, triggered)
@@ -484,6 +493,11 @@ class PRTouchEndstopWrapper:
             if self._armed:
                 self._disarm()
             raise
+
+    def home_wait(self, home_end_time):
+        result = self._mcu_home_wait(home_end_time)
+        self._last_home_wait_result = result
+        return result
 
     def probe_prepare(self, hmove):
         self._arm()
@@ -600,12 +614,19 @@ class PRTouchEndstopWrapper:
                ticks, pressures))
 
     def probe_finish(self, hmove):
+        self._last_probe_no_trigger = (
+            self._probing_move_active
+            and self._last_home_wait_result == 0.
+            and not getattr(hmove, 'triggered_endstops', ())
+            and not getattr(hmove, 'force_stop_requested', False))
+        self._last_probe_cleanup_ok = False
         if self._armed:
             try:
-                if not getattr(hmove, 'triggered_endstops', ()):
+                if self._last_probe_no_trigger:
                     self._report_probe_diagnostic()
             finally:
                 self._disarm(verify_release=True)
+                self._last_probe_cleanup_ok = True
 
     def multi_probe_begin(self, always_restore_toolhead=False):
         pass
@@ -629,8 +650,41 @@ class PRTouchEndstopWrapper:
             logging.exception("prtouch: multi_probe_end after command error")
 
     def probing_move(self, pos, speed, gcmd):
-        return self.printer.lookup_object('homing').probing_move(
-            self, pos, speed)
+        homing = self.printer.lookup_object('homing')
+        toolhead = self.printer.lookup_object('toolhead')
+        start_z = toolhead.get_position()[2]
+        probe_distance = abs(start_z - pos[2])
+        self._probing_move_active = True
+        try:
+            for retry in range(self.no_trigger_retries + 1):
+                self._last_probe_no_trigger = False
+                self._last_probe_cleanup_ok = False
+                try:
+                    return homing.probing_move(self, pos, speed)
+                except self.printer.command_error as error:
+                    if (
+                            str(error)
+                            != "No trigger on probe after full movement"
+                            or self.printer.is_shutdown()
+                            or not self._last_probe_no_trigger
+                            or not self._last_probe_cleanup_ok
+                            or probe_distance
+                            > self.no_trigger_retry_max_distance
+                            or retry >= self.no_trigger_retries):
+                        raise
+                    homed = toolhead.get_status(
+                        self.reactor.monotonic())['homed_axes']
+                    if 'z' not in homed:
+                        raise
+                    self.gcode.respond_info(
+                        "prtouch: no trigger; restoring Z=%.3f and retrying "
+                        "(%d/%d)"
+                        % (start_z, retry + 1, self.no_trigger_retries))
+                    toolhead.manual_move(
+                        [None, None, start_z], self.lift_speed)
+                    toolhead.wait_moves()
+        finally:
+            self._probing_move_active = False
 
     def _probe_one(self, gcmd):
         """Single touch sample."""
@@ -1006,6 +1060,20 @@ class PRTouchEndstopWrapper:
                 "prtouch: scrub tab=%s deflection=%.4fmm depth=%.3fmm "
                 "passes=%d shorten=%.4fmm"
                 % (tab_detected, deflection, depth, passes, shortened))
+        except self.printer.command_error as error:
+            if self._printer_probe is not None:
+                try:
+                    self._printer_probe.multi_probe_end()
+                finally:
+                    self._printer_probe.retry_session.end()
+            else:
+                self.multi_probe_end()
+            homed = toolhead.get_status(
+                self.reactor.monotonic())['homed_axes']
+            if self.printer.is_shutdown() or not all(
+                    axis in homed for axis in 'xyz'):
+                raise
+            gcmd.respond_info("prtouch: scrub stopped: %s" % (error,))
         finally:
             try:
                 self._scrub_lift(toolhead)

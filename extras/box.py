@@ -444,6 +444,7 @@ class Box:
         self.path_owner = None
         self._clear_runout_state()
         self.runout_defer_active = False
+        self._kalico_runout_taken = False
         self.runout_feature = None
         self.fault_generation = 0
         self.last_fatal_reason = None
@@ -603,6 +604,14 @@ class Box:
                 self.poll_timer, self.reactor.monotonic() + POLL_START_DELAY)
 
     def _install_runout_source_observer(self, eventtime):
+        helper = getattr(self._filament_sensor(), "runout_helper", None)
+        original_handler = getattr(helper, "_runout_event_handler", None)
+        if original_handler is not None:
+            def handler(eventtime):
+                if not self._kalico_runout_taken:
+                    return original_handler(eventtime)
+
+            helper._runout_event_handler = handler
         sd = self.printer.lookup_object("virtual_sdcard", None)
         if sd is None or isinstance(sd.gcode, _VirtualSDGCodeObserver):
             return
@@ -613,9 +622,16 @@ class Box:
             return
         sd = self.printer.lookup_object("virtual_sdcard", None)
         try:
-            if (sd is not None and sd.is_active()
-                    and self.filament_sensor_enabled()):
+            armed = (sd is not None and sd.is_active()
+                     and self.filament_sensor_enabled())
+            self._kalico_runout_taken = False
+            if armed:
                 self.runout_defer_active = True
+            self._info(
+                self.gcode,
+                "Filament sensor runout event received; %s" % (
+                    "watching for infill" if armed
+                    else "infill watch not armed"))
         except Exception:
             _klog('runout defer arm failed', level=logging.exception)
 
@@ -625,18 +641,20 @@ class Box:
             self.runout_feature = marker.split(":", 1)[1].strip().lower()
         if (self.runout_defer_active
                 and "infill" in (self.runout_feature or "")):
+            _klog(
+                "runout defer dispatching BOX_RUNOUT_CHECK at feature=%s",
+                self.runout_feature)
             self.gcode.run_script("BOX_RUNOUT_CHECK")
 
     def cancel_runout_defer(self):
         self.runout_defer_active = False
-        sensor = self.printer.lookup_object(
-            "filament_switch_sensor filament_sensor", None)
+        self._kalico_runout_taken = True
         try:
-            reset = getattr(
-                getattr(sensor, "runout_helper", None),
-                "reset_runout_distance_info", None)
-            if reset is not None:
-                reset()
+            helper = self._filament_sensor().runout_helper
+            helper.reset_runout_distance_info()
+            if helper.min_event_systime == self.reactor.NEVER:
+                helper.min_event_systime = (
+                    self.reactor.monotonic() + helper.event_delay)
         except Exception:
             _klog('runout distance cleanup failed', level=logging.exception)
 
@@ -866,12 +884,15 @@ class Box:
 
     def get_filament_sensor_state(self):
         try:
-            sensor = self.printer.lookup_object(
-                "filament_switch_sensor filament_sensor")
-            status = sensor.get_status(self.reactor.monotonic())
+            status = self._filament_sensor().get_status(
+                self.reactor.monotonic())
             return bool(status["filament_detected"]), None
         except Exception as exc:
             return None, str(exc)
+
+    def _filament_sensor(self):
+        return self.printer.lookup_object(
+            "filament_switch_sensor filament_sensor", None)
 
     def filament_detected(self):
         detected, error = self.get_filament_sensor_state()
@@ -880,9 +901,7 @@ class Box:
         return detected
 
     def filament_sensor_enabled(self):
-        sensor = self.printer.lookup_object(
-            "filament_switch_sensor filament_sensor")
-        return bool(sensor.runout_helper.sensor_enabled)
+        return bool(self._filament_sensor().runout_helper.sensor_enabled)
 
     def enable_filament_sensor(self):
         self.gcode.run_script_from_command(
