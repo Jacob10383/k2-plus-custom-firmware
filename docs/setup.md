@@ -59,6 +59,9 @@ My [OrcaSlicer fork](https://github.com/Jacob10383/OrcaSlicer) improves CFS
 synchronization so slots can resolve to the actual Orca filament preset instead
 of collapsing to a generic material profile.
 
+See [CFS and RFID](cfs.md) for the Filament Box widget and CFS controls in
+Fluidd.
+
 ### Slot numbering
 
 Slots are numbered across CFS units:

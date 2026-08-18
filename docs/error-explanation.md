@@ -6,7 +6,6 @@ Errors reported by the CFS.
 
 | Error | Meaning | What to check |
 | --- | --- | --- |
-| `BUSY` | The CFS refused to move because it is already working, pretensioning, or in a state that does not allow feeding. | |
 | `STAGE0_SENSOR_TIMEOUT` | The chosen slot started feeding, but filament never reached the path sensor on the way into the hub (7 s). | If filament is seated in the slot gears and not tangled. |
 | `SLOT_EMPTY` | The chosen slot has no filament at the inlet. | |
 | `STAGE0_ODOMETER_TIMEOUT` | Load started, but the hub odometer did not move for 2 s. | For a tangle, or whether the hub is turning filament. |

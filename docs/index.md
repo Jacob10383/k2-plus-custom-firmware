@@ -31,4 +31,10 @@ port `4409` at the printer's IP address.
 The default configuration expects the 5.8 mm Y-endstop spacer and the
 Cartographer mount used by K2 Improvements.
 
-Continue with [Calibration](calibration.md).
+## Before your first print
+
+1. [Calibrate the printer](calibration.md). Follow the path that applies to
+   your probe mode.
+2. [Set up OrcaSlicer](setup.md) after calibration.
+3. Read [CFS and RFID](cfs.md) to find the Fluidd CFS widget, its controls,
+   and RFID setup.

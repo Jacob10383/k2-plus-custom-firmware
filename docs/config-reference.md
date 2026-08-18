@@ -84,6 +84,8 @@ sample_retract_dist: 2.0    # Retract between samples, mm
 samples_result: median      # Sample aggregation
 samples_tolerance: 0.02     # Allowed sample spread, mm
 samples_tolerance_retries: 3
+no_trigger_retries: 1       # Retry attempts after a clean no-trigger probe
+no_trigger_retry_max_distance: 10.0 # Maximum probe move length eligible for no-trigger retry, mm
 home_xy: 175, 175            # XY point used by PRTOUCH_HOME
 home_samples: 3
 home_max_samples: 10

@@ -31,7 +31,7 @@ nav:
   - Install: index.md
   - Calibration: calibration.md
   - OrcaSlicer: setup.md
-  - RFID: rfid.md
+  - CFS and RFID: cfs.md
   - Error explanation: error-explanation.md
   - Updates & Recovery: updates-recovery.md
   - Reference:
