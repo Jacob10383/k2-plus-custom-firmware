@@ -444,6 +444,7 @@ class PRTouchEndstopWrapper:
         enqueues is not enough — that was the bed-crash footgun.
         """
         self._disarm(verify_release=True)
+        self.printer.lookup_object('toolhead').wait_moves()
         if self.pres_rearm_delay:
             self.reactor.pause(
                 self.reactor.monotonic() + self.pres_rearm_delay)
