@@ -64,8 +64,15 @@ mode does not.
 
 #### Mixed-mode calibration
 
+First, home the printer:
+
 ```gcode
 G28
+```
+
+Wait for homing to finish, then run:
+
+```gcode
 PRTOUCH_SCAN_CALIBRATE
 ```
 
