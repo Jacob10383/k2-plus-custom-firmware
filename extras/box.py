@@ -1908,7 +1908,12 @@ class Box:
                 "RESTORE_GCODE_STATE NAME=_box_snap_clean MOVE=0")
 
     def move_to_wastebin(self):
-        self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
+        toolhead = self.printer.lookup_object("toolhead")
+        homed = toolhead.get_status(
+            self.reactor.monotonic()).get("homed_axes", "")
+        # Cleaning may run inside HOME_IF_NEEDED during Z homing.
+        if "x" not in homed or "y" not in homed:
+            self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
         save_motion_limits(
             self.printer, self.gcode, "_box_wastebin_limits", include_gcode=True)
         try:
