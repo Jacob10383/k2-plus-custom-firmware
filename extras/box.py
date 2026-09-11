@@ -1914,6 +1914,13 @@ class Box:
         # Cleaning may run inside HOME_IF_NEEDED during Z homing.
         if "x" not in homed or "y" not in homed:
             self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
+        # Compare in G-code coordinates, matching the absolute moves below.
+        gcode_move = self.printer.lookup_object("gcode_move")
+        position = gcode_move.get_status(
+            self.reactor.monotonic())["gcode_position"]
+        if (abs(position[0] - self.wastebin_x) < 1.0e-6
+                and abs(position[1] - self.wastebin_y) < 1.0e-6):
+            return
         save_motion_limits(
             self.printer, self.gcode, "_box_wastebin_limits", include_gcode=True)
         try:
@@ -1923,6 +1930,10 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
+            self.gcode.run_script_from_command(
+                "G0 X%g Y%g F%.0f" % (
+                    self.wastebin_x + 10.0, self.wastebin_y,
+                    self.travel_velocity))
             self.gcode.run_script_from_command(
                 "G0 X%g Y%g F%.0f" % (
                     self.wastebin_x, self.wastebin_y, self.travel_velocity))
