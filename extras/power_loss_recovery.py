@@ -1337,8 +1337,7 @@ class PowerLossRecovery:
             return None
         engine = box.change_engine
         epoch = self.print_stats.print_start_time
-        parsed = (epoch is not None and engine.parsed_epoch == epoch
-                  and engine.matrix is not None)
+        parsed = epoch is not None and engine.parsed_epoch == epoch
         static = {
             "parsed": parsed,
             "matrix": engine.matrix if parsed else None,
@@ -1348,6 +1347,7 @@ class PowerLossRecovery:
             "total_layer": self.print_stats.info_total_layer,
         }
         dynamic["current_layer"] = self.print_stats.info_current_layer
+        dynamic["tool_mapping"] = engine.mapping_status()
         return {
             "dynamic": dynamic,
             "static": static,
@@ -1361,9 +1361,11 @@ class PowerLossRecovery:
         if token["kind"] == "none":
             return
         state = token["change"]
-        if state["parsed"] and not isinstance(state["matrix"], list):
+        if (state["parsed"] and state["matrix"] is not None
+                and not isinstance(state["matrix"], list)):
             raise ValueError("invalid saved CFS matrix")
         engine = self.printer.lookup_object("box").change_engine
+        engine.restore_print_mapping(token.get("tool_mapping"))
         engine.matrix = copy.deepcopy(state["matrix"]) if state["parsed"] else None
         engine.temp_print = copy.deepcopy(state["temp_print"])
         engine.temp_initial_layer = copy.deepcopy(state["temp_initial_layer"])
@@ -1696,8 +1698,12 @@ class PowerLossRecovery:
                  and not box.hotend_feed_pending(target))
         prepared = False
         if not ready:
-            if not engine.change(gcmd, target, flush=True):
-                raise ValueError("CFS could not restore T%d" % target)
+            # The saved file tool only belongs to the slot it was loaded from;
+            # a low-level load since then leaves the target without one.
+            tool = engine.active_tool if engine.active_slot == target else None
+            if not engine.change(gcmd, target, flush=True, logical_tool=tool):
+                raise ValueError(
+                    "CFS could not restore %s" % box.slot_label(target))
             prepared = engine.resume_prepared
         if not prepared:
             prepared = engine.prime_for_power_loss_recovery(

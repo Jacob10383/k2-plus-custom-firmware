@@ -10,6 +10,7 @@ ADDRESS_WEDGE_WARNING = (
     "If a CFS shows ID '0' after address assignment, it is wedged and requires "
     "a power cycle.")
 MAX_ADDRESSES = 4
+LOADER_TO_APP_SETTLE = 2.0
 
 
 def _klog(msg, *args, level=logging.info):
@@ -32,7 +33,7 @@ class AutoAddressManager:
         self.target_count = target_count
         self._known_input = dict(known_ids or {})
 
-    def enumerate(self, client):
+    def enumerate(self, client, pause=None):
         """Find the requested number of boxes without deriving topology from it."""
         errors = []
         known = dict(self._known_input)
@@ -59,6 +60,29 @@ class AutoAddressManager:
             uniid = reply.uniid
             _klog(
                 'A2 query address=%d uid=%s', address, uniid.hex(), level=logging.info)
+            if reply.mode:
+                _klog(
+                    'A2 address=%d uid=%s is in loader mode; starting app',
+                    address, uniid.hex(), level=logging.info)
+                self._remember(known, address, uniid)
+                self._call(
+                    errors, "start app for box %s" % uniid.hex(),
+                    client.start_app)
+                if pause is not None:
+                    pause(LOADER_TO_APP_SETTLE)
+                reply = self._call(
+                    errors, "verify app address %d" % address,
+                    client.query, address)
+                if reply is None:
+                    continue
+                if reply.uniid != uniid:
+                    errors.append(
+                        "address %d verification returned the wrong box identity"
+                        % address)
+                    continue
+                if reply.mode:
+                    errors.append("address %d remained in loader mode" % address)
+                    continue
             occupied.add(address)
             self._remember(known, address, uniid)
             online[address] = uniid
@@ -89,6 +113,20 @@ class AutoAddressManager:
                 errors.append("all four CFS addresses are online")
                 break
 
+            if reply.mode:
+                _klog(
+                    'loader mode uid=%s; assign then start app', uniid.hex(),
+                    level=logging.info)
+                self._call(
+                    errors, "assign loader box %s to address %d"
+                    % (uniid.hex(), target),
+                    client.assign, uniid, target)
+                self._call(
+                    errors, "start app for box %s" % uniid.hex(),
+                    client.start_app)
+                if pause is not None:
+                    pause(LOADER_TO_APP_SETTLE)
+
             _klog(
                 'A0 assign uid=%s address=%d source=%s', uniid.hex(), target,
                 "persisted" if preferred else "first-free", level=logging.info)
@@ -110,6 +148,9 @@ class AutoAddressManager:
                 errors.append(
                     "address %d verification returned the wrong box identity"
                     % target)
+                break
+            if verified.mode:
+                errors.append("address %d verification returned loader mode" % target)
                 break
 
             _klog(

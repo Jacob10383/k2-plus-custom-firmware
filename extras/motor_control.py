@@ -739,7 +739,7 @@ class MotorParamRegistry:
 
 """Mainboard motor pin-state manager.
 
-Drives configured STEP/DIR outputs during startup and homing transitions.
+Drives STEP/DIR address straps for the stock Creality MCU during discovery.
 """
 
 
@@ -784,8 +784,6 @@ class MotorPinManager:
         self.mcu = printer.lookup_object("mcu")
         self.ppins = printer.lookup_object("pins")
         self.outputs = {}
-        self.state: dict[str, int | None] = {}
-        self.enable_pin_pa9 = None
         self._init_outputs()
 
     def _init_outputs(self):
@@ -799,11 +797,6 @@ class MotorPinManager:
             pin.setup_max_duration(0.0)
             pin.setup_start_value(initial, initial)
             self.outputs[option] = pin
-            self.state[option] = initial
-        self.ppins.allow_multi_use_pin("PA9")
-        self.enable_pin_pa9 = self.ppins.setup_pin("digital_out", "!PA9")
-        self.enable_pin_pa9.setup_max_duration(0.0)
-        self.enable_pin_pa9.setup_start_value(0, 0)
 
     def _schedule_sequence(
             self, sequence: Iterable[tuple[str, int]]):
@@ -814,16 +807,21 @@ class MotorPinManager:
             pin = self.outputs[attr]
             when = start + idx * 0.003
             pin.set_digital(when, value)
-            self.state[attr] = value
+        # set_digital queues future writes. Do not broadcast the address-latch
+        # request (or leave cleanup) before the final write's scheduled time.
+        deadline = when + 0.010
+        while True:
+            now = self.reactor.monotonic()
+            remaining = deadline - self.mcu.estimated_print_time(now)
+            if remaining <= 0.0:
+                break
+            self.reactor.pause(now + remaining)
 
     def set_motor_pin_dir(self):
         return self._schedule_sequence(PIN_DIR_SEQUENCE)
 
     def set_motor_pin_normal(self):
         return self._schedule_sequence(PIN_NORMAL_SEQUENCE)
-
-    def read_all(self) -> dict[str, int | None]:
-        return {attr: self.state.get(attr) for attr in OUTPUT_PIN_OPTIONS}
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_firmware_client
@@ -2075,143 +2073,6 @@ class MotorAxisController:
         }
 
 # ──────────────────────────────────────────────────────────────────────────
-# motor_stall_monitor
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Stall input monitor for motor control.
-
-Registers configured stall pins through Klipper's button framework and forwards
-state changes to the motor-control runtime.
-"""
-
-
-
-
-
-STALL_AXIS_PINS = (
-    ("x", "motor_x_stall"),
-    ("y", "motor_y_stall"),
-    ("z", "motor_z_stall"),
-    ("z1", "motor_z1_stall"),
-    (EXTRUDER_AXIS, "motor_e_stall"),
-)
-
-
-class MotorStallMonitor:
-    def __init__(self, config, replacement, config_model):
-        self.printer = config.get_printer()
-        self.replacement = replacement
-        self.buttons = self.printer.load_object(config, "buttons")
-        self.states = {axis: None for axis, _ in STALL_AXIS_PINS}
-        self.pin_map = {
-            axis: config_model.pins.get(option)
-            for axis, option in STALL_AXIS_PINS
-        }
-        self._main_axes = []
-        self._nozzle_axes = []
-
-    def initialize(self):
-        for axis in KINEMATIC_AXES:
-            pin_cfg = self.pin_map.get(axis)
-            if pin_cfg is not None:
-                self._main_axes.append((axis, pin_cfg.raw))
-        pin_cfg = self.pin_map.get(EXTRUDER_AXIS)
-        if pin_cfg is not None:
-            self._nozzle_axes.append((EXTRUDER_AXIS, pin_cfg.raw))
-        if self._main_axes:
-            self.buttons.register_buttons(
-                [pin for _axis, pin in self._main_axes],
-                functools.partial(self._dispatch_group, axes=self._main_axes))
-        if self._nozzle_axes:
-            self.buttons.register_buttons(
-                [pin for _axis, pin in self._nozzle_axes],
-                functools.partial(self._dispatch_group, axes=self._nozzle_axes))
-
-    def _dispatch_group(self, eventtime, state, axes):
-        for i, (axis, _pin) in enumerate(axes):
-            active = 1 if (state & (1 << i)) else 0
-            prev = self.states[axis]
-            if prev == active:
-                continue
-            self.states[axis] = active
-            self.replacement.note_stall_pin_event(
-                axis=axis, active=active, eventtime=eventtime)
-
-    def read_all(self):
-        return dict(self.states)
-
-# ──────────────────────────────────────────────────────────────────────────
-# motor_temp_sensors
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Expose MOT2 MCU temperatures as Fluidd-visible sensors."""
-
-
-
-
-GET_MCU_TEMP_INDEX = 17
-POLL_INTERVAL = 6.0
-POLL_TIMEOUT = 0.25
-
-
-class Mot2AxisTempSensor:
-    def __init__(self):
-        self.temperature = 0.0
-        self.measured_min = 99999999.0
-        self.measured_max = 0.0
-
-    def note(self, temp: float):
-        self.temperature = float(temp)
-        if temp:
-            self.measured_min = min(self.measured_min, self.temperature)
-            self.measured_max = max(self.measured_max, self.temperature)
-
-    def get_status(self, _eventtime):
-        return {
-            "temperature": round(self.temperature, 2),
-            "measured_min_temp": round(self.measured_min, 2),
-            "measured_max_temp": round(self.measured_max, 2),
-        }
-
-
-class Mot2TempSensorHub:
-    def __init__(self, replacement):
-        self.replacement = replacement
-        self.reactor = replacement.reactor
-        self.sensors = {}
-        for axis in ALL_AXES:
-            sensor = Mot2AxisTempSensor()
-            name = "temperature_sensor motor_%s_MCU" % (axis.upper(),)
-            replacement.printer.add_object(name, sensor)
-            self.sensors[axis] = sensor
-        self._timer = self.reactor.register_timer(self._poll)
-        self._started = False
-        self._axis_index = 0
-
-    def start(self):
-        self._started = True
-        self.reactor.update_timer(self._timer, self.reactor.monotonic())
-
-    def stop(self):
-        self._started = False
-        self.reactor.update_timer(self._timer, self.reactor.NEVER)
-
-    def _poll(self, _eventtime):
-        if not self._started:
-            return self.reactor.NEVER
-        if self.replacement.is_ready and self.replacement.motor_params_init:
-            axis = ALL_AXES[self._axis_index]
-            self._axis_index = (self._axis_index + 1) % len(ALL_AXES)
-            try:
-                target = self.replacement.axes.target(axis)
-                self.sensors[axis].note(target.client.get_value(
-                    target.addr, GET_MCU_TEMP_INDEX,
-                    timeout=POLL_TIMEOUT, attempts=1))
-            except Exception:
-                pass
-        return self.reactor.monotonic() + POLL_INTERVAL
-
-# ──────────────────────────────────────────────────────────────────────────
 # motor_control_debug_surface
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2222,28 +2083,6 @@ class Mot2TempSensorHub:
 
 
 class MotorControlDebugSurfaceMixin:
-    def _build_pin_io_snapshot(self) -> dict:
-        output_state = self.pin_manager.read_all()
-        stall_state = self.stall_monitor.read_all()
-        stall_by_option = {
-            option: stall_state.get(axis)
-            for axis, option in STALL_AXIS_PINS
-        }
-        snapshot = {}
-        for option in PIN_OPTIONS:
-            pin_cfg = self.config_model.pins.get(option)
-            if pin_cfg is None:
-                continue
-            if option in output_state:
-                value = output_state.get(option)
-            else:
-                value = stall_by_option.get(option)
-            snapshot[option] = {
-                "value": value,
-                "source": pin_cfg.raw,
-            }
-        return snapshot
-
     def _iter_runtime_cfg_override_params(self, axes: tuple[str, ...] | None = None):
         allowed = set(axes) if axes is not None else None
         for (axis, key), param in self.registry.by_axis_key.items():
@@ -2429,7 +2268,6 @@ class MotorControlDebugSurfaceMixin:
             "startup_step_count": len(self._startup_steps()),
             "startup_error": self._startup_error,
             "runtime_cfg_override_count": len(self._runtime_cfg_overrides),
-            "pin_state": self.pin_manager.read_all(),
             "stall_state": self.stall_monitor.read_all(),
             "cut_check_active": bool(self.is_check_cut_pos_start),
             "cut_latched": bool(self.cut_state),
@@ -2522,11 +2360,6 @@ class MotorControlDebugSurfaceMixin:
         self._begin_startup(force=True, allow_auto_retry=False)
         gcmd.respond_info("motor control startup retry scheduled")
 
-    def motor_read_all_pin_io_status(self, gcmd):
-        status = self._build_pin_io_snapshot()
-        gcmd.respond_info(f"motor_read_all_pin_io_status {status}")
-        return status
-
     def cmd_MOTOR_QUERY_FAULTS(self, gcmd):
         try:
             start_time = self.reactor.monotonic()
@@ -2550,6 +2383,143 @@ class MotorControlDebugSurfaceMixin:
             raise gcmd.error(str(exc))
 
 # ──────────────────────────────────────────────────────────────────────────
+# motor_stall_monitor
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Stall input monitor for motor control.
+
+Registers configured stall pins through Klipper's button framework and forwards
+state changes to the motor-control runtime.
+"""
+
+
+
+
+
+STALL_AXIS_PINS = (
+    ("x", "motor_x_stall"),
+    ("y", "motor_y_stall"),
+    ("z", "motor_z_stall"),
+    ("z1", "motor_z1_stall"),
+    (EXTRUDER_AXIS, "motor_e_stall"),
+)
+
+
+class MotorStallMonitor:
+    def __init__(self, config, replacement, config_model):
+        self.printer = config.get_printer()
+        self.replacement = replacement
+        self.buttons = self.printer.load_object(config, "buttons")
+        self.states = {axis: None for axis, _ in STALL_AXIS_PINS}
+        self.pin_map = {
+            axis: config_model.pins.get(option)
+            for axis, option in STALL_AXIS_PINS
+        }
+        self._main_axes = []
+        self._nozzle_axes = []
+
+    def initialize(self):
+        for axis in KINEMATIC_AXES:
+            pin_cfg = self.pin_map.get(axis)
+            if pin_cfg is not None:
+                self._main_axes.append((axis, pin_cfg.raw))
+        pin_cfg = self.pin_map.get(EXTRUDER_AXIS)
+        if pin_cfg is not None:
+            self._nozzle_axes.append((EXTRUDER_AXIS, pin_cfg.raw))
+        if self._main_axes:
+            self.buttons.register_buttons(
+                [pin for _axis, pin in self._main_axes],
+                functools.partial(self._dispatch_group, axes=self._main_axes))
+        if self._nozzle_axes:
+            self.buttons.register_buttons(
+                [pin for _axis, pin in self._nozzle_axes],
+                functools.partial(self._dispatch_group, axes=self._nozzle_axes))
+
+    def _dispatch_group(self, eventtime, state, axes):
+        for i, (axis, _pin) in enumerate(axes):
+            active = 1 if (state & (1 << i)) else 0
+            prev = self.states[axis]
+            if prev == active:
+                continue
+            self.states[axis] = active
+            self.replacement.note_stall_pin_event(
+                axis=axis, active=active, eventtime=eventtime)
+
+    def read_all(self):
+        return dict(self.states)
+
+# ──────────────────────────────────────────────────────────────────────────
+# motor_temp_sensors
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Expose MOT2 MCU temperatures as Fluidd-visible sensors."""
+
+
+
+
+GET_MCU_TEMP_INDEX = 17
+POLL_INTERVAL = 6.0
+POLL_TIMEOUT = 0.25
+
+
+class Mot2AxisTempSensor:
+    def __init__(self):
+        self.temperature = 0.0
+        self.measured_min = 99999999.0
+        self.measured_max = 0.0
+
+    def note(self, temp: float):
+        self.temperature = float(temp)
+        if temp:
+            self.measured_min = min(self.measured_min, self.temperature)
+            self.measured_max = max(self.measured_max, self.temperature)
+
+    def get_status(self, _eventtime):
+        return {
+            "temperature": round(self.temperature, 2),
+            "measured_min_temp": round(self.measured_min, 2),
+            "measured_max_temp": round(self.measured_max, 2),
+        }
+
+
+class Mot2TempSensorHub:
+    def __init__(self, replacement):
+        self.replacement = replacement
+        self.reactor = replacement.reactor
+        self.sensors = {}
+        for axis in ALL_AXES:
+            sensor = Mot2AxisTempSensor()
+            name = "temperature_sensor motor_%s_MCU" % (axis.upper(),)
+            replacement.printer.add_object(name, sensor)
+            self.sensors[axis] = sensor
+        self._timer = self.reactor.register_timer(self._poll)
+        self._started = False
+        self._axis_index = 0
+
+    def start(self):
+        self._started = True
+        self.reactor.update_timer(self._timer, self.reactor.monotonic())
+
+    def stop(self):
+        self._started = False
+        self.reactor.update_timer(self._timer, self.reactor.NEVER)
+
+    def _poll(self, _eventtime):
+        if not self._started:
+            return self.reactor.NEVER
+        if self.replacement.is_ready and self.replacement.motor_params_init:
+            axis = ALL_AXES[self._axis_index]
+            self._axis_index = (self._axis_index + 1) % len(ALL_AXES)
+            try:
+                target = self.replacement.axes.target(axis)
+                self.sensors[axis].note(target.client.get_value(
+                    target.addr, GET_MCU_TEMP_INDEX,
+                    timeout=POLL_TIMEOUT, attempts=1))
+            except Exception:
+                pass
+        return self.reactor.monotonic() + POLL_INTERVAL
+
+# ──────────────────────────────────────────────────────────────────────────
 # motor_control
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2557,7 +2527,7 @@ class MotorControlDebugSurfaceMixin:
 
 Architecture:
 - config model: `MotorControlConfigModel`
-- local pin orchestration: `MotorPinManager`
+- host-side address pin orchestration: `MotorPinManager`
 - RS485 transport: `Serial485TransportAdapter`
 - firmware axis routing: `MotorAxisController`
 """
@@ -2588,12 +2558,10 @@ CALIBRATION_STAGE_ALIAS_MAP = {
     CALIBRATION_STAGE_OFFSET: CALIBRATION_STAGE_OFFSET,
 }
 STARTUP_STEP_ACTIONS = {
-    "pin_dir": "configuring motor direction pins",
     "stall_mode": "configuring motor stall modes",
     "protect_check": "checking motor protection status",
     "protect_clear": "clearing motor protection faults",
     "protect_recheck": "rechecking motor protection status",
-    "pin_normal": "restoring motor control pins",
     "apply_overrides": "applying motor configuration",
 }
 STARTUP_STEP_FUNCTIONS = {
@@ -2739,8 +2707,6 @@ class MotorControl(MotorControlDebugSurfaceMixin):
 
     def _register_debug_commands(self):
         self._register_command_specs((
-            ("MOTOR_READ_ALL_PIN_IO", self.motor_read_all_pin_io_status,
-             "MOTOR_READ_ALL_PIN_IO"),
             ("MOTOR_QUERY_FAULTS", self.cmd_MOTOR_QUERY_FAULTS,
              "MOTOR_QUERY_FAULTS Live query and print error/warning/status codes for all axes with elapsed time"),
             ("MOTOR_CFG_OVERRIDE_STATUS", self.cmd_MOTOR_CFG_OVERRIDE_STATUS,
@@ -3228,7 +3194,6 @@ class MotorControl(MotorControlDebugSurfaceMixin):
 
     def _startup_steps(self):
         return (
-            ("pin_dir", self.pin_manager.set_motor_pin_dir),
             ("serial_target_discovery", self._startup_discover_serial_targets),
             ("extruder_target_discovery", self._startup_discover_extruder_target),
             ("stall_mode", self.axes.set_normal_stall_mode),
@@ -3241,7 +3206,6 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             ("protect_recheck", partial(
                 self._startup_recheck_axis_protection,
                 "motors", timeout=MOTOR_COMMAND_TIMEOUT)),
-            ("pin_normal", self.pin_manager.set_motor_pin_normal),
             ("apply_overrides", partial(
                 self._startup_apply_axis_set_overrides,
                 ALL_AXES,
@@ -3250,8 +3214,12 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         )
 
     def _startup_discover_serial_targets(self):
-        prepared = self.axes.prepare_serial_bus()
-        result = self.axes.probe_serial_axes(timeout=MOTOR_COMMAND_TIMEOUT)
+        try:
+            self.pin_manager.set_motor_pin_dir()
+            prepared = self.axes.prepare_serial_bus()
+            result = self.axes.probe_serial_axes(timeout=MOTOR_COMMAND_TIMEOUT)
+        finally:
+            self.pin_manager.set_motor_pin_normal()
         faulted = sorted(
             addr for addr, detail in result.items() if detail.get("faulted"))
         warned = sorted(

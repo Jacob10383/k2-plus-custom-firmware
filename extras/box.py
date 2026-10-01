@@ -18,11 +18,12 @@ from dataclasses import dataclass, replace
 from extras import box_protocol
 from extras.box_addr import ADDRESS_WEDGE_WARNING, MAX_ADDRESSES, AutoAddressManager
 from extras.box_change import BoxChangeEngine
+from extras.box_gcode import read_metadata
 from extras.box_catalog import resolve_material
 from extras.motion_limits import restore_motion_limits, save_motion_limits
 
 
-SLOTS_PER_BOX = 4
+SLOTS_PER_BOX = box_protocol.SLOTS_PER_BOX
 EXTERNAL_PROFILE_KEY = "external"
 API_VERSION = 1
 LEGACY_WIDGET_VERSION = 2
@@ -477,7 +478,8 @@ class Box:
         self.poll_timer = self.reactor.register_timer(self._poll)
         self.enumeration_started = False
         self.klippy_ready = False
-        self.tx_registered = False
+        self.registered_tools = set()
+        self.print_info = None
         self._register_commands()
         self.printer.register_event_handler("serial_485:ready", self._serial_ready)
         self.printer.register_event_handler("klippy:ready", self._klippy_ready)
@@ -505,6 +507,9 @@ class Box:
 
     def _register_commands(self):
         commands = (
+            ("BOX_PRINT_INFO", self.cmd_print_info, "Inspect tools used by a print"),
+            ("BOX_PRINT_START", self.cmd_print_start, "Start a print with a tool map"),
+            ("BOX_SELECT_SLOT", self.cmd_select_slot, "Select a physical filament slot"),
             ("BOX_LOAD", self.cmd_load, "Load filament from a CFS slot"),
             ("BOX_UNLOAD", self.cmd_unload, "Fully unload the active filament"),
             ("BOX_DEBUG", self.cmd_debug, "Show complete box diagnostics"),
@@ -517,10 +522,13 @@ class Box:
              "Parse slicer flush metadata"),
             ("BOX_RUNOUT_CHECK", self.cmd_runout,
              "Handle CFS runout"),
-            ("_BOX_RESUME_CHECK", self.cmd_resume_check,
-             "Validate or recover Box state before print resume"),
-            ("_FLUSH_CLEAN_SNAP", self.cmd_flush_clean_snap,
-             "Internal flush snap and clean"),
+            ("_BOX_PAUSE_CAPTURE", self.change_engine.capture_pause,
+             "Capture the temperature to resume this pause at"),
+            ("_BOX_RESUME_PREPARE", self.change_engine.prepare_resume,
+             "Recover Box state, then heat and prime at the wastebin"),
+            ("_BOX_RESUME_COMMIT",
+             self.change_engine.complete_pause_resume,
+             "Clear completed pause state"),
             ("_BOX_SLOT_SET", self.cmd_slot_set, "Save slot metadata"),
             ("_BOX_SLOT_CLEAR", self.cmd_slot_clear, "Clear slot metadata"),
             ("_BOX_MATERIAL_SET", self.cmd_material_set, "Save material metadata"),
@@ -566,7 +574,10 @@ class Box:
         self._invalidate_tracking_session()
         self.serial = self.printer.lookup_object("serial_485 serial485")
         client = box_protocol.AutoAddressClient(self.serial)
-        result = self.address_manager.enumerate(client)
+        reactor = self.reactor
+        result = self.address_manager.enumerate(
+            client,
+            pause=lambda delay: reactor.pause(reactor.monotonic() + delay))
         self.address_errors = tuple(result.errors)
         if ADDRESS_WEDGE_WARNING in self.address_errors:
             self._warn(ADDRESS_WEDGE_WARNING)
@@ -584,17 +595,18 @@ class Box:
                 self.poll_timer, self.reactor.monotonic() + POLL_START_DELAY)
 
     def _register_t_commands(self):
-        if self.tx_registered:
-            return
-        for slot in self.physical_slots + (self.external_slot,):
-            name = "T%d" % slot
+        self._register_tools(self.physical_slots + (self.external_slot,))
+
+    def _register_tools(self, tools):
+        for tool in tools:
+            if tool in self.registered_tools:
+                continue
             self.gcode.register_command(
-                name,
-                lambda gcmd, target=slot: self.change_engine.change(
-                    gcmd, target, bool(gcmd.get_int("FLUSH", 1))),
-                desc="Change to box slot T%d" % slot,
+                "T%d" % tool,
+                lambda gcmd, tool=tool: self.change_engine.select_tool(gcmd, tool),
+                desc="Select tool T%d" % tool,
             )
-        self.tx_registered = True
+            self.registered_tools.add(tool)
 
     def _klippy_ready(self, *args):
         self.klippy_ready = True
@@ -663,6 +675,7 @@ class Box:
         self.runout_feature = None
 
     def _disconnect(self, *args):
+        self.change_engine.reset_print_mapping()
         self._invalidate_tracking_session()
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
@@ -675,6 +688,9 @@ class Box:
         slots = physical + [self._external_status(snap)]
         return {
             "api_version": API_VERSION,
+            "print_mapping_version": 1,
+            "print_info": self.print_info,
+            "print_mapping": self.change_engine.mapping_status(),
             "fluidd_widget_version": LEGACY_WIDGET_VERSION,
             "data_ready": snap.data_ready,
             "status": box_protocol.status_name(snap.status_code),
@@ -777,6 +793,9 @@ class Box:
 
     def is_valid_slot(self, slot):
         return self.is_physical_slot(slot) or slot == self.external_slot
+
+    def slot_label(self, slot):
+        return box_protocol.slot_label(slot, self.external_slot)
 
     def profile(self, slot):
         return self.store.profile(self._runtime_slot_key(slot))
@@ -1008,6 +1027,95 @@ class Box:
     # G-code command wrappers
     # ------------------------------------------------------------------
 
+    def _print_idle(self, gcmd):
+        if self.change_engine._is_print_active() or self.change_engine._is_print_paused():
+            raise gcmd.error("[BOX]: Finish or cancel the current print first")
+        if self.operation_depth:
+            raise gcmd.error("[BOX]: Wait for the current Box operation to finish")
+        return self.printer.lookup_object("virtual_sdcard")
+
+    def _print_path(self, gcmd, sd):
+        # Match SDCARD_PRINT_FILE, which accepts a leading slash.
+        filename = gcmd.get("FILENAME")
+        if filename.startswith("/"):
+            filename = filename[1:]
+        root = os.path.realpath(sd.sdcard_dirname)
+        path = os.path.realpath(os.path.join(root, filename))
+        if (not filename or os.path.isabs(filename)
+                or os.path.commonpath((root, path)) != root
+                or not filename.lower().endswith((".gcode", ".gco", ".g"))):
+            raise gcmd.error("[BOX]: Select a text G-code file inside Virtual SD")
+        return filename, path
+
+    def _inspect_print(self, gcmd, sd):
+        filename, path = self._print_path(gcmd, sd)
+        try:
+            metadata = read_metadata(path)
+        except OSError as exc:
+            raise gcmd.error("[BOX]: Unable to inspect print: %s" % exc)
+        self.print_info = {"filename": filename, "tools": metadata["tools"]}
+        return self.print_info
+
+    def cmd_print_info(self, gcmd):
+        self._inspect_print(gcmd, self._print_idle(gcmd))
+
+    def cmd_print_start(self, gcmd):
+        sd = self._print_idle(gcmd)
+        info = self._inspect_print(gcmd, sd)
+        if not info["tools"]:
+            raise gcmd.error("[BOX]: No filament usage metadata; start this file normally")
+        try:
+            mapping = {}
+            for entry in gcmd.get("MAP", "").split(","):
+                if not entry.strip():
+                    continue
+                tool, slot = entry.split(":")
+                tool, slot = int(tool), int(slot)
+                if tool in mapping or not 0 <= tool <= 255 or slot < 0:
+                    raise ValueError()
+                mapping[tool] = slot
+        except ValueError:
+            raise gcmd.error("[BOX]: MAP must contain unique tool:slot pairs, e.g. 2:0,3:1")
+        used = {item["tool"] for item in info["tools"]}
+        if set(mapping) != used:
+            raise gcmd.error("[BOX]: Map every tool used by this file: %s" %
+                             ", ".join("T%d" % tool for tool in sorted(used)))
+        if not self.drivers_ready:
+            raise gcmd.error("[BOX]: Filament slots are not ready")
+        try:
+            live = self.read_live_state()
+        except Exception as exc:
+            raise gcmd.error("[BOX]: Unable to read CFS state: %s" % exc)
+        for slot in mapping.values():
+            if not self.is_valid_slot(slot):
+                raise gcmd.error("[BOX]: %s is offline" % self.slot_label(slot))
+            if self.is_physical_slot(slot) and not live.slot_mask & (1 << slot):
+                raise gcmd.error("[BOX]: %s has no filament" % self.slot_label(slot))
+        try:
+            self._register_tools(used)
+        except Exception as exc:
+            raise gcmd.error("[BOX]: Unable to register print tools: %s" % exc)
+        # Load/reset events clear the old map. Install the new job's map only
+        # after those events and before Virtual SD schedules its first command.
+        sd._reset_file()
+        try:
+            sd._load_file(gcmd, info["filename"], check_subdirs=True)
+            self.change_engine.tool_map = mapping
+            self.change_engine.mapping_filename = info["filename"]
+            sd.do_resume()
+        except Exception as exc:
+            sd._reset_file()
+            if isinstance(exc, self.gcode.error):
+                raise
+            # Any other exception from a G-code handler shuts Klipper down.
+            raise gcmd.error("[BOX]: Unable to start %s: %s"
+                             % (info["filename"], exc))
+
+    def cmd_select_slot(self, gcmd):
+        self.change_engine.change(
+            gcmd, gcmd.get_int("SLOT", minval=0),
+            bool(gcmd.get_int("FLUSH", 1)))
+
     def cmd_load(self, gcmd):
         slot = gcmd.get_int(
             "SLOT", 0, minval=0,
@@ -1018,9 +1126,9 @@ class Box:
             raise gcmd.error(
                 "[BOX]: " + box_protocol.format_failed("BOX_LOAD", exc))
         if already_loaded:
-            self._info(gcmd, "T%d already loaded; tracking active" % slot)
+            self._info(gcmd, "%s already loaded; tracking active" % self.slot_label(slot))
         else:
-            self._info(gcmd, "T%d loaded" % slot)
+            self._info(gcmd, "%s loaded" % self.slot_label(slot))
         self.last_loaded_slot = slot
         self.activate_spool(slot)
 
@@ -1059,16 +1167,9 @@ class Box:
     def cmd_nozzle_clean(self, gcmd):
         self.nozzle_clean()
 
-    def cmd_flush_clean_snap(self, gcmd):
-        self.flush_clean_snap(retract=bool(gcmd.get_int("RETRACT", 1)))
-
     def cmd_wastebin(self, gcmd):
         self.move_to_wastebin()
         self._info(gcmd, "Moved to wastebin")
-
-    def cmd_resume_check(self, gcmd):
-        retry = bool(gcmd.get_int("RETRY", 0, minval=0, maxval=1))
-        self.change_engine.resume_check(gcmd, retry=retry)
 
     def cmd_slot_set(self, gcmd):
         slot = gcmd.get_int(
@@ -1077,7 +1178,7 @@ class Box:
         if slot is None:
             raise gcmd.error("[BOX]: SLOT is required")
         if not self.is_valid_slot(slot):
-            raise gcmd.error("[BOX]: T%d is not an online box slot" % slot)
+            raise gcmd.error("[BOX]: %s is not online" % self.slot_label(slot))
         material = self._param(gcmd, "MATERIAL")
         if not material:
             raise gcmd.error("[BOX]: MATERIAL is required")
@@ -1098,7 +1199,7 @@ class Box:
                 raise gcmd.error("[BOX]: SPOOLMAN_ID must be an integer")
             profile["spoolman_id"] = None if spool < 0 else spool
         self.set_profile(slot, profile)
-        self._info(gcmd, "Saved T%d profile" % slot)
+        self._info(gcmd, "Saved %s profile" % self.slot_label(slot))
 
     def cmd_slot_clear(self, gcmd):
         slot = gcmd.get_int(
@@ -1107,9 +1208,9 @@ class Box:
         if slot is None:
             raise gcmd.error("[BOX]: SLOT is required")
         if not self.is_valid_slot(slot):
-            raise gcmd.error("[BOX]: T%d is not an online box slot" % slot)
+            raise gcmd.error("[BOX]: %s is not online" % self.slot_label(slot))
         self.clear_profile(slot)
-        self._info(gcmd, "Cleared T%d profile" % slot)
+        self._info(gcmd, "Cleared %s profile" % self.slot_label(slot))
 
     def cmd_material_set(self, gcmd):
         material = self._param(gcmd, "MATERIAL")
@@ -1434,8 +1535,8 @@ class Box:
         }
         if previous and previous.get("code") == code:
             return
-        self._warn("Unknown RFID tag in T%d: CODE=%s" % (
-            self._runtime_slot(slot_key), code))
+        self._warn("Unknown RFID tag in %s: CODE=%s" % (
+            self.slot_label(self._runtime_slot(slot_key)), code))
         self._warn("Map it with: %s" % self._rfid_map_command(code))
 
     def _ensure_material(self, material, target=None):
@@ -1496,8 +1597,8 @@ class Box:
         reserve = self._clean_rfid(fields.get("reserve")) or "none"
         self._info(
             self.gcode,
-            "RFID tag read for T%d: code=%s reserve=%s"
-            % (display_slot, code, reserve))
+            "RFID tag read for %s: code=%s reserve=%s"
+            % (self.slot_label(display_slot), code, reserve))
         requested_id = _spool_id_from_reserve(fields.get("reserve"))
         if requested_id is not None:
             self._request_spoolman_profile(
@@ -1512,7 +1613,7 @@ class Box:
             return True
         if self._apply_rfid_profile(slot, fields):
             self._info(
-                self.gcode, "RFID T%d: RFID profile applied" % display_slot)
+                self.gcode, "%s: RFID profile applied" % self.slot_label(display_slot))
         return True
 
     def _apply_new_mapping(self, code):
@@ -1587,8 +1688,8 @@ class Box:
             local for local in range(SLOTS_PER_BOX) if mask & (1 << local))
         tools = tuple(self._global_slot(address, local) for local in selected)
         self._info(
-            self.gcode, "Reading RFID for %s (%s)" % (
-                ",".join("T%d" % slot for slot in tools), reason))
+            self.gcode, "Reading RFID for Box %d slot %s (%s)" % (
+                address, ", ".join(str(local + 1) for local in selected), reason))
         self._require_reply(
             driver.force_rfid_read(mask),
             "box %d forced RFID read" % address)
@@ -1601,7 +1702,7 @@ class Box:
             record = after.records.get(name, "").strip("\x00")
             fields = after.fields.get(name)
             if len(record) != 40 or not fields:
-                _klog("T%d forced RFID result was invalid", slot)
+                _klog("%s forced RFID result was invalid", self.slot_label(slot))
                 continue
             if self._apply_rfid_record(slot, record, fields):
                 applied.add(slot)
@@ -1648,8 +1749,8 @@ class Box:
         self.spoolman_tokens[slot_key] = token
         generation = self.spoolman_generation
         self._info(
-            self.gcode, "RFID T%d: fetching Spoolman ID %d"
-            % (display_slot, requested_id))
+            self.gcode, "%s: fetching Spoolman ID %d"
+            % (self.slot_label(display_slot), requested_id))
 
         def worker():
             try:
@@ -1662,8 +1763,8 @@ class Box:
                         or self.spoolman_tokens.get(slot_key) != token):
                     self._info(
                         self.gcode,
-                        "RFID T%d: Spoolman ID %d result discarded; slot changed"
-                        % (display_slot, requested_id))
+                        "%s: Spoolman ID %d result discarded; slot changed"
+                        % (self.slot_label(display_slot), requested_id))
                     return
 
                 try:
@@ -1684,8 +1785,8 @@ class Box:
                             slot_key, code, raw_code, record, fields)
                     self._info(
                         self.gcode,
-                        "RFID T%d: Spoolman ID %d unavailable or incomplete; %s"
-                        % (display_slot, requested_id, "RFID profile applied"
+                        "%s: Spoolman ID %d unavailable or incomplete; %s"
+                        % (self.slot_label(display_slot), requested_id, "RFID profile applied"
                            if applied else "RFID mapping required"))
                     return
                 vendor = filament.get("vendor")
@@ -1710,8 +1811,8 @@ class Box:
                     message = (
                         "unknown RFID code %s resolved via Spoolman ID %d"
                         % (code, spool_id))
-                self._info(self.gcode, "RFID T%d: %s" % (
-                    display_slot, message))
+                self._info(self.gcode, "%s: %s" % (
+                    self.slot_label(display_slot), message))
                 if self.snapshot.loaded_slot == display_slot:
                     self.activate_spool(display_slot)
 
@@ -1755,7 +1856,7 @@ class Box:
         self._info(gcmd, "change=%s" % self.change_engine.debug_status())
         self._info(gcmd, "clog=%s" % self._clog_status())
         for address, driver in sorted(self.drivers.items()):
-            self._info(gcmd, "--- Box %d (T%d-T%d) ---" % (
+            self._info(gcmd, "--- Box %d (slot indices %d-%d) ---" % (
                 address, self._global_slot(address, 0),
                 self._global_slot(address, 3)))
             queries = (
@@ -1799,8 +1900,8 @@ class Box:
             for slot, item in sorted(
                     self.unknown_rfid.items(),
                     key=lambda entry: self._runtime_slot(entry[0])):
-                self._info(gcmd, "unknown RFID T%d CODE=%s" % (
-                    self._runtime_slot(slot), item["code"]))
+                self._info(gcmd, "unknown RFID in %s CODE=%s" % (
+                    self.slot_label(self._runtime_slot(slot)), item["code"]))
                 self._info(gcmd, "map: %s" % self._rfid_map_command(item["code"]))
         else:
             self._info(gcmd, "unknown RFID: none")
@@ -1887,7 +1988,7 @@ class Box:
             restore_motion_limits(
                 self.gcode, "_box_clean_limits", include_gcode=True, move=0)
 
-    def flush_clean_snap(self, retract=True, fan_after=None):
+    def flush_clean_snap(self, fan_after=None):
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.wait_moves()
         self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=_box_snap_clean")
@@ -1896,11 +1997,10 @@ class Box:
                 self.gcode.run_script_from_command(
                     "G4 P%d" % self.snap_fan_dwell_ms)
                 self.gcode.run_script_from_command("M83")
-                if retract:
-                    self.gcode.run_script_from_command(
-                        "G1 E-%.1f F%.0f" % (
-                            SNAP_RETRACT_MM, self.retract_velocity))
-                    toolhead.wait_moves()
+                self.gcode.run_script_from_command(
+                    "G1 E-%.1f F%.0f" % (
+                        SNAP_RETRACT_MM, self.retract_velocity))
+                toolhead.wait_moves()
                 self.nozzle_clean()
                 toolhead.wait_moves()
         finally:
@@ -2191,8 +2291,8 @@ class Box:
         address, slot = candidates[0]
         if owner is not None and (owner.address, owner.slot) != (address, slot):
             raise BoxError(
-                "CFS tracking owner T%d conflicts with loaded path T%d"
-                % (owner.slot, slot))
+                "CFS tracking owner %s conflicts with loaded path %s"
+                % (self.slot_label(owner.slot), self.slot_label(slot)))
         self._set_tracking_owner(address, slot)
 
     def _fault_key(self, status, category):
@@ -2309,8 +2409,8 @@ class Box:
                 candidate = self._global_slot(address, local)
                 if loaded >= 0:
                     raise BoxError(
-                        "Multiple CFS boxes report loaded paths: T%d and T%d"
-                        % (loaded, candidate))
+                        "Multiple CFS boxes report loaded paths: %s and %s"
+                        % (self.slot_label(loaded), self.slot_label(candidate)))
                 loaded = candidate
                 loaded_mask |= 1 << candidate
         self.box_replies = replies
@@ -2509,13 +2609,11 @@ class Box:
         stats = self.printer.lookup_object("print_stats")
         if stats.state == "printing":
             target = snap.loaded_slot
-            retry_command = (
-                "T%d" % target if self.is_valid_slot(target) else None)
+            automatic = self.is_valid_slot(target)
             self.change_engine.block_resume(
                 detail,
-                target=target if retry_command else None,
-                automatic=False,
-                retry_command=retry_command)
+                target=target if automatic else None,
+                automatic=automatic)
             self._warn(self.change_engine.recovery_notice())
             self.pause_print()
         else:
@@ -2529,7 +2627,7 @@ class Box:
         address, local = self._address_slot(slot)
         driver = self.drivers.get(address)
         if driver is None:
-            raise BoxError("Box %d is offline (T%d)" % (address, slot))
+            raise BoxError("Box %d is offline (%s)" % (address, self.slot_label(slot)))
         return driver, address, local
 
     def physical_load(self, slot, fault_generation=None):
@@ -2545,12 +2643,13 @@ class Box:
             self.check_operation_abort(fault_generation)
             if live.loaded_slot == self.external_slot:
                 raise BoxError(
-                    "External filament is loaded; unload it before loading T%d" % slot)
+                    "External filament is loaded; unload it before loading %s"
+                    % self.slot_label(slot))
             if (self.is_physical_slot(live.loaded_slot)
                     and live.loaded_slot != slot):
                 raise BoxError(
-                    "T%d is already loaded; unload it before loading T%d"
-                    % (live.loaded_slot, slot))
+                    "%s is already loaded; unload it before loading %s"
+                    % (self.slot_label(live.loaded_slot), self.slot_label(slot)))
             if (live.loaded_slot == slot and live.filament_detected
                     and self._fatal_episode(address, live.status_code)):
                 return self._recover_loaded_path(
@@ -2565,7 +2664,7 @@ class Box:
             slots = self._require_reply(
                 self._query_presence(address, driver), "slot-presence query")
             self.check_operation_abort(fault_generation)
-            self._info(self.gcode, "Loading T%d" % slot)
+            self._info(self.gcode, "Loading %s" % self.slot_label(slot))
             if slot in self.rfid_pending:
                 state = self.box_replies.get(address)
                 if (live.loaded_slot == -1
@@ -2582,8 +2681,8 @@ class Box:
                                 "deferred insertion")
                     except Exception as exc:
                         self._warn(
-                            "T%d deferred RFID read failed: %s; loading without metadata"
-                            % (slot, exc))
+                            "%s deferred RFID read failed: %s; loading without metadata"
+                            % (self.slot_label(slot), exc))
                 self._clear_rfid_watch(slot)
             load_encoder_start = self._optional_encoder(driver)
             self._require_reply(
@@ -2674,7 +2773,8 @@ class Box:
             final = self._wait_for_state(
                 slot, True, True, fault_generation=fault_generation)
             if not (final.loaded_slot == slot and final.filament_detected and final.tracking):
-                raise BoxError("T%d did not reach verified loaded state" % slot)
+                raise BoxError(
+                    "%s did not reach verified loaded state" % self.slot_label(slot))
             self.runout_active = False
             self.runout_origin = None
             self.mark_hotend_feed_pending(slot)
@@ -2700,7 +2800,7 @@ class Box:
                 or not final.filament_detected
                 or not final.tracking):
             raise BoxError(
-                "T%d recovery did not reach verified loaded state" % slot)
+                "%s recovery did not reach verified loaded state" % self.slot_label(slot))
         return True
 
     def physical_unload(self, allow_extruder_retract=True,
@@ -2723,7 +2823,7 @@ class Box:
                     raise BoxError("CFS loaded-slot state is unavailable")
                 slot = live.loaded_slot
                 driver, address, local = self._driver_for_slot(slot)
-                self._info(self.gcode, "Unloading T%d" % slot)
+                self._info(self.gcode, "Unloading %s" % self.slot_label(slot))
                 self.disable_filament_sensor()
                 self._set_tracking(
                     driver, address, None, "disable CFS tracking")

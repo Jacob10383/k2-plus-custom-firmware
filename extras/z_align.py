@@ -44,8 +44,6 @@ TEMP_RISE_MAX_Z_VELOCITY = 100.0
 TEMP_RISE_MAX_Z_ACCEL = 200.0
 STARTUP_RISE_PRIME_MAX_DIST = 0.1
 STARTUP_RISE_PRIME_SPEED = 10.0
-MOTOR_ZDOWN_TIMEOUT = -10000
-MOTOR_PROTECT_ERROR = -10001
 TILT_BIAS_FILE = '/mnt/UDISK/printer_data/z_align_tilt_bias.json'
 MAX_TILT_BIAS = 1.0
 
@@ -113,15 +111,10 @@ class ZAlign:
         self._tilt_bias = 0.0
         self._learn_delta = None
         self._bottom_anchor = None
-        self.force_stop_flag = False
         self.endstop_pin_status = [0] * min(len(self.endstop_pin_z), 8)
         self.pin_len = min(len(self.endstop_pin_z), 8)
         self._timer = self.reactor.register_timer(
             self._handle_timer, self.reactor.NEVER)
-        self.gcode.register_command("ZDOWN", self.cmd_ZDOWN)
-        self.gcode.register_command("ZDOWN_FORCE_STOP", self.cmd_ZDOWN_FORCE_STOP)
-        webhooks = self.printer.lookup_object('webhooks')
-        webhooks.register_endpoint("zdown_force_stop", self.zdown_force_stop)
         buttons = self.printer.load_object(config, 'buttons')
         buttons.register_buttons(self.endstop_pin_z, self._button_handler)
         self.printer.register_event_handler('klippy:connect', self._handle_connect)
@@ -282,14 +275,6 @@ class ZAlign:
 
     def _handle_z_align_status(self, params, source="callback"):
         self._z_align_status = dict(params)
-        _klog(
-            "status[%s] oid=%s flag=%s delta=%s sent=%s recv=%s",
-            source,
-            params.get('oid'),
-            params.get('flag'),
-            params.get('deltaError1'),
-            params.get('#sent_time'),
-            params.get('#receive_time'))
 
     def _install_status_cache_hook(self):
         serial = self._main_mcu._serial
@@ -326,7 +311,6 @@ class ZAlign:
         self._last_retry_delta_mm = 0.0
         self._last_retry_delta_steps = 0
         self._z_align_status = {}
-        self.force_stop_flag = False
 
     def _say(self, msg):
         _klog('%s', msg)
@@ -433,19 +417,13 @@ class ZAlign:
         if not self._settle_attempt:
             self._settle_attempt = 1
         self._z_align_status = {}
-        result = self._z_align_query_cmd.send([
+        self._z_align_query_cmd.send([
             self._oidz, 1, quick_ticks, slow_ticks,
             rising_steps, self.mcu_filter_count, safe_steps])
-        _klog("initial query_z_align response=%s", result)
         self._phase_deadline = self.reactor.monotonic() + self.timeout
         self._state = 'mcu_wait'
 
     def _poll_mcu_z_align(self, eventtime):
-        if self.force_stop_flag:
-            self.force_stop_flag = False
-            self._force_stop_mcu_z_align()
-            self._fail('MCU z_align force-stopped', request_homing_abort=True)
-            return self.reactor.NEVER
         if self._phase_deadline is not None and eventtime > self._phase_deadline:
             _klog("timeout waiting status=%s", self._z_align_status)
             self._force_stop_mcu_z_align()
@@ -457,6 +435,8 @@ class ZAlign:
         flag = int(status.get('flag', 0) or 0)
         if flag == 0:
             return eventtime + POLL_INTERVAL
+        _klog('MCU z-align attempt %d/%d status=%s',
+              self._settle_attempt, self.retries, status)
         if flag == 2:
             self._force_stop_mcu_z_align()
             if self._settle_attempt >= self.retries:
@@ -480,8 +460,8 @@ class ZAlign:
         tolerance_mm = self.retry_tolerance * (self._step_distance or 0.0)
         if abs(delta_steps) <= self.retry_tolerance:
             self._say(
-                'MCU z-align attempt %d/%d delta %.4fmm (%d steps)'
-                % (self._settle_attempt, self.retries, delta_mm, delta_steps))
+                'MCU z-align attempt %d/%d: delta %.4fmm'
+                % (self._settle_attempt, self.retries, delta_mm))
             self._phase_deadline = None
             self._prepared_zmax = self.zmax
             self._target_z = max(0.0, self._prepared_zmax - self.rise_distance)
@@ -489,16 +469,17 @@ class ZAlign:
             return self.reactor.NEVER
         if self._settle_attempt >= self.retries:
             self._fail(
-                'too many MCU z_align retries:'
-                ' delta_steps=%d retry_tolerance=%d retries=%d'
-                % (delta_steps, self.retry_tolerance, self.retries),
+                'MCU z-align delta %.4fmm exceeded tolerance %.4fmm'
+                ' after %d/%d attempts'
+                % (delta_mm, tolerance_mm, self._settle_attempt, self.retries),
                 request_homing_abort=True)
             return self.reactor.NEVER
         self._settle_attempt += 1
         self._say(
-            'MCU z-align attempt %d/%d delta %.4fmm (%d steps) exceeds tolerance %.4fmm'
+            'MCU z-align attempt %d/%d: delta %.4fmm exceeds tolerance %.4fmm;'
+            ' retrying attempt %d/%d'
             % (self._settle_attempt - 1, self.retries,
-               delta_mm, delta_steps, tolerance_mm))
+               delta_mm, tolerance_mm, self._settle_attempt, self.retries))
         self._state = 'mcu_start'
         return self.reactor.NOW
 
@@ -795,7 +776,6 @@ class ZAlign:
                        restore_motor_mode=False, wait_until_safe=False):
         if self._state in ('idle', 'error'):
             return False
-        self.force_stop_flag = True
         self._force_stop_mcu_z_align()
         self._fail(reason, request_homing_abort=False)
         if motor_off:
@@ -806,29 +786,6 @@ class ZAlign:
                     'failed to motor_off during abort',
                     level=logging.exception)
         return True
-
-    def zdown_force_stop(self, web_request):
-        self.force_stop_flag = True
-        self._force_stop_mcu_z_align()
-        web_request.send({"result": "success"})
-
-    def cmd_ZDOWN_FORCE_STOP(self, _gcmd):
-        self.force_stop_flag = True
-        self._force_stop_mcu_z_align()
-
-    def cmd_ZDOWN(self, _gcmd):
-        self.force_stop_flag = False
-        try:
-            started = self.start_prepare()
-            if started:
-                self.wait_prepare_complete()
-                self.perform_blocking_rise()
-        except self.printer.command_error as err:
-            msg = str(err)
-            if 'timed out waiting for MCU z_align' in msg:
-                return MOTOR_ZDOWN_TIMEOUT
-            return MOTOR_PROTECT_ERROR
-        return 0
 
     def get_status(self, _eventtime):
         return {

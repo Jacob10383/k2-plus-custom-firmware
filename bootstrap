@@ -932,7 +932,7 @@ def update_k2_configs() -> None:
         if detect_error is None:
             detect_error = "printer.cfg probe stack is not carto, mix, or prtouch"
         log_warn(f"Could not detect current probe mode ({detect_error})")
-        log_warn(f"Probe mode is now set to {PROBE_MODES['carto'][0]}")
+        log_warn(f"Probe mode is now set to {PROBE_MODES['mix'][0]}")
 
     printer_cfg = CONFIG_DIR / "printer.cfg"
     blob = None

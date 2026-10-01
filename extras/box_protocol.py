@@ -18,6 +18,7 @@ DEFAULT_TIMEOUT = 1.0
 POLL_TIMEOUT = 0.1
 RFID_FORCE_SLOT_TIMEOUT = 190.0
 BROADCAST_ADDRESS = 0xFE
+GENERAL_BROADCAST_ADDRESS = 0xFF
 UNIID_LENGTH = 12
 
 CMD_RFID_RECORDS = 0x02
@@ -34,6 +35,10 @@ CMD_UNLOAD = 0x11
 AUTO_ASSIGN = 0xA0
 AUTO_DISCOVER = 0xA1
 AUTO_QUERY = 0xA2
+LOADER_TO_APP = 0x0B
+
+MODE_APP = 0
+MODE_LOADER = 1
 
 STATUS_OK = 0x00
 STATUS_INVALID_PARAM = 0x01
@@ -242,6 +247,18 @@ def status_detail(value):
     return "(%s): %s" % (name, body)
 
 
+SLOTS_PER_BOX = 4
+
+
+def slot_label(slot, external_slot):
+    """User-facing slot name. T numbers are reserved for tool commands."""
+    if slot == external_slot:
+        return "External spool"
+    if isinstance(slot, int) and slot >= 0:
+        return "Box %d, slot %d" % (slot // SLOTS_PER_BOX + 1, slot % SLOTS_PER_BOX + 1)
+    return "unknown slot"
+
+
 def format_failed(prefix, detail):
     detail = str(detail)
     if detail.startswith("("):
@@ -293,6 +310,7 @@ class RfidRemainingReply(Reply):
 @dataclass(frozen=True)
 class AutoAddressReply:
     uniid: bytes
+    mode: int
 
 
 def _protocol_error(message, reply=None, context=None):
@@ -528,17 +546,17 @@ def decode_auto_reply(frame, command, expected_address, expected_uniid=None):
     reply = decode_reply(frame, expected_address, command)
     if reply.status != STATUS_OK or len(reply.payload) != 14:
         _protocol_error("auto-address response has invalid outer status or shape", reply)
-    device_type, inner_status = reply.payload[:2]
+    device_type, mode = reply.payload[:2]
     if device_type != 1:
         _protocol_error("auto-address response device type is not CFS", reply)
-    if inner_status != STATUS_OK:
-        _protocol_error("auto-address inner status is nonzero", reply)
+    if mode not in (MODE_APP, MODE_LOADER):
+        _protocol_error("auto-address response mode is invalid", reply)
     uniid = reply.payload[2:]
     if not any(uniid):
         _protocol_error("auto-address UniID is zero", reply)
     if expected_uniid is not None and uniid != _uniid(expected_uniid):
         _protocol_error("auto-address UniID does not match", reply)
-    return AutoAddressReply(uniid)
+    return AutoAddressReply(uniid, mode)
 
 
 class BoxDriver:
@@ -702,3 +720,7 @@ class AutoAddressClient:
             BROADCAST_ADDRESS, AUTO_ASSIGN, (address,) + tuple(uniid), timeout)
         return None if not frame else decode_auto_reply(
             frame, AUTO_ASSIGN, address, expected_uniid=uniid)
+
+    def start_app(self, timeout=0.05):
+        return self._exchange(
+            GENERAL_BROADCAST_ADDRESS, LOADER_TO_APP, (1,), timeout)
