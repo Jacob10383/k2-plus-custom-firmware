@@ -1,0 +1,17 @@
+{#-
+  The stock repository link, with a Discord button beside it.
+-#}
+<div style="display: flex; align-items: center">
+  <a href="https://discord.gg/RcnUFd7dfX" title="Discord" class="md-header__button md-icon" target="_blank" rel="noopener">
+    {% include ".icons/fontawesome/brands/discord.svg" %}
+  </a>
+  <a href="{{ config.repo_url }}" title="{{ lang.t('source') }}" class="md-source" data-md-component="source" style="flex: 1; min-width: 0">
+    <div class="md-source__icon md-icon">
+      {% set icon = config.theme.icon.repo or "fontawesome/brands/git-alt" %}
+      {% include ".icons/" ~ icon ~ ".svg" %}
+    </div>
+    <div class="md-source__repository">
+      {{ config.repo_name }}
+    </div>
+  </a>
+</div>

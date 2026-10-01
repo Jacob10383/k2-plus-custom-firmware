@@ -28,7 +28,7 @@ extra files you added, and the current probe mode. Moonraker and Klipper are
 stopped before the swap and started afterward. A timestamped copy of the
 previous configuration is left in `printer_data/config/config_backups/`.
 
-If the probe stack cannot be read, `carto` is left in place.
+If the probe stack cannot be read, Mixed mode is left in place.
 
 ## Replace the printer configuration
 

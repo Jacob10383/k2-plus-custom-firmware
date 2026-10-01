@@ -1,22 +1,73 @@
 # Calibration
 
-The default configuration expects the 5.8 mm Y-endstop spacer and the
-Cartographer mount used by K2 Improvements.
+## Probe modes
+
+| Mode | What it does |
+| --- | --- |
+| Mixed (default) | Cartographer scans the bed, PRTouch does touch operations (Z offset) |
+| Cartographer | Cartographer does both |
+| PRTouch | PRTouch does both |
+
+The default configuration of Mixed and Cartographer modes expects the K2
+Improvements Cartographer mount and the 5.8 mm Y-endstop spacer. Change it if
+your setup differs.
+
+Check the current mode:
+
+```sh
+bootstrap --probe
+```
+
+Switch modes:
+
+```sh
+bootstrap --probe mix
+bootstrap --probe carto
+bootstrap --probe prtouch
+```
+
+Bootstrap restarts Klipper after switching.
 
 ## Required after installation
 
-These are the only calibration steps required for the default setup.
+### 1. Calibrate the probe
 
-### 1. Calibrate Cartographer
+Run only the commands for your probe mode.
 
-```gcode
-G28
-CARTOGRAPHER_TOUCH_CALIBRATE METHOD=touch
-CARTOGRAPHER_SCAN_CALIBRATE
-```
+=== "Mixed (default)"
 
-The default probe mode is `carto`. If you changed modes, use the matching
-instructions under [Probe modes](#probe-modes) instead.
+    First, home the printer:
+
+    ```gcode
+    G28
+    ```
+
+    Wait for homing to finish, then run:
+
+    ```gcode
+    PRTOUCH_SCAN_CALIBRATE
+    ```
+
+=== "Cartographer"
+
+    First, home the printer:
+
+    ```gcode
+    G28
+    ```
+
+    Wait for homing to finish, then run:
+
+    ```gcode
+    CARTOGRAPHER_TOUCH_CALIBRATE
+    SAVE_CONFIG RESTART=0
+    CARTOGRAPHER_SCAN_CALIBRATE METHOD=touch
+    SAVE_CONFIG RESTART=0
+    ```
+
+=== "PRTouch"
+
+    No probe calibration is required.
 
 ### 2. Calibrate the cutter
 
@@ -28,60 +79,10 @@ CALIBRATE_CUT_POS
 
 ```gcode
 SHAPER_CALIBRATE
-SAVE_CONFIG
+SAVE_CONFIG RESTART=0
 ```
-
-The analysis step can take a while because the printer's SoC is slow at
-processing resonance data.
 
 ## Other calibration and maintenance
-
-Nothing below is part of the normal initial setup.
-
-### Probe modes
-
-Check the current mode:
-
-```sh
-bootstrap --probe
-```
-
-Switch modes:
-
-```sh
-bootstrap --probe carto
-bootstrap --probe mix
-bootstrap --probe prtouch
-```
-
-- `carto`: Cartographer only
-- `mix`: Cartographer scans the bed; PRTouch establishes nozzle Z=0
-- `prtouch`: PRTouch only
-
-Bootstrap updates the probe configuration and restarts Klipper automatically.
-Cartographer and mixed modes expect the 5.8 mm Y-endstop spacer. PRTouch-only
-mode does not.
-
-#### Mixed-mode calibration
-
-First, home the printer:
-
-```gcode
-G28
-```
-
-Wait for homing to finish, then run:
-
-```gcode
-PRTOUCH_SCAN_CALIBRATE
-```
-
-This uses PRTouch to calibrate the Cartographer scan model. It does not
-calibrate PRTouch itself.
-
-#### PRTouch-only mode
-
-No probe calibration is required.
 
 ### Motor calibration
 
@@ -119,7 +120,8 @@ Use `BELT_TENSION AXES=X` or `BELT_TENSION AXES=Y` to tension one axis.
 
 #### Belt tension sensor recalibration
 
-Do not run this as routine setup. It is only for incorrect tension readings or
+Do **not** run this as routine setup. It **will** redefine what your tensioners
+treat as "normal" tension. It is only for incorrect tension readings or
 specific troubleshooting, and requires the [printed calibration jig](https://www.crealitycloud.com/model-detail/belt-tensioning-module-calibration-tool). Normal
 automatic belt tensioning does not require it.
 

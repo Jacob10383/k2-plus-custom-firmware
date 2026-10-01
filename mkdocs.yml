@@ -1,10 +1,13 @@
 site_name: Jacobean's K2 Plus firmware
 site_description: Documentation for the Creality K2 Plus firmware
 site_url: https://jacob10383.github.io/k2-plus-custom-firmware/
+repo_url: https://github.com/Jacob10383/k2-plus-custom-firmware
 
 theme:
   name: material
   custom_dir: overrides
+  icon:
+    repo: fontawesome/brands/github
   features:
     - navigation.top
     - content.code.copy
@@ -26,6 +29,8 @@ markdown_extensions:
   - admonition
   - pymdownx.details
   - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
 
 nav:
   - Home: index.md

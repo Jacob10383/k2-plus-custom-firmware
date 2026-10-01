@@ -34,7 +34,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-docs.txt
       - run: pip install -r requirements-docs.txt
-      - run: mkdocs build --strict
+      - run: zensical build --strict
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
