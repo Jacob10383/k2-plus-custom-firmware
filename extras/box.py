@@ -64,7 +64,8 @@ UNLOAD_RETRY_MM = 25.0
 UNLOAD_RETRIES = 3
 ENCODER_CLEAR_MM = 20.0
 
-CLOG_EXTRUDER_MM = 80.0
+# The CFS refills the buffer in ~25-30mm chunks, so any single refill moves
+# the encoder past this and proves filament is flowing.
 CLOG_ENCODER_RESET_MM = 18.0
 
 CFS_COMMAND_FATAL_STATUSES = frozenset((
@@ -433,6 +434,10 @@ class Box:
         self.pre_cut_cal_x = config.getfloat("pre_cut_cal_pos_x", -5.0)
         self.cut_check_max_x = config.getfloat("check_cut_pos_x_max", -5.5)
         self.cut_check_min_x = config.getfloat("check_cut_pos_x_min", -9.5)
+        self.clog_detection = config.getboolean("clog_detection", True)
+        # Below one refill chunk, normal buffer draw would read as a clog.
+        self.clog_extruder_length = config.getfloat(
+            "clog_extruder_length", 80.0, minval=30.0)
 
         self.serial = None
         self.drivers = {}
@@ -1006,17 +1011,22 @@ class Box:
             encoder_delta = abs(
                 self.clog_baseline.get("last_encoder", 0.0) - self.clog_baseline["encoder"])
         triggered = (
-            extruder_delta is not None and extruder_delta > CLOG_EXTRUDER_MM
+            extruder_delta is not None
+            and extruder_delta > self.clog_extruder_length
             and encoder_delta <= CLOG_ENCODER_RESET_MM)
-        state = "disabled" if self.runout_active else (
-            "inactive" if not self.snapshot.tracking else (
-                "triggered" if triggered else "active"))
+        if not self.clog_detection or self.runout_active:
+            state = "disabled"
+        elif not self.snapshot.tracking:
+            state = "inactive"
+        else:
+            state = "triggered" if triggered else "active"
         return {
             "state": state,
+            "enabled": self.clog_detection,
             "baseline_ready": self.clog_baseline is not None,
             "extruder_delta_mm": extruder_delta,
             "encoder_delta_mm": encoder_delta,
-            "extruder_threshold_mm": CLOG_EXTRUDER_MM,
+            "extruder_threshold_mm": self.clog_extruder_length,
             "encoder_reset_mm": CLOG_ENCODER_RESET_MM,
             "triggered": triggered,
             "event_count": self.clog_event_count,
@@ -2487,7 +2497,8 @@ class Box:
             snap = self.read_live_state(include_topology=include_topology)
             if include_topology:
                 self.last_topology_refresh = eventtime
-            if snap.tracking and not self.runout_active:
+            if (self.clog_detection and snap.tracking
+                    and not self.runout_active):
                 self._check_clog(eventtime, snap)
             else:
                 self.clog_baseline = None
@@ -2594,7 +2605,7 @@ class Box:
                 "last_extruder": position, "last_encoder": snap.encoder_mm,
             }
             return
-        if extruder_delta <= CLOG_EXTRUDER_MM:
+        if extruder_delta <= self.clog_extruder_length:
             return
         self.clog_event_count += 1
         self.last_clog = {

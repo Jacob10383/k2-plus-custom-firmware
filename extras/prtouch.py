@@ -80,6 +80,11 @@ class PRTouchEndstopWrapper:
         self.gcode = self.printer.lookup_object('gcode')
         self.ppins = self.printer.lookup_object('pins')
 
+        # Default z_offset in memory, not in the shipped include, so
+        # SAVE_CONFIG can save it without an include conflict. Runs before
+        # PrinterProbe, which requires the option.
+        if not config.fileconfig.has_option(config.get_name(), 'z_offset'):
+            config.fileconfig.set(config.get_name(), 'z_offset', '0')
         self.position_endstop = config.getfloat('z_offset')
         # When true: claim Klipper probe object + probe:z_virtual_endstop.
         # When false: PRTOUCH_HOME still works; endstop chip is prtouch:.
