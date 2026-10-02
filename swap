@@ -24,7 +24,9 @@ import shutil
 import signal
 import struct
 import subprocess
+import tempfile
 import time
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -53,6 +55,16 @@ SERVICE_TARGETS = [
     {"name": "app", "systemd": [], "init": ["app"]},
     {"name": "device_manager", "systemd": [], "init": ["device_manager"]},
 ]
+# SIGKILLed before anything else: stock's Monitor restarts webrtc, log_main
+# and the app servers when they die, and wipe_data (factory reset, rm -rf
+# under /mnt/UDISK) ignores SIGTERM.
+FIRST_KILL_PROCESSES = ["Monitor", "wipe_data"]
+# Shell scripts run as `sh <script>`, so killall cannot match them by name.
+UDISK_WRITER_SCRIPTS = [
+    "/usr/bin/auto_uvc.sh",
+    "/usr/bin/report.sh",
+    "/sbin/swupdate_cmd.sh",
+]
 UDISK_WRITER_PROCESSES = [
     "device_manager",
     "cam_app",
@@ -66,6 +78,15 @@ UDISK_WRITER_PROCESSES = [
     "upgrade-server",
     "web-server",
     "Monitor",
+    "log_main",
+    "cam_sub_app",
+    "ai_engine",
+    "ai_capture",
+    "yolo_attention",
+    "burn-server",
+    "swupdate",
+    "swupdate-progress",
+    "adbd",
     "helix-screen",
     "helix-splash",
     "helix-watchdog",
@@ -78,9 +99,17 @@ CUSTOM_ROOTFS_SENTINEL = Path("/etc/.k2_custom")
 CUSTOM_KERNEL_MARKER = "-k2jt"
 
 PARTITION_PAIRS = {
-    "A": {"root": "/dev/mmcblk0p6", "boot_env": "bootA", "root_env": "rootfsA"},
-    "B": {"root": "/dev/mmcblk0p7", "boot_env": "bootB", "root_env": "rootfsB"},
+    "A": {"root": "/dev/mmcblk0p6", "boot": "/dev/mmcblk0p4", "boot_env": "bootA", "root_env": "rootfsA"},
+    "B": {"root": "/dev/mmcblk0p7", "boot": "/dev/mmcblk0p5", "boot_env": "bootB", "root_env": "rootfsB"},
 }
+
+ANDROID_BOOT_MAGIC = b"ANDROID!"
+MAX_KERNEL_SIZE = 32 * 1024 * 1024
+GZIP_MAGIC = b"\x1f\x8b\x08"
+LINUX_BANNER = b"Linux version "
+SQUASHFS_MAGIC = b"hsqs"
+EXT_MAGIC_OFFSET = 1024 + 56
+EXT_MAGIC = b"\x53\xef"
 
 
 # ---------------------------------------------------------------------------
@@ -188,22 +217,49 @@ def service_control(action: str, targets: list[dict[str, list[str] | str]]) -> N
             log(f"{action}ed {target['name']}")
 
 
+def kill_process(name: str, *signal_args: str) -> None:
+    result = subprocess.run(
+        ["killall", *signal_args, name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        log(f"killed {name}")
+
+
+def kill_scripts(paths: list[str]) -> None:
+    wanted = {path.encode() for path in paths}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        match = wanted.intersection(argv)
+        if not match:
+            continue
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            continue
+        log(f"killed {os.path.basename(match.pop().decode())} (pid {pid})")
+
+
 def quiet_udisk_writers() -> None:
     try:
         os.chdir("/")
     except OSError:
         pass
 
+    for name in FIRST_KILL_PROCESSES:
+        kill_process(name, "-9")
+    kill_scripts(UDISK_WRITER_SCRIPTS)
+
     service_control("stop", SERVICE_TARGETS)
 
     for name in UDISK_WRITER_PROCESSES:
-        result = subprocess.run(
-            ["killall", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            log(f"killed {name}")
+        kill_process(name)
 
     subprocess.run(["sync"], check=True)
 
@@ -246,6 +302,113 @@ def detect_active_slot() -> str:
     if "root=/dev/mmcblk0p7" in cmdline:
         return "B"
     raise SystemExit("cannot determine active partition slot from /proc/cmdline")
+
+
+def kernel_release_on_partition(partition_slot: str) -> str | None:
+    """Read the kernel release from the gzip zImage on an inactive boot partition."""
+    try:
+        with open(PARTITION_PAIRS[partition_slot]["boot"], "rb") as f:
+            hdr = f.read(2048)
+            if len(hdr) < 40 or not hdr.startswith(ANDROID_BOOT_MAGIC):
+                return None
+            kernel_size = struct.unpack_from("<I", hdr, 8)[0]
+            page_size = struct.unpack_from("<I", hdr, 36)[0]
+            if not 0 < kernel_size <= MAX_KERNEL_SIZE:
+                return None
+            if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+                return None
+            f.seek(page_size)
+            kernel = f.read(kernel_size)
+    except OSError:
+        return None
+
+    start = kernel.find(GZIP_MAGIC)
+    while start >= 0:
+        try:
+            decomp = zlib.decompressobj(31)
+            buf = b""
+            for offset in range(start, len(kernel), 1 << 20):
+                buf += decomp.decompress(kernel[offset:offset + (1 << 20)])
+                idx = buf.find(LINUX_BANNER)
+                if idx >= 0 and buf.find(b" ", idx + len(LINUX_BANNER)) >= 0:
+                    rest = buf[idx + len(LINUX_BANNER):]
+                    return rest.split(b" ", 1)[0].decode(errors="replace")
+                buf = buf[-64:]
+                if decomp.eof:
+                    break
+        except zlib.error:
+            pass
+        start = kernel.find(GZIP_MAGIC, start + 1)
+    return None
+
+
+def rootfs_has_sentinel(partition_slot: str) -> bool | None:
+    """Mount an inactive rootfs read-only and check for the custom sentinel."""
+    dev = PARTITION_PAIRS[partition_slot]["root"]
+    try:
+        with open(dev, "rb") as f:
+            head = f.read(EXT_MAGIC_OFFSET + 2)
+    except OSError:
+        return None
+    if head[:4] == SQUASHFS_MAGIC:
+        fstype, opts = "squashfs", "ro"
+    elif head[EXT_MAGIC_OFFSET:EXT_MAGIC_OFFSET + 2] == EXT_MAGIC:
+        fstype, opts = "ext4", "ro,noload"
+    else:
+        return None
+
+    mnt = tempfile.mkdtemp(prefix="swap-probe-")
+    mounted = False
+    try:
+        mounted = subprocess.run(
+            ["mount", "-t", fstype, "-o", opts, dev, mnt],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if not mounted:
+            return None
+        return (Path(mnt) / CUSTOM_ROOTFS_SENTINEL.relative_to("/")).exists()
+    finally:
+        if os.path.ismount(mnt):
+            umount = subprocess.run(["umount", mnt], capture_output=True, text=True)
+            if umount.returncode != 0:
+                raise SystemExit(
+                    f"could not unmount probe of {dev} at {mnt}: "
+                    f"{umount.stderr.strip() or umount.returncode}. Refusing to swap."
+                )
+        os.rmdir(mnt)
+
+
+def require_target_installed(to_slot: str, from_partition_slot: str, to_partition_slot: str) -> None:
+    """Refuse unless the target slot holds the firmware its env snapshot claims."""
+    if to_slot == "custom":
+        fix = f"Rerun the installer to reinstall {firmware_label(to_slot)}."
+    else:
+        fix = (
+            f"Creality firmware is no longer intact on boot{to_partition_slot}/"
+            f"rootfs{to_partition_slot}; restore it before swapping."
+        )
+    if to_partition_slot == from_partition_slot:
+        raise SystemExit(
+            f"slot '{to_slot}' points at rootfs{to_partition_slot}, which is the running slot. "
+            f"A firmware update most likely overwrote it. {fix}"
+        )
+
+    release = kernel_release_on_partition(to_partition_slot)
+    sentinel = rootfs_has_sentinel(to_partition_slot)
+    if release is None or sentinel is None:
+        raise SystemExit(
+            f"could not read boot{to_partition_slot}/rootfs{to_partition_slot} markers "
+            f"(kernel={release!r}, sentinel={sentinel!r}). {fix}"
+        )
+
+    kernel_env = "custom" if CUSTOM_KERNEL_MARKER in release else "stock"
+    rootfs_env = "custom" if sentinel else "stock"
+    if kernel_env != to_slot or rootfs_env != to_slot:
+        raise SystemExit(
+            f"boot{to_partition_slot} kernel is '{kernel_env}' ({release}) and "
+            f"rootfs{to_partition_slot} is '{rootfs_env}', expected '{to_slot}'. {fix}"
+        )
 
 
 def firmware_label(env_name: str) -> str:
@@ -732,15 +895,16 @@ def cmd_swap(args: argparse.Namespace) -> None:
     if not target_dir.exists():
         raise SystemExit(
             f"slot '{to_slot}' does not exist at {target_dir}. "
-            f"Run install.py to set up {firmware_label(to_slot)} first."
+            f"Run the installer to set up {firmware_label(to_slot)} first."
         )
     if not (target_dir / ENV_SNAPSHOT_FILE).exists():
         raise SystemExit(
             f"slot '{to_slot}' exists but is missing env.bin — may be corrupt. "
-            f"Run install.py to reinitialize."
+            f"Rerun the installer to reinitialize."
         )
 
     _to_blob, _to_info, to_partition_slot = load_slot_env(target_dir, to_slot)
+    require_target_installed(to_slot, from_partition_slot, to_partition_slot)
 
     if not args.yes:
         confirm_swap(from_slot, from_partition_slot, to_slot, to_partition_slot)
