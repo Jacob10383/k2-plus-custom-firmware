@@ -100,6 +100,8 @@ CLEAN_MINIMUM_CRUISE_RATIO = 0.5
 CLEAN_LIMIT_SCV = 5
 CLEAN_SERPENTINE_Y_STEP = 2.0
 CLEAN_SCRAPER_PASSES = 3
+# Toolhead moves between the wastebin visits of a filament retry.
+DEFAULT_FILAMENT_RETRY_MOVES = "Y350, X300, Y50, X50"
 
 SNAP_RETRACT_MM = 1.2
 
@@ -139,6 +141,23 @@ class _VirtualSDGCodeObserver:
                 self.enabled = False
                 _klog('runout feature observer disabled', level=logging.exception)
         return result
+
+
+def _parse_retry_moves(text, error):
+    """Parse comma-separated G0 XY words such as "Y350, X300 Y50"."""
+    moves = []
+    for item in str(text).split(","):
+        words = item.upper().split()
+        try:
+            if not words or any(
+                    word[0] not in "XY" or not math.isfinite(float(word[1:]))
+                    for word in words):
+                raise ValueError(item)
+        except ValueError:
+            raise error(
+                "Invalid filament_retry_moves entry %r" % (item.strip(),))
+        moves.append(" ".join(words))
+    return tuple(moves)
 
 
 def _spool_id_from_reserve(value):
@@ -412,6 +431,9 @@ class Box:
             raise config.error("Invalid clean pad boundaries")
         self.wastebin_x = config.getfloat("wastebin_pos_x", 133.0)
         self.wastebin_y = config.getfloat("wastebin_pos_y", 378.0)
+        self.filament_retry_moves = _parse_retry_moves(config.get(
+            "filament_retry_moves", DEFAULT_FILAMENT_RETRY_MOVES),
+            config.error)
         self.travel_velocity = config.getfloat(
             "travel_velocity", 18000.0, above=0.0)
         self.z_velocity = config.getfloat(
@@ -2069,8 +2091,7 @@ class Box:
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
             wastebin = "X%g Y%g" % (self.wastebin_x, self.wastebin_y)
-            for move in (
-                    wastebin, "Y350", "X300", "Y50", "X50", wastebin):
+            for move in (wastebin,) + self.filament_retry_moves + (wastebin,):
                 self.gcode.run_script_from_command(
                     "G0 %s F%.0f" % (move, self.travel_velocity))
             toolhead.wait_moves()
