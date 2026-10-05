@@ -61,8 +61,8 @@
       "size": 3496
     },
     "motor_control.py": {
-      "sha256": "0eb7a348f3f643fe1bb3ffe3af14b3810a980fb2b1296f2d50d227e5e0edc7d6",
-      "size": 184464
+      "sha256": "694fba546bd1a51b78931c5343738daf987a0a0ae86f4c76be8e2da9512156e1",
+      "size": 185280
     },
     "motor_map.json": {
       "sha256": "d4f143b0ff2522165992bef5053a07f295fa7bc8cb0fef4a937179706388fee1",

@@ -20,88 +20,6 @@ from typing import Iterable
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# motor_control_config_model
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Configuration model for the `[motor_control]` section.
-
-Combines the K2 pin layout with cutter calibration and firmware parameter
-overrides used by startup, fault handling, and command execution.
-"""
-
-
-
-
-K2_PIN_LAYOUT = {
-    "motor_x_dir": ("PB9", 0),
-    "motor_x_step": ("PB10", 0),
-    "motor_x_stall": ("PB11", None),
-    "motor_y_dir": ("!PB7", 0),
-    "motor_y_step": ("PB8", 0),
-    "motor_y_stall": ("PB12", None),
-    "motor_z_dir": ("PB5", 0),
-    "motor_z_step": ("PB6", 1),
-    "motor_z_stall": ("PB13", None),
-    "motor_z1_dir": ("PA1", 1),
-    "motor_z1_step": ("PB15", 1),
-    "motor_z1_stall": ("PA10", None),
-    "motor_e_stall": ("nozzle_mcu:PB12", None),
-}
-
-PIN_OPTIONS = tuple(K2_PIN_LAYOUT)
-
-OUTPUT_PIN_OPTIONS = (
-    "motor_x_dir",
-    "motor_x_step",
-    "motor_y_dir",
-    "motor_y_step",
-    "motor_z_dir",
-    "motor_z_step",
-    "motor_z1_dir",
-    "motor_z1_step",
-)
-
-
-@dataclass(frozen=True)
-class MotorPinConfig:
-    raw: str
-    pin_desc: str
-    startup_value: int | None
-
-
-@dataclass(frozen=True)
-class MotorControlConfigModel:
-    raw_options: dict[str, str | None]
-    cut_pos_offset: float
-    pins: dict[str, MotorPinConfig]
-
-    @classmethod
-    def from_config(cls, config, param_options=()):
-        accepted = {
-            "cut_pos_offset",
-            *(option.lower() for option in PIN_OPTIONS),
-            *(str(option).lower() for option in param_options),
-        }
-        raw = {
-            option: config.get(option)
-            for option in config.fileconfig.options(config.section)
-            if option.lower() in accepted
-        }
-        pins = {
-            option: MotorPinConfig(
-                raw=pin_desc,
-                pin_desc=pin_desc,
-                startup_value=startup_value,
-            )
-            for option, (pin_desc, startup_value) in K2_PIN_LAYOUT.items()
-        }
-        return cls(
-            raw_options=raw,
-            cut_pos_offset=config.getfloat("cut_pos_offset", 0.4),
-            pins=pins,
-        )
-
-# ──────────────────────────────────────────────────────────────────────────
 # motor_cut_calibration
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -732,96 +650,6 @@ class MotorParamRegistry:
                 "cfg_value": cfg_value,
             })
         return applied
-
-# ──────────────────────────────────────────────────────────────────────────
-# motor_pin_manager
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Mainboard motor pin-state manager.
-
-Drives STEP/DIR address straps for the stock Creality MCU during discovery.
-"""
-
-
-
-
-
-PIN_DIR_SEQUENCE = (
-    ("motor_x_dir", 0),
-    ("motor_x_step", 0),
-    ("motor_y_dir", 0),
-    ("motor_y_step", 0),
-    ("motor_z_dir", 0),
-    ("motor_z_step", 1),
-    ("motor_z1_dir", 1),
-    ("motor_z1_step", 1),
-)
-
-PIN_NORMAL_SEQUENCE = (
-    ("motor_x_dir", 0),
-    ("motor_x_step", 0),
-    ("motor_y_dir", 1),
-    ("motor_y_step", 0),
-    ("motor_z_dir", 0),
-    ("motor_z_step", 0),
-    ("motor_z1_dir", 0),
-    ("motor_z1_step", 0),
-)
-
-
-def _shareable_pin_desc(pin_desc: str) -> str:
-    desc = pin_desc.strip()
-    while desc and desc[0] in "!^~":
-        desc = desc[1:].strip()
-    return desc
-
-
-class MotorPinManager:
-    def __init__(self, printer, config_model: MotorControlConfigModel):
-        self.printer = printer
-        self.config_model = config_model
-        self.reactor = printer.get_reactor()
-        self.mcu = printer.lookup_object("mcu")
-        self.ppins = printer.lookup_object("pins")
-        self.outputs = {}
-        self._init_outputs()
-
-    def _init_outputs(self):
-        for option in OUTPUT_PIN_OPTIONS:
-            pin_cfg = self.config_model.pins.get(option)
-            if pin_cfg is None:
-                raise RuntimeError(f"missing required output pin config for {option}")
-            self.ppins.allow_multi_use_pin(_shareable_pin_desc(pin_cfg.pin_desc))
-            pin = self.ppins.setup_pin("digital_out", pin_cfg.pin_desc)
-            initial = int(pin_cfg.startup_value or 0)
-            pin.setup_max_duration(0.0)
-            pin.setup_start_value(initial, initial)
-            self.outputs[option] = pin
-
-    def _schedule_sequence(
-            self, sequence: Iterable[tuple[str, int]]):
-        start = (
-            self.mcu.estimated_print_time(self.reactor.monotonic())
-            + 0.05)
-        for idx, (attr, value) in enumerate(sequence):
-            pin = self.outputs[attr]
-            when = start + idx * 0.003
-            pin.set_digital(when, value)
-        # set_digital queues future writes. Do not broadcast the address-latch
-        # request (or leave cleanup) before the final write's scheduled time.
-        deadline = when + 0.010
-        while True:
-            now = self.reactor.monotonic()
-            remaining = deadline - self.mcu.estimated_print_time(now)
-            if remaining <= 0.0:
-                break
-            self.reactor.pause(now + remaining)
-
-    def set_motor_pin_dir(self):
-        return self._schedule_sequence(PIN_DIR_SEQUENCE)
-
-    def set_motor_pin_normal(self):
-        return self._schedule_sequence(PIN_NORMAL_SEQUENCE)
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_firmware_client
@@ -2073,6 +1901,99 @@ class MotorAxisController:
         }
 
 # ──────────────────────────────────────────────────────────────────────────
+# motor_control_config_model
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Configuration model for the `[motor_control]` section.
+
+Combines the K2 pin layout with cutter calibration and firmware parameter
+overrides used by startup, fault handling, and command execution.
+"""
+
+
+
+
+
+K2_PIN_LAYOUT = {
+    "motor_x_dir": ("PB9", 0),
+    "motor_x_step": ("PB10", 0),
+    "motor_x_stall": ("PB11", None),
+    "motor_y_dir": ("!PB7", 0),
+    "motor_y_step": ("PB8", 0),
+    "motor_y_stall": ("PB12", None),
+    "motor_z_dir": ("PB5", 0),
+    "motor_z_step": ("PB6", 1),
+    "motor_z_stall": ("PB13", None),
+    "motor_z1_dir": ("PA1", 1),
+    "motor_z1_step": ("PB15", 1),
+    "motor_z1_stall": ("PA10", None),
+    "motor_e_stall": ("nozzle_mcu:PB12", None),
+}
+
+PIN_OPTIONS = tuple(K2_PIN_LAYOUT)
+
+OUTPUT_PIN_OPTIONS = (
+    "motor_x_dir",
+    "motor_x_step",
+    "motor_y_dir",
+    "motor_y_step",
+    "motor_z_dir",
+    "motor_z_step",
+    "motor_z1_dir",
+    "motor_z1_step",
+)
+
+
+@dataclass(frozen=True)
+class MotorPinConfig:
+    raw: str
+    pin_desc: str
+    startup_value: int | None
+
+
+@dataclass(frozen=True)
+class MotorControlConfigModel:
+    raw_options: dict[str, str | None]
+    cut_pos_offset: float
+    pins: dict[str, MotorPinConfig]
+    mcu_temperature_sensors: tuple[str, ...] = ALL_AXES
+
+    @classmethod
+    def from_config(cls, config, param_options=()):
+        accepted = {
+            "cut_pos_offset",
+            *(option.lower() for option in PIN_OPTIONS),
+            *(str(option).lower() for option in param_options),
+        }
+        raw = {
+            option: config.get(option)
+            for option in config.fileconfig.options(config.section)
+            if option.lower() in accepted
+        }
+        pins = {
+            option: MotorPinConfig(
+                raw=pin_desc,
+                pin_desc=pin_desc,
+                startup_value=startup_value,
+            )
+            for option, (pin_desc, startup_value) in K2_PIN_LAYOUT.items()
+        }
+        sensor_option = config.get(
+            "mcu_temperature_sensors", ", ".join(ALL_AXES)).strip().lower()
+        sensor_axes = () if sensor_option in ("", "none") else tuple(
+            axis.strip() for axis in sensor_option.split(","))
+        if any(axis not in ALL_AXES for axis in sensor_axes):
+            raise config.error(
+                "mcu_temperature_sensors must be a comma-separated list of "
+                "x, y, z, z1, e, or none")
+        return cls(
+            raw_options=raw,
+            cut_pos_offset=config.getfloat("cut_pos_offset", 0.4),
+            pins=pins,
+            mcu_temperature_sensors=tuple(dict.fromkeys(sensor_axes)),
+        )
+
+# ──────────────────────────────────────────────────────────────────────────
 # motor_control_debug_surface
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2483,33 +2404,38 @@ class Mot2AxisTempSensor:
 
 
 class Mot2TempSensorHub:
-    def __init__(self, replacement):
+    def __init__(self, replacement, axes=ALL_AXES):
         self.replacement = replacement
         self.reactor = replacement.reactor
+        self.axes = tuple(axes)
         self.sensors = {}
-        for axis in ALL_AXES:
+        for axis in self.axes:
             sensor = Mot2AxisTempSensor()
             name = "temperature_sensor motor_%s_MCU" % (axis.upper(),)
             replacement.printer.add_object(name, sensor)
             self.sensors[axis] = sensor
-        self._timer = self.reactor.register_timer(self._poll)
+        self._timer = (
+            self.reactor.register_timer(self._poll) if self.axes else None)
         self._started = False
         self._axis_index = 0
 
     def start(self):
+        if not self.axes:
+            return
         self._started = True
         self.reactor.update_timer(self._timer, self.reactor.monotonic())
 
     def stop(self):
         self._started = False
-        self.reactor.update_timer(self._timer, self.reactor.NEVER)
+        if self._timer is not None:
+            self.reactor.update_timer(self._timer, self.reactor.NEVER)
 
     def _poll(self, _eventtime):
         if not self._started:
             return self.reactor.NEVER
         if self.replacement.is_ready and self.replacement.motor_params_init:
-            axis = ALL_AXES[self._axis_index]
-            self._axis_index = (self._axis_index + 1) % len(ALL_AXES)
+            axis = self.axes[self._axis_index]
+            self._axis_index = (self._axis_index + 1) % len(self.axes)
             try:
                 target = self.replacement.axes.target(axis)
                 self.sensors[axis].note(target.client.get_value(
@@ -2518,6 +2444,96 @@ class Mot2TempSensorHub:
             except Exception:
                 pass
         return self.reactor.monotonic() + POLL_INTERVAL
+
+# ──────────────────────────────────────────────────────────────────────────
+# motor_pin_manager
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Mainboard motor pin-state manager.
+
+Drives STEP/DIR address straps for the stock Creality MCU during discovery.
+"""
+
+
+
+
+
+PIN_DIR_SEQUENCE = (
+    ("motor_x_dir", 0),
+    ("motor_x_step", 0),
+    ("motor_y_dir", 0),
+    ("motor_y_step", 0),
+    ("motor_z_dir", 0),
+    ("motor_z_step", 1),
+    ("motor_z1_dir", 1),
+    ("motor_z1_step", 1),
+)
+
+PIN_NORMAL_SEQUENCE = (
+    ("motor_x_dir", 0),
+    ("motor_x_step", 0),
+    ("motor_y_dir", 1),
+    ("motor_y_step", 0),
+    ("motor_z_dir", 0),
+    ("motor_z_step", 0),
+    ("motor_z1_dir", 0),
+    ("motor_z1_step", 0),
+)
+
+
+def _shareable_pin_desc(pin_desc: str) -> str:
+    desc = pin_desc.strip()
+    while desc and desc[0] in "!^~":
+        desc = desc[1:].strip()
+    return desc
+
+
+class MotorPinManager:
+    def __init__(self, printer, config_model: MotorControlConfigModel):
+        self.printer = printer
+        self.config_model = config_model
+        self.reactor = printer.get_reactor()
+        self.mcu = printer.lookup_object("mcu")
+        self.ppins = printer.lookup_object("pins")
+        self.outputs = {}
+        self._init_outputs()
+
+    def _init_outputs(self):
+        for option in OUTPUT_PIN_OPTIONS:
+            pin_cfg = self.config_model.pins.get(option)
+            if pin_cfg is None:
+                raise RuntimeError(f"missing required output pin config for {option}")
+            self.ppins.allow_multi_use_pin(_shareable_pin_desc(pin_cfg.pin_desc))
+            pin = self.ppins.setup_pin("digital_out", pin_cfg.pin_desc)
+            initial = int(pin_cfg.startup_value or 0)
+            pin.setup_max_duration(0.0)
+            pin.setup_start_value(initial, initial)
+            self.outputs[option] = pin
+
+    def _schedule_sequence(
+            self, sequence: Iterable[tuple[str, int]]):
+        start = (
+            self.mcu.estimated_print_time(self.reactor.monotonic())
+            + 0.05)
+        for idx, (attr, value) in enumerate(sequence):
+            pin = self.outputs[attr]
+            when = start + idx * 0.003
+            pin.set_digital(when, value)
+        # set_digital queues future writes. Do not broadcast the address-latch
+        # request (or leave cleanup) before the final write's scheduled time.
+        deadline = when + 0.010
+        while True:
+            now = self.reactor.monotonic()
+            remaining = deadline - self.mcu.estimated_print_time(now)
+            if remaining <= 0.0:
+                break
+            self.reactor.pause(now + remaining)
+
+    def set_motor_pin_dir(self):
+        return self._schedule_sequence(PIN_DIR_SEQUENCE)
+
+    def set_motor_pin_normal(self):
+        return self._schedule_sequence(PIN_NORMAL_SEQUENCE)
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_control
@@ -2653,7 +2669,8 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         self._startup_auto_retry_count = 0
         self._startup_allow_auto_retry = True
         self._startup_timer = self.reactor.register_timer(self._startup_handler)
-        self.temp_sensors = Mot2TempSensorHub(self)
+        self.temp_sensors = Mot2TempSensorHub(
+            self, self.config_model.mcu_temperature_sensors)
 
         for axis, pin_cfg in self.stall_monitor.pin_map.items():
             if pin_cfg is not None:
