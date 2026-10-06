@@ -144,19 +144,23 @@ class _VirtualSDGCodeObserver:
 
 
 def _parse_retry_moves(text, error):
-    """Parse comma-separated G0 XY words such as "Y350, X300 Y50"."""
+    """Parse comma-separated XY moves such as "Y350, X300 Y50"."""
     moves = []
     for item in str(text).split(","):
-        words = item.upper().split()
+        move = {}
         try:
-            if not words or any(
-                    word[0] not in "XY" or not math.isfinite(float(word[1:]))
-                    for word in words):
+            words = item.upper().split()
+            if not words:
                 raise ValueError(item)
+            for word in words:
+                axis, value = word[0].lower(), float(word[1:])
+                if axis not in "xy" or axis in move or not math.isfinite(value):
+                    raise ValueError(item)
+                move[axis] = value
         except ValueError:
             raise error(
                 "Invalid filament_retry_moves entry %r" % (item.strip(),))
-        moves.append(" ".join(words))
+        moves.append(move)
     return tuple(moves)
 
 
@@ -1964,6 +1968,29 @@ class Box:
         finally:
             setter(max(0.0, min(float(restore), 1.0)))
 
+    def _z_homed(self):
+        toolhead = self.printer.lookup_object("toolhead")
+        return "z" in toolhead.get_status(
+            self.reactor.monotonic()).get("homed_axes", "")
+
+    def _service_move(self, x=None, y=None, velocity=None):
+        """Move XY for service travel; callers must have G90 active.
+
+        With Z homed, G0 keeps bed mesh compensation so travel holds the
+        hop above the bed and print. With Z unhomed the mesh has no Z
+        reference and would fail the move (G28 Z cleans before homing Z),
+        so move in toolhead space. extended_zone_transform routes both.
+        """
+        if not self._z_homed():
+            self.printer.lookup_object("extended_zone_transform").manual_move(
+                [x, y], velocity / 60.0)
+            return
+        # Fixed-point: %g's exponent form ("Y1e-05") parses as Y1 E-5.
+        words = "".join(
+            " %s%s" % (axis, ("%.3f" % value).rstrip("0").rstrip("."))
+            for axis, value in (("X", x), ("Y", y)) if value is not None)
+        self.gcode.run_script_from_command("G0%s F%.0f" % (words, velocity))
+
     def nozzle_clean(self):
         toolhead = self.printer.lookup_object("toolhead")
         save_motion_limits(
@@ -1985,18 +2012,13 @@ class Box:
             center_x = (left + right) / 2.0
             amplitude_x = (right - left) / 2.0
             segments = y_steps * 8
-            self.gcode.run_script_from_command(
-                "G0 Y%g F%.0f" % (back, self.travel_velocity))
-            self.gcode.run_script_from_command(
-                "G0 X%g F%.0f" % (left, self.clean_velocity))
+            self._service_move(y=back, velocity=self.travel_velocity)
+            self._service_move(x=left, velocity=self.clean_velocity)
             for _index in range(CLEAN_SCRAPER_PASSES):
-                self.gcode.run_script_from_command(
-                    "G0 X%g F%.0f" % (
-                        self.wastebin_x, self.clean_velocity))
-                self.gcode.run_script_from_command(
-                    "G0 X%g F%.0f" % (left, self.clean_velocity))
-            self.gcode.run_script_from_command(
-                "G0 X%g F%.0f" % (right, self.clean_velocity))
+                self._service_move(
+                    x=self.wastebin_x, velocity=self.clean_velocity)
+                self._service_move(x=left, velocity=self.clean_velocity)
+            self._service_move(x=right, velocity=self.clean_velocity)
             for pass_index in range(self.clean_pad_passes):
                 direction = -1.0 if (pass_index * y_steps) % 2 else 1.0
                 for index in range(1, segments + 1):
@@ -2004,17 +2026,14 @@ class Box:
                     x = center_x + direction * amplitude_x * math.cos(
                         math.pi * y_steps * progress)
                     y = back + (front - back) * progress
-                    self.gcode.run_script_from_command(
-                        "G0 X%.3f Y%.3f F%.0f" % (
-                            x, y, self.clean_velocity))
-                self.gcode.run_script_from_command(
-                    "G0 X%g F%.0f" % (center_x, self.clean_velocity))
-                self.gcode.run_script_from_command(
-                    "G0 Y%g F%.0f" % (back, self.clean_velocity))
-            self.gcode.run_script_from_command(
-                "G0 X%g F%.0f" % (self.wastebin_x, self.clean_velocity))
-            self.gcode.run_script_from_command(
-                "G0 Y%g F%.0f" % (self.wastebin_y, self.travel_velocity))
+                    self._service_move(
+                        x=x, y=y, velocity=self.clean_velocity)
+                self._service_move(x=center_x, velocity=self.clean_velocity)
+                self._service_move(y=back, velocity=self.clean_velocity)
+            self._service_move(
+                x=self.wastebin_x, velocity=self.clean_velocity)
+            self._service_move(
+                y=self.wastebin_y, velocity=self.travel_velocity)
             toolhead.wait_moves()
         finally:
             restore_motion_limits(
@@ -2046,10 +2065,12 @@ class Box:
         # Cleaning may run inside HOME_IF_NEEDED during Z homing.
         if "x" not in homed or "y" not in homed:
             self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
-        # Compare in G-code coordinates, matching the absolute moves below.
-        gcode_move = self.printer.lookup_object("gcode_move")
-        position = gcode_move.get_status(
-            self.reactor.monotonic())["gcode_position"]
+        # Compare in the coordinate space _service_move will use.
+        if self._z_homed():
+            position = self.printer.lookup_object("gcode_move").get_status(
+                self.reactor.monotonic())["gcode_position"]
+        else:
+            position = toolhead.get_position()
         if (abs(position[0] - self.wastebin_x) < 1.0e-6
                 and abs(position[1] - self.wastebin_y) < 1.0e-6):
             return
@@ -2062,13 +2083,12 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            self.gcode.run_script_from_command(
-                "G0 X%g Y%g F%.0f" % (
-                    self.wastebin_x + 10.0, self.wastebin_y,
-                    self.travel_velocity))
-            self.gcode.run_script_from_command(
-                "G0 X%g Y%g F%.0f" % (
-                    self.wastebin_x, self.wastebin_y, self.travel_velocity))
+            self._service_move(
+                x=self.wastebin_x + 10.0, y=self.wastebin_y,
+                velocity=self.travel_velocity)
+            self._service_move(
+                x=self.wastebin_x, y=self.wastebin_y,
+                velocity=self.travel_velocity)
         finally:
             restore_motion_limits(
                 self.gcode, "_box_wastebin_limits", include_gcode=True, move=0)
@@ -2090,10 +2110,9 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            wastebin = "X%g Y%g" % (self.wastebin_x, self.wastebin_y)
+            wastebin = {"x": self.wastebin_x, "y": self.wastebin_y}
             for move in (wastebin,) + self.filament_retry_moves + (wastebin,):
-                self.gcode.run_script_from_command(
-                    "G0 %s F%.0f" % (move, self.travel_velocity))
+                self._service_move(velocity=self.travel_velocity, **move)
             toolhead.wait_moves()
         finally:
             restore_motion_limits(
@@ -2129,9 +2148,8 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CUT_LIMIT_VELOCITY, CUT_LIMIT_ACCEL,
                    CUT_LIMIT_CRUISE, CUT_LIMIT_SCV))
-            self.gcode.run_script_from_command(
-                "G0 X%.2f Y%.2f F%.0f" % (
-                    self.pre_cut_x, self.cut_y, self.travel_velocity))
+            self._service_move(
+                x=self.pre_cut_x, y=self.cut_y, velocity=self.travel_velocity)
             toolhead.wait_moves()
             if not self.get_cut_sensor_state():
                 raise BoxError("Cut sensor is not in standby")
@@ -2141,11 +2159,10 @@ class Box:
             for attempt in range(3):
                 if attempt:
                     self._info(self.gcode, "Cut retry %d/3" % (attempt + 1))
-                self.gcode.run_script_from_command(
-                    "G0 X%.2f F%.0f" % (self.cut_x, self.cut_velocity))
+                self._service_move(x=self.cut_x, velocity=self.cut_velocity)
                 toolhead.wait_moves()
-                self.gcode.run_script_from_command(
-                    "G0 X%.2f F%.0f" % (self.pre_cut_x, self.travel_velocity))
+                self._service_move(
+                    x=self.pre_cut_x, velocity=self.travel_velocity)
                 toolhead.wait_moves()
                 if self._wait_cut_return(1.0):
                     returned = True
