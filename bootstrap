@@ -497,14 +497,6 @@ def validate_helix_release(release_dir: Path) -> None:
             raise SystemExit(f"HelixScreen archive is missing {path.relative_to(release_dir)}")
 
 
-def refresh_helix_units() -> None:
-    script = HELIX_DIR / "config" / "refresh-service-units.sh"
-    if script.is_file():
-        run([str(script)])
-    else:
-        log_warn(f"missing {script}; systemd units were not refreshed")
-
-
 def install_helixscreen() -> None:
     tag, asset_url = latest_release_asset(HELIX_REPO, HELIX_ASSET)
     log(f"{HELIX_REPO} latest release is {tag}")
@@ -534,8 +526,6 @@ def install_helixscreen() -> None:
             if old_dir.exists():
                 os.replace(old_dir, HELIX_DIR)
             raise
-
-    refresh_helix_units()
 
 
 def service_control(action: str, services: list[str]) -> None:

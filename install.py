@@ -5,6 +5,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import struct
@@ -30,16 +31,16 @@ TELEMETRY_ID_PATHS = (
     "/sys/class/net/wlan0/address",
 )
 
-ROOTFS_SHA256 = "e81d144d4e282782a274016fcac1d04e2876b1e2b12642d56add15d3410f0aa3"
+ROOTFS_SHA256 = "6e9624d3786c072655e3b3c3e1cd3be25e8653eccc8eee3f1d19e7683d27a60a"
 KERNEL_SHA256 = "a978c0b4894e8689b481efff7b1778a844823191e8d898b5bef454ec385fc193"
-SWAP_SHA256 = "ab87d85d2141d6c9cd16481bce844f16d4001e36d4fd08fab76be23d880f213a"
-HELIX_VERSION = "v1.0.2"
+SWAP_SHA256 = "dceaafaa3a1f7e8243d94a759b14bda52eade79c9a8f486fb85982eaac391e8e"
+HELIX_VERSION = "v1.0.3"
 HELIX_ARCHIVE = f"helixscreen-k2-{HELIX_VERSION}.tar.gz"
 HELIX_URL = (
     "https://github.com/prestonbrown/helixscreen/releases/download/"
     f"{HELIX_VERSION}/{HELIX_ARCHIVE}"
 )
-HELIX_SHA256 = "30bf36374be7cec112101fff91e68bd5580a03d21e6e3e6fafacb973e9257ab4"
+HELIX_SHA256 = "38d3e297440dce5bcc52c3e2249424c0725e0d4e462c8b8ac5888dad1d3dc4f4"
 
 
 def object_url(digest):
@@ -66,6 +67,23 @@ CUSTOM_KERNEL_MARKER = "-k2jt"
 SLOTS_DIR = os.path.join(UDISK, ".slots")
 CUSTOM_SLOT_DIR = os.path.join(SLOTS_DIR, "custom")
 CUSTOM_HELIX_DIR = os.path.join(CUSTOM_SLOT_DIR, "helixscreen")
+CUSTOM_OVERLAY_DIR = os.path.join(UDISK, ".k2-custom-root-overlay")
+# Paths bootstrap refuses to overwrite without --replace, relative to UDISK.
+BOOTSTRAP_MANAGED_PATHS = (
+    "klipper",
+    "moonraker",
+    "klippy-env",
+    "moonraker-env",
+    "fluidd",
+    "mainsail",
+    os.path.join("printer_data", "config"),
+)
+STOCK_WIFI_CONF = "/etc/wifi/wpa_supplicant/wpa_supplicant.conf"
+CUSTOM_WIFI_CONF = os.path.join(CUSTOM_OVERLAY_DIR, "upper", "etc", "wpa_supplicant.conf")
+CUSTOM_WIFI_HEADER = "ctrl_interface=/run/wpa_supplicant\nupdate_config=1\nap_scan=1\n"
+# Network settings carried over from Creality firmware, in output order.
+WIFI_NETWORK_KEYS = ("ssid", "scan_ssid", "key_mgmt", "psk", "sae_password", "ieee80211w", "priority")
+WIFI_KEY_MGMT = {"WPA-PSK", "WPA-PSK-SHA256", "SAE", "NONE"}
 NETWORK_ATTEMPTS = 3
 NETWORK_DELAY_SECONDS = 3
 INSTALL_SPACE_MARGIN = 64 * 1024 * 1024
@@ -100,6 +118,8 @@ EXPECTED_CMDLINE_PARTITIONS = (
 )
 
 _current_step = "preflight"
+# Output inside a step is indented under its title.
+_indent = "  "
 _telemetry_context = {}
 _telemetry_failure_done = False
 
@@ -112,20 +132,26 @@ def _fmt(seconds):
 
 
 def header(message):
-    print(f"\033[1m{message}\033[0m")
-    print(f"\033[36m{'=' * len(message)}\033[0m", flush=True)
+    bar = "─" * (len(message) + 4)
+    print(f"  \033[36m╭{bar}╮\033[0m")
+    print(f"  \033[36m│\033[0m  \033[1m{message}\033[0m  \033[36m│\033[0m")
+    print(f"  \033[36m╰{bar}╯\033[0m", flush=True)
 
 
 def section(message):
-    print(f"\n\033[1;36m==> {message}\033[0m", flush=True)
+    print(f"\n  \033[1;36m▸\033[0m \033[1m{message}\033[0m", flush=True)
 
 
 def log(message):
-    print(f"  {message}", flush=True)
+    print(f"{_indent}{message}", flush=True)
 
 
 def log_warn(message):
-    print(f"  \033[33m{message}\033[0m", flush=True)
+    print(f"{_indent}\033[33m{message}\033[0m", flush=True)
+
+
+def log_status(label, value):
+    log(f"\033[2m{label:<12}\033[0m{value}")
 
 
 def _telemetry_id_value(path):
@@ -192,19 +218,23 @@ def send_failure_telemetry(**fields):
 
 
 @contextmanager
-def step(title):
-    global _current_step
+def step(title, done):
+    """Run a step under a "▸ title" line, then print "✓ done" if it finished."""
+    global _current_step, _indent
     previous_step = _current_step
     _current_step = title
     section(title)
+    _indent = "    "
     try:
         yield
+        print(f"  \033[32m✓\033[0m {done}", flush=True)
     finally:
         _current_step = previous_step
+        _indent = "  "
 
 
 def success(message):
-    print(f"\n\033[1;32m{message}\033[0m", flush=True)
+    print(f"\n  \033[1;32m✓ {message}\033[0m", flush=True)
 
 
 def die(msg):
@@ -213,7 +243,7 @@ def die(msg):
         _telemetry_failure_done = True
     else:
         send_failure_telemetry(error_kind="controlled", message=str(msg))
-    print(f"\n\033[1;31mERROR:\033[0m {msg}")
+    print(f"\n  \033[1;31mERROR:\033[0m {msg}")
     sys.exit(1)
 
 
@@ -369,13 +399,14 @@ def remote_size(url, label):
         die(f"failed to check {label} size: {exc}")
 
 
-def check_staging_space():
+def check_staging_space(seed_helix):
     sizes = [
         remote_size(ROOTFS_URL, "root file system"),
         remote_size(KERNEL_URL, "kernel"),
         remote_size(SWAP_URL, "swap utility"),
-        remote_size(HELIX_URL, "HelixScreen"),
     ]
+    if seed_helix:
+        sizes.append(remote_size(HELIX_URL, "HelixScreen"))
     required = sum(sizes) + INSTALL_SPACE_MARGIN
     free = shutil.disk_usage(UDISK).free
     if free < required:
@@ -410,7 +441,7 @@ def download_sha256(url, dest, label, expected_sha256):
                     elapsed = max(time.monotonic() - start, 1e-6)
                     rate = downloaded / elapsed
                     line = (
-                        f"\r\033[K  {pct:3d}%  {done:.1f}/{total_mb:.1f} MB  "
+                        f"\r\033[K{_indent}{pct:3d}%  {done:.1f}/{total_mb:.1f} MB  "
                         f"{rate / 1024 / 1024:.1f} MB/s"
                     )
                     if show_eta:
@@ -424,7 +455,7 @@ def download_sha256(url, dest, label, expected_sha256):
                 done = downloaded / 1024 / 1024
                 total_mb = total / 1024 / 1024
                 line = (
-                    f"\r\033[K  100%  {done:.1f}/{total_mb:.1f} MB  "
+                    f"\r\033[K{_indent}100%  {done:.1f}/{total_mb:.1f} MB  "
                     f"{rate / 1024 / 1024:.1f} MB/s"
                 )
                 if show_eta:
@@ -529,6 +560,110 @@ def validate_android_boot_image(path):
         die(f"{path} has no appended mainline DTB in the kernel payload")
 
 
+def _strip_wifi_comment(line):
+    # wpa_supplicant drops "#" comments that are not inside double quotes.
+    quoted = False
+    for i, char in enumerate(line):
+        if char == '"':
+            quoted = not quoted
+        elif char == "#" and not quoted:
+            return line[:i]
+    return line
+
+
+def parse_wifi_networks(text):
+    networks = []
+    block = None
+    for raw in text.splitlines():
+        line = _strip_wifi_comment(raw).strip()
+        if not line:
+            continue
+        if block is None:
+            if line.replace(" ", "") == "network={":
+                block = {}
+            continue
+        if line == "}":
+            networks.append(block)
+            block = None
+            continue
+        key, sep, value = line.partition("=")
+        if sep:
+            block[key.strip()] = value.strip()
+    return networks
+
+
+def custom_wifi_network(network):
+    """Return the settings Jacobean's firmware can use, or None to skip the network."""
+    if "ssid" not in network or network.get("disabled") == "1":
+        return None
+    if any(key.startswith("wep_key") for key in network):
+        return None
+    key_mgmt = [m for m in network.get("key_mgmt", "WPA-PSK").split() if m in WIFI_KEY_MGMT]
+    if not key_mgmt:
+        return None
+    if "NONE" not in key_mgmt and "psk" not in network and "sae_password" not in network:
+        return None
+    network = {**network, "key_mgmt": " ".join(key_mgmt)}
+    return {key: network[key] for key in WIFI_NETWORK_KEYS if key in network}
+
+
+def render_wifi_conf(networks):
+    lines = [CUSTOM_WIFI_HEADER]
+    for network in networks:
+        lines.append("\nnetwork={\n")
+        lines.extend(f"\t{key}={value}\n" for key, value in network.items())
+        lines.append("}\n")
+    return "".join(lines)
+
+
+def custom_wifi_configured():
+    if not os.path.isfile(CUSTOM_WIFI_CONF):
+        return False
+    with open(CUSTOM_WIFI_CONF, encoding="utf-8", errors="replace") as f:
+        return bool(parse_wifi_networks(f.read()))
+
+
+def copy_stock_wifi():
+    if custom_wifi_configured():
+        log("keeping the Wi-Fi settings from your earlier install")
+        return
+    stock_networks = []
+    if os.path.isfile(STOCK_WIFI_CONF):
+        with open(STOCK_WIFI_CONF, encoding="utf-8", errors="replace") as f:
+            stock_networks = parse_wifi_networks(f.read())
+    if not stock_networks:
+        log("no Wi-Fi saved in Creality firmware, nothing to copy")
+        log("you can set up Wi-Fi from the printer screen whenever you want")
+        return
+    networks = [converted for converted in map(custom_wifi_network, stock_networks) if converted]
+    if not networks:
+        log("the Wi-Fi saved in Creality firmware uses a type this firmware cannot use")
+        log("set up Wi-Fi from the printer screen after the restart")
+        return
+
+    os.makedirs(os.path.dirname(CUSTOM_WIFI_CONF), mode=0o755, exist_ok=True)
+    tmp = CUSTOM_WIFI_CONF + ".install"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Created 0600 up front: it holds Wi-Fi passwords.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(render_wifi_conf(networks))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CUSTOM_WIFI_CONF)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    subprocess.run(["sync"], check=True)
+    for network in networks:
+        log(f"copied Wi-Fi network {network['ssid']}")
+
+
 def install_swap(script_path):
     shutil.copy2(script_path, SWAP_INSTALL_PATH)
     os.chmod(SWAP_INSTALL_PATH, 0o755)
@@ -608,6 +743,28 @@ def _preserve_existing_helix_state(existing_dir, new_dir):
             _copy_path(src, dest)
 
 
+def _helix_version_key(version):
+    """(1, 0, 3) for "v1.0.3"; a pre-release like "v1.1.0-beta.4" counts as 1.1.0."""
+    match = re.match(r"v?(\d+)\.(\d+)\.(\d+)", version or "")
+    return tuple(map(int, match.groups())) if match else None
+
+
+def installed_helix_version():
+    """The custom slot's HelixScreen version, or None if it cannot be read."""
+    try:
+        with open(os.path.join(CUSTOM_HELIX_DIR, "release_info.json"), encoding="utf-8") as f:
+            version = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return version if isinstance(version, str) else None
+
+
+def helix_is_current(installed):
+    """True when the installed HelixScreen is the pinned version or newer."""
+    key = _helix_version_key(installed)
+    return key is not None and key >= _helix_version_key(HELIX_VERSION)
+
+
 def seed_custom_helix_archive(archive_path):
     extract_dir = os.path.join(STAGING_DIR, "helixscreen-extract")
     new_dir = os.path.join(CUSTOM_SLOT_DIR, ".helixscreen.new")
@@ -641,7 +798,48 @@ def seed_custom_helix_archive(archive_path):
 
     shutil.rmtree(old_dir, ignore_errors=True)
     subprocess.run(["sync"], check=True)
-    log(f"seeded HelixScreen {HELIX_VERSION} into custom UDISK slot")
+
+
+def previous_install_found():
+    return os.path.lexists(CUSTOM_SLOT_DIR) or os.path.lexists(CUSTOM_OVERLAY_DIR)
+
+
+def previous_bootstrap_paths():
+    return [
+        name for name in BOOTSTRAP_MANAGED_PATHS
+        if os.path.lexists(os.path.join(CUSTOM_SLOT_DIR, name))
+    ]
+
+
+def _remove_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def stale_helix_units():
+    """HelixScreen unit files an earlier bootstrap copied over the image's ones."""
+    unit_dir = os.path.join(CUSTOM_OVERLAY_DIR, "upper", "etc", "systemd", "system")
+    names = (
+        "helixscreen.service",
+        "helixscreen.service.d",
+        "helixscreen-update.service",
+        "helixscreen-update.path",
+    )
+    return [path for path in (os.path.join(unit_dir, name) for name in names) if os.path.lexists(path)]
+
+
+def wipe_previous_install():
+    for path in (CUSTOM_SLOT_DIR, CUSTOM_OVERLAY_DIR):
+        if not os.path.lexists(path):
+            continue
+        log(f"removing {path}")
+        try:
+            _remove_path(path)
+        except OSError as exc:
+            die(f"could not remove {path}: {exc}. Rerun the installer to try again.")
+    subprocess.run(["sync"], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -816,43 +1014,69 @@ def write_custom_env_blob(target_slot, custom_blob):
 
 
 def run_swap():
-    subprocess.run([SWAP_INSTALL_PATH, "--no-reboot", "--yes"], check=True)
+    if subprocess.run([SWAP_INSTALL_PATH, "--no-reboot", "--yes", "--nested"]).returncode != 0:
+        die("swap failed; see the error above")
 
 
-def confirm_install(active_slot, target_slot, target_rootfs, target_boot):
+def _ask(prompt):
+    """Return the lowercased answer, or None when input is closed."""
+    try:
+        return input(f"\n  \033[36m›\033[0m {prompt}").strip().lower()
+    except EOFError:
+        return None
+
+
+def show_menu():
+    print()
+    log("Jacobean's firmware is already installed.")
+    print()
+    for number, label in (("1", "Reinstall, keep my setup"), ("2", "Fresh install"), ("3", "Cancel")):
+        log(f"  \033[1;36m{number}\033[0m  {label}")
+
+
+def choose_fresh_install():
+    """Return True when the user picks a fresh install over keeping their setup."""
+    while True:
+        answer = _ask("Choose 1-3: ")
+        if answer == "1":
+            return False
+        if answer == "2":
+            return True
+        if answer in {"3", None}:
+            die("install cancelled")
+        log_warn("Enter 1, 2 or 3.")
+
+
+def confirm_fresh_install():
+    print()
+    log("\033[1;31mThis deletes everything on Jacobean's firmware.\033[0m Nothing is backed up.")
+    if _ask("Type erase to continue: ") != "erase":
+        die("install cancelled")
+
+
+def confirm_install(active_slot, target_slot):
+    """Confirm the install and return True for a fresh install."""
     print()
     firmware_version = read_fw_env("version") or "unknown"
-    current_rootfs = f"rootfs{active_slot}"
-    current_boot = f"boot{active_slot}"
-    target_rootfs_name = f"rootfs{target_slot}"
-    target_boot_name = f"boot{target_slot}"
+    log_status("Creality", f"{firmware_version} on slot {active_slot}, stays installed")
+    log_status("Jacobean's", f"installs to slot {target_slot}")
 
-    log(
-        f"You are running Creality firmware {firmware_version} on "
-        f"{current_rootfs} and {current_boot}."
-    )
-    log(
-        f"This will download and install Jacobean's firmware on the inactive slot "
-        f"({target_rootfs_name} / {target_boot_name})."
-    )
-    if "--no-telemetry" not in sys.argv[1:]:
+    found = previous_install_found()
+    fresh_flag = "--fresh" in sys.argv[1:]
+    if found and not fresh_flag:
+        show_menu()
+    elif fresh_flag and not found:
         print()
-        log_warn(
-            "This installer uses pseudonymous install/error telemetry. "
-            "Rerun installer with --no-telemetry to disable."
-        )
-        log_warn(
-            "Telemetry is only used by this installer. "
-            "The installed firmware includes no telemetry."
-        )
+        log("No earlier install found; --fresh has nothing to erase.")
 
-    try:
-        answer = input("\nContinue? [y/N]: ").strip().lower()
-    except EOFError:
-        answer = ""
-
-    if answer not in {"y", "yes"}:
+    if found:
+        if fresh_flag or choose_fresh_install():
+            confirm_fresh_install()
+            return True
+        return False
+    if _ask("Install Jacobean's firmware? [y/N]: ") not in {"y", "yes"}:
         die("install cancelled")
+    return False
 
 
 def shutdown_device():
@@ -873,53 +1097,81 @@ def main():
     custom_blob = preflight_env(active_slot, target_slot)
     check_release_index()
 
-    confirm_install(active_slot, target_slot, target_rootfs, target_boot)
+    fresh = confirm_install(active_slot, target_slot)
+    # Read before the swap moves the custom slot back to the top of UDISK.
+    kept_setup = [] if fresh else previous_bootstrap_paths()
+    installed_helix = None if fresh else installed_helix_version()
+    seed_helix = not helix_is_current(installed_helix)
     send_telemetry("install_started")
 
     prepare_staging_dir()
-    check_staging_space()
+    check_staging_space(seed_helix)
     rootfs_path = os.path.join(STAGING_DIR, "rootfs.ext2")
     kernel_path = os.path.join(STAGING_DIR, "kernel.img")
     swap_path = os.path.join(STAGING_DIR, "swap")
     helix_path = os.path.join(STAGING_DIR, HELIX_ARCHIVE)
 
     try:
-        with step("Downloading root file system"):
+        with step("Downloading root file system", "Root file system downloaded"):
             download_sha256(ROOTFS_URL, rootfs_path, "root file system", ROOTFS_SHA256)
-        with step("Downloading kernel.img"):
+        with step("Downloading kernel.img", "Kernel downloaded"):
             download_sha256(KERNEL_URL, kernel_path, "kernel", KERNEL_SHA256)
-        with step("Downloading swap utility"):
+        with step("Downloading swap utility", "Swap utility downloaded"):
             download_sha256(SWAP_URL, swap_path, "swap utility", SWAP_SHA256)
-        with step("Downloading HelixScreen"):
-            download_sha256(HELIX_URL, helix_path, "HelixScreen", HELIX_SHA256)
+        if seed_helix:
+            with step("Downloading HelixScreen", "HelixScreen downloaded"):
+                download_sha256(HELIX_URL, helix_path, "HelixScreen", HELIX_SHA256)
+        else:
+            print(f"\n  \033[32m✓\033[0m HelixScreen {installed_helix} already installed, skipping", flush=True)
 
-        with step("Validating images"):
+        with step("Validating images", "Images validated"):
             validate_rootfs_image(rootfs_path)
             validate_android_boot_image(kernel_path)
 
-        with step("Preparing custom UDISK payloads"):
-            seed_custom_helix_archive(helix_path)
+        if fresh:
+            with step("Erasing earlier install", "Earlier install erased"):
+                wipe_previous_install()
 
-        with step("Flashing root file system"):
+        if seed_helix:
+            with step("Installing HelixScreen", f"HelixScreen {HELIX_VERSION} installed"):
+                seed_custom_helix_archive(helix_path)
+
+        stale_units = stale_helix_units()
+        if stale_units:
+            with step("Removing old HelixScreen units", "Old HelixScreen units removed"):
+                for path in stale_units:
+                    _remove_path(path)
+
+        with step("Flashing root file system", "Root file system flashed"):
             flash(rootfs_path, target_rootfs)
-        with step("Flashing kernel"):
+        with step("Flashing kernel", "Kernel flashed"):
             flash(kernel_path, target_boot)
 
-        with step("Installing swap utility"):
+        with step("Installing swap utility", "Swap utility installed"):
             install_swap(swap_path)
 
-        with step("Preparing custom env snapshot"):
+        with step("Copying Wi-Fi settings", "Wi-Fi settings checked"):
+            try:
+                copy_stock_wifi()
+            except Exception as exc:
+                log_warn(f"could not copy Wi-Fi settings ({exc}); set up Wi-Fi from the printer screen")
+
+        with step("Preparing custom env snapshot", "Custom env snapshot prepared"):
             write_custom_env_blob(target_slot, custom_blob)
 
-        with step("Swapping to Jacobean's firmware"):
+        with step("Swapping to Jacobean's firmware", "Swapped to Jacobean's firmware"):
             run_swap()
     finally:
         shutil.rmtree(STAGING_DIR, ignore_errors=True)
 
     success("Install complete")
     send_telemetry("install_success", step="complete")
-    log("Hard power cycle your printer and run 'bootstrap'")
-    time.sleep(2)
+    if kept_setup:
+        log("Hard power cycle your printer. Your earlier setup comes back after the restart.")
+        log("If it worked before this reinstall, there is nothing else to run.")
+        log("If 'bootstrap' never finished on it, run 'bootstrap --replace'.")
+    else:
+        log("Hard power cycle your printer and run 'bootstrap'")
     shutdown_device()
 
 

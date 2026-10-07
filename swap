@@ -24,6 +24,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import zlib
@@ -92,7 +93,6 @@ UDISK_WRITER_PROCESSES = [
     "helix-watchdog",
     "moonraker.py",
     "klippy.py",
-    "wpa_supplicant",
 ]
 
 CUSTOM_ROOTFS_SENTINEL = Path("/etc/.k2_custom")
@@ -116,30 +116,58 @@ EXT_MAGIC = b"\x53\xef"
 # Logging
 # ---------------------------------------------------------------------------
 
+# Under the installer (--nested), output sits inside the installer's own
+# step: no header or success line, steps become plain indented titles.
+NESTED = False
+_indent = "  "
+
+
 def header(message: str) -> None:
-    print(f"\n\033[1m{message}\033[0m", flush=True)
+    if NESTED:
+        return
+    bar = "─" * (len(message) + 4)
+    print(f"  \033[36m╭{bar}╮\033[0m")
+    print(f"  \033[36m│\033[0m  \033[1m{message}\033[0m  \033[36m│\033[0m")
+    print(f"  \033[36m╰{bar}╯\033[0m", flush=True)
 
 
 def section(message: str) -> None:
-    print(f"\n\033[1;36m==> {message}\033[0m", flush=True)
+    if NESTED:
+        print(f"    {message}", flush=True)
+    else:
+        print(f"\n  \033[1;36m▸\033[0m \033[1m{message}\033[0m", flush=True)
 
 
 def log(message: str) -> None:
-    print(f"  {message}", flush=True)
+    print(f"{_indent}{message}", flush=True)
 
 
 def log_warn(message: str) -> None:
-    print(f"  \033[33m{message}\033[0m", flush=True)
+    print(f"{_indent}\033[33m{message}\033[0m", flush=True)
+
+
+def log_status(label: str, value: str) -> None:
+    log(f"\033[2m{label:<14}\033[0m{value}")
 
 
 def success(message: str) -> None:
-    print(f"\n\033[1;32m{message}\033[0m", flush=True)
+    if not NESTED:
+        print(f"\n  \033[1;32m✓ {message}\033[0m", flush=True)
 
 
 @contextmanager
-def step(title: str):
+def step(title: str, done: str):
+    """Run a step under a "▸ title" line, then print "✓ done" if it finished."""
+    global _indent
+    outer = _indent
     section(title)
-    yield
+    _indent = outer + "  " if NESTED else "    "
+    try:
+        yield
+        if not NESTED:
+            print(f"  \033[32m✓\033[0m {done}", flush=True)
+    finally:
+        _indent = outer
 
 
 def read_fw_env(key: str) -> str | None:
@@ -214,7 +242,7 @@ def service_control(action: str, targets: list[dict[str, list[str] | str]]) -> N
                 break
 
         if handled:
-            log(f"{action}ed {target['name']}")
+            log(f"{'stopped' if action == 'stop' else action + 'ed'} {target['name']}")
 
 
 def kill_process(name: str, *signal_args: str) -> None:
@@ -420,18 +448,13 @@ def firmware_label(env_name: str) -> str:
 
 def confirm_swap(from_slot: str, from_partition_slot: str, to_slot: str, to_partition_slot: str) -> None:
     print()
-    log(
-        f"You are running {firmware_label(from_slot)} on "
-        f"rootfs{from_partition_slot} and boot{from_partition_slot}."
-    )
-    log(
-        f"This will switch the printer to {firmware_label(to_slot)} on "
-        f"the other slot (rootfs{to_partition_slot} / boot{to_partition_slot})."
-    )
-    log("If you proceed, the printer will prepare the swap and reboot automatically.")
+    log_status("Running", f"{firmware_label(from_slot)} on slot {from_partition_slot}")
+    log_status("Switching to", f"{firmware_label(to_slot)} on slot {to_partition_slot}")
+    print()
+    log("The printer reboots when the swap is done.")
 
     try:
-        answer = input("\nContinue? [y/N]: ").strip().lower()
+        answer = input("\n  \033[36m›\033[0m Switch now? [y/N]: ").strip().lower()
     except EOFError:
         answer = ""
 
@@ -884,6 +907,7 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 def cmd_swap(args: argparse.Namespace) -> None:
+    header("Jacobean's K2 Plus Firmware Swap")
     require_root()
     require_udisk()
 
@@ -908,18 +932,17 @@ def cmd_swap(args: argparse.Namespace) -> None:
 
     if not args.yes:
         confirm_swap(from_slot, from_partition_slot, to_slot, to_partition_slot)
-    header(f"Swap: {from_slot} -> {to_slot}")
 
-    with step("Stopping UDISK writers"):
+    with step("Stopping UDISK writers", "UDISK writers stopped"):
         quiet_udisk_writers()
 
-    with step(f"Archiving live environment to slot '{from_slot}'"):
+    with step(f"Archiving live environment to slot '{from_slot}'", f"Archived to slot '{from_slot}'"):
         archive_live_to_slot(from_slot)
 
-    with step(f"Restoring slot '{to_slot}' to live"):
+    with step(f"Restoring slot '{to_slot}' to live", f"Slot '{to_slot}' restored"):
         restore_slot_to_live(to_slot)
 
-    with step(f"Restoring U-Boot env snapshot for '{to_slot}'"):
+    with step(f"Restoring U-Boot env snapshot for '{to_slot}'", "U-Boot env restored"):
         restore_slot_env(to_slot)
 
     success("Swap complete")
@@ -943,6 +966,11 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--nested",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -952,6 +980,10 @@ def main() -> None:
     subparsers.add_parser("status", help="show running env and available slots")
     args = parser.parse_args()
 
+    global NESTED, _indent
+    if args.nested:
+        NESTED = True
+        _indent = "    "
     ignore_sighup()
 
     if args.command == "status":
@@ -961,4 +993,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        if not isinstance(exc.code, str):
+            raise
+        print(f"\n{'  ' if NESTED else ''}  \033[1;31mERROR:\033[0m {exc.code}", flush=True)
+        sys.exit(1)
