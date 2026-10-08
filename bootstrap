@@ -651,6 +651,71 @@ def split_save_config(text: str) -> tuple[str, str | None]:
     return text[:idx], text[idx:]
 
 
+SAVE_CONFIG_COMMENT_RE = re.compile("[#;].*$")
+SAVE_CONFIG_OPTION_RE = re.compile("[^A-Za-z0-9_].*$")
+
+
+SAVE_CONFIG_HEADER = (
+    "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+    "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n"
+    "#*#\n"
+)
+
+
+def save_config_options(blob: str) -> set[tuple[str, str]]:
+    # Mirror Kalico's _find_autosave_data: a malformed block is ignored by
+    # Kalico, so its options must not suppress any shipped defaults.
+    blob = blob.replace("\r\n", "\n")
+    pos = blob.find(SAVE_CONFIG_HEADER)
+    if pos < 0:
+        return set()
+    body = blob[pos + len(SAVE_CONFIG_HEADER):].strip()
+    for line in body.split("\n"):
+        if body and (not line.startswith("#*#") or (len(line) >= 4 and not line.startswith("#*# "))):
+            return set()
+    options = set()
+    section = None
+    for line in body.split("\n"):
+        if not line.startswith("#*#"):
+            continue
+        line = line[4:] if line.startswith("#*# ") else line[3:]
+        if not line.strip() or line[0].isspace() or line[0] in "#;":
+            continue  # blank, comment, or continuation of a multi-line value
+        line = line.strip()
+        if line.startswith("["):
+            section = line[1:].split("]", 1)[0].strip()
+        elif section is not None:
+            options.add((section, SAVE_CONFIG_OPTION_RE.sub("", line).lower()))
+    # Probe-mode switching regex-edits this line, so it must stay active.
+    return {opt for opt in options if opt[1] != "register_as_probe"}
+
+
+def comment_superseded_options(text: str, options: set[tuple[str, str]]) -> tuple[str, int]:
+    # Same rule as Kalico's SAVE_CONFIG: comment out regular config lines (and
+    # their continuation lines) for options that the SAVE_CONFIG block sets.
+    lines = text.split("\n")
+    section = None
+    in_dup = False
+    count = 0
+    for i, line in enumerate(lines):
+        pruned = SAVE_CONFIG_COMMENT_RE.sub("", line).rstrip()
+        if not pruned:
+            continue
+        if pruned[0].isspace():
+            if in_dup:
+                lines[i] = "#" + line
+            continue
+        in_dup = False
+        if pruned[0] == "[":
+            section = pruned[1:-1].strip()
+            continue
+        if (section, SAVE_CONFIG_OPTION_RE.sub("", pruned).lower()) in options:
+            in_dup = True
+            lines[i] = "#" + line
+            count += 1
+    return "\n".join(lines), count
+
+
 def install_moonraker_asvc() -> None:
     PRINTER_DATA.mkdir(parents=True, exist_ok=True)
     asvc = PRINTER_DATA / "moonraker.asvc"
@@ -955,6 +1020,22 @@ def update_k2_configs() -> None:
         body, _ = split_save_config(dest.read_text(encoding="utf-8"))
         dest.write_text(body.rstrip() + "\n" + blob.lstrip("\n"), encoding="utf-8")
         log("restored SAVE_CONFIG block")
+
+        # Kalico lets active config values override SAVE_CONFIG, so comment out
+        # shipped defaults the block supersedes (as a live SAVE_CONFIG would).
+        saved = save_config_options(blob)
+        for name in sorted(p.name for p in src.glob("*.cfg")):
+            if name == "overrides.cfg":
+                continue
+            cfg = CONFIG_DIR / name
+            if not cfg.is_file():
+                continue
+            text = cfg.read_text(encoding="utf-8")
+            body, tail = split_save_config(text)
+            body, count = comment_superseded_options(body, saved)
+            if count:
+                cfg.write_text(body + (tail or ""), encoding="utf-8")
+                log(f"commented out {count} default option(s) in {name} superseded by SAVE_CONFIG")
 
     if probe_mode:
         changed = set_probe_mode(probe_mode, restart=False, quiet=True)
