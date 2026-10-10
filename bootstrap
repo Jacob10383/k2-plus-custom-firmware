@@ -543,13 +543,6 @@ def service_control(action: str, services: list[str]) -> None:
             log_warn(f"failed to {action} {svc} (exit {result.returncode})")
 
 
-def get_local_ip() -> str:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-
-
 def moonraker_json(path: str, timeout: int = 2) -> dict:
     with urllib.request.urlopen(f"http://localhost:7125{path}", timeout=timeout) as resp:
         return json.load(resp)
@@ -576,7 +569,6 @@ def install_webcam() -> None:
     if not wait_for_moonraker():
         log_warn("Moonraker webcam API did not come up in 120s — skipping webcam registration")
         return
-    ip = get_local_ip()
     payload = json.dumps({
         "name": "Front",
         "enabled": True,
@@ -586,8 +578,8 @@ def install_webcam() -> None:
         "target_fps_idle": 30,
         "location": "printer",
         "service": "uv4l-mjpeg",
-        "stream_url": f"http://{ip}:8080/stream",
-        "snapshot_url": f"http://{ip}:8080/snapshot",
+        "stream_url": "/camera/stream",
+        "snapshot_url": "/camera/snapshot",
         "flip_horizontal": False,
         "flip_vertical": False,
         "rotation": 0,
@@ -601,7 +593,7 @@ def install_webcam() -> None:
     with urllib.request.urlopen(req, timeout=10) as resp:
         result = json.load(resp)
     uid = result["result"]["webcam"]["uid"]
-    log(f"registered webcam 'Front' ({ip}) uid={uid}")
+    log(f"registered webcam 'Front' (/camera/stream) uid={uid}")
 
 
 def backup_config_dir() -> Path | None:
