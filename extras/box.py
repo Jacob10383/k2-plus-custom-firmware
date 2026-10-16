@@ -488,7 +488,7 @@ class Box:
         self.rfid_snapshot = {}
         self.rfid_seen_invalid = set()
         self.rfid_live_slots = set()
-        self.box_replies = {}
+        self.box_replies = None  # until the first poll; then address -> reply
         self.last_rfid_refresh = 0.0
         self.last_topology_refresh = 0.0
         self.spoolman_generation = 0
@@ -711,6 +711,7 @@ class Box:
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
         self.serial = None
+        self.box_replies = {}
         self.reactor.update_timer(self.poll_timer, self.reactor.NEVER)
 
     def get_status(self, eventtime):
@@ -734,6 +735,7 @@ class Box:
             "loaded_mask": snap.loaded_mask,
             "slot_filament_mask": snap.slot_mask,
             "slots": slots,
+            "boxes": self._boxes_status(),
             "materials": self.store.materials,
             "runout": self._runout_status(physical, snap),
             "runout_swap_enabled": self.runout_swap_enabled,
@@ -750,6 +752,42 @@ class Box:
 
     def _slot_statuses(self, snap):
         return [self._slot_status(slot, snap) for slot in self.physical_slots]
+
+    def _boxes_status(self):
+        """Per-CFS readings from the last poll, keyed by RS-485 address."""
+        if self.box_replies is None:
+            return []
+        boxes = []
+        for address in sorted(self.drivers):
+            reply = self.box_replies.get(address)
+            status_code = reply.status if reply else None
+            state_code = reply.box_state if reply else None
+            boxes.append({
+                "address": address,
+                "online": reply is not None,
+                "slots": [self._global_slot(address, local)
+                          for local in range(SLOTS_PER_BOX)],
+                "temp_c": reply.temp_c if reply else None,
+                "humidity_pct": reply.humidity_pct if reply else None,
+                "status": box_protocol.status_name(status_code),
+                "status_code": status_code,
+                "state": box_protocol.state_name(state_code),
+                "state_code": state_code,
+                "fault": self._fault_status(address),
+            })
+        return boxes
+
+    def _fault_status(self, address):
+        episode = self.fault_episodes.get(address)
+        if episode is None:
+            return None
+        status_code, category = episode[0], episode[-1]
+        return {
+            "category": category,
+            "status": box_protocol.status_name(status_code),
+            "status_code": status_code,
+            "detail": box_protocol.status_detail(status_code),
+        }
 
     def _external_status(self, snap):
         return self._slot_status(self.external_slot, snap, external=True)
