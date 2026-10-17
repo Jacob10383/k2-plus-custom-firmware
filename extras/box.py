@@ -25,8 +25,11 @@ from extras.motion_limits import restore_motion_limits, save_motion_limits
 
 SLOTS_PER_BOX = box_protocol.SLOTS_PER_BOX
 EXTERNAL_PROFILE_KEY = "external"
+# printer.box contract: docs/status-api.md (published as
+# docs/box-status-api.md in the firmware repo). API_VERSION changes only on a
+# break clients must handle; API_REVISION on every additive schema change.
 API_VERSION = 1
-LEGACY_WIDGET_VERSION = 2
+API_REVISION = 2
 SAFE_WIDGET_COMMANDS = frozenset((
     "_BOX_SLOT_SET",
     "_BOX_SLOT_CLEAR",
@@ -50,6 +53,9 @@ IDLE_POLL = 5.0
 TOPOLOGY_POLL = 15.0
 RFID_REFRESH = 30.0
 ERROR_BACKOFF = 10.0
+# Consecutive missed state reads before a CFS reports offline; one dropped
+# RS-485 frame must not flicker a box offline or hide its slots.
+OFFLINE_POLLS = 3
 STATE_TIMEOUT = 5.0
 STATE_POLL = 0.1
 STATE_EVENT_DRAIN = 4
@@ -87,12 +93,14 @@ CFS_COMMAND_FATAL_STATUSES = frozenset((
     box_protocol.STATUS_BUFFER_REFILL_STALLED,
     box_protocol.STATUS_BUFFER_REFILL_NO_MOTION,
 ))
-CFS_ADVISORY_STATUSES = frozenset((
-    box_protocol.STATUS_INVALID_PARAM,
-    box_protocol.STATUS_BAD_CRC,
+# Not user problems: logged, never shown as a fault.
+CFS_LOG_ONLY_STATUSES = frozenset((
     box_protocol.STATUS_BUSY,
     box_protocol.STATUS_STAGE7_NO_MOTION,
 ))
+# One corrupted frame is noise; repeated ones point at the cable.
+CRC_FAULT_COUNT = 3
+CRC_FAULT_WINDOW = 60.0
 
 CLEAN_LIMIT_VELOCITY = 800
 CLEAN_LIMIT_ACCEL = 10000
@@ -213,6 +221,11 @@ class BoxSnapshot:
     encoder_mm: object = None
     buffer_status: object = None
     buffer_state: object = None
+    # Legacy top-level status: the feeding box, else the lowest responding.
+    # Only the legacy fields (docs/status-api.md) use these, temp_c,
+    # humidity_pct, and the relay fallback beyond the buffer.
+    relay_status_code: object = None
+    relay_state_code: object = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +233,11 @@ class TrackingOwner:
     address: int
     slot: int
     epoch: int
+
+
+def box_profile_key(uniid, local_slot):
+    """Persisted profile key: the CFS's 12-byte UniID plus its local slot."""
+    return "%s:%d" % (bytes(uniid).hex(), local_slot)
 
 
 class BoxStore:
@@ -330,8 +348,8 @@ class BoxStore:
         self.save()
         return key
 
-    def profile(self, slot):
-        value = self.data["slots"].get(str(slot), {})
+    def profile(self, key):
+        value = self.data["slots"].get(str(key), {})
         return {
             "material": str(value.get("material", "")).strip().upper(),
             "color": str(value.get("color", "")).strip().upper(),
@@ -342,7 +360,7 @@ class BoxStore:
                 "rfid_reserve", "")).strip().strip("\x00").strip(),
         }
 
-    def set_profile(self, slot, profile):
+    def set_profile(self, key, profile):
         clean = {
             "material": str(profile.get("material", "")).strip().upper(),
             "color": str(profile.get("color", "")).strip().upper(),
@@ -354,12 +372,40 @@ class BoxStore:
             "rfid_reserve", "")).strip().strip("\x00").strip()
         if reserve:
             clean["rfid_reserve"] = reserve
-        self.data["slots"][str(slot)] = clean
+        self.data["slots"][str(key)] = clean
         self.save()
 
-    def clear_profile(self, slot):
-        if self.data["slots"].pop(str(slot), None) is not None:
+    def clear_profile(self, key):
+        if self.data["slots"].pop(str(key), None) is not None:
             self.save()
+
+    def migrate_slot_profiles(self, identities):
+        """Move legacy global-slot keys onto the CFS identity at that address.
+
+        A legacy key whose address has no identity is left untouched; a later
+        enumeration that identifies the address migrates it. A legacy key
+        whose identity profile already exists is stale: it is logged and
+        dropped so it cannot resurface on another box later.
+        """
+        slots = self.data["slots"]
+        moved = {}
+        for key in list(slots):
+            if not key.isdigit() or int(key) >= MAX_ADDRESSES * SLOTS_PER_BOX:
+                continue
+            address, local = divmod(int(key), SLOTS_PER_BOX)
+            uniid = identities.get(address + 1)
+            if uniid is None:
+                continue
+            target = box_profile_key(uniid, local)
+            if target in slots:
+                _klog("dropped stale legacy profile %s=%s; %s already exists",
+                      key, slots.pop(key), target, level=logging.warning)
+            else:
+                slots[target] = slots.pop(key)
+            moved[key] = target
+        if moved:
+            self.save()
+            _klog("migrated slot profiles %s", moved)
 
     def setting(self, name, default=None):
         return self.data["runtime"].get(name, default)
@@ -470,6 +516,7 @@ class Box:
 
         self.serial = None
         self.drivers = {}
+        self.box_ids = {}  # address -> UniID of each box online at enumeration
         self.address_errors = ()
         self.drivers_ready = False
         self.snapshot = BoxSnapshot(loaded_slot=None)
@@ -484,6 +531,8 @@ class Box:
         self.fault_generation = 0
         self.last_fatal_reason = None
         self.fault_episodes = {}
+        self.crc_errors = {}
+        self.crc_warned = set()
         self.rfid_percent = {}
         self.unknown_rfid = {}
         self.rfid_presence = {}
@@ -492,6 +541,8 @@ class Box:
         self.rfid_seen_invalid = set()
         self.rfid_live_slots = set()
         self.box_replies = None  # until the first poll; then address -> reply
+        self.box_last = {}
+        self.box_misses = {}
         self.last_rfid_refresh = 0.0
         self.last_topology_refresh = 0.0
         self.spoolman_generation = 0
@@ -543,8 +594,10 @@ class Box:
         commands = (
             ("BOX_PRINT_INFO", self.cmd_print_info, "Inspect tools used by a print"),
             ("BOX_PRINT_START", self.cmd_print_start, "Start a print with a tool map"),
-            ("BOX_SELECT_SLOT", self.cmd_select_slot, "Select a physical filament slot"),
-            ("BOX_LOAD", self.cmd_load, "Load filament from a CFS slot"),
+            ("BOX_SELECT_SLOT", self.cmd_select_slot,
+             "Switch to SLOT (unload, load, purge), ignoring the print's tool map"),
+            ("BOX_LOAD", self.cmd_load,
+             "Feed SLOT to the printhead only; no unload, heating, or purge"),
             ("BOX_UNLOAD", self.cmd_unload, "Fully unload the active filament"),
             ("BOX_DEBUG", self.cmd_debug, "Show complete box diagnostics"),
             ("BOX_BUFFER_RETRACT", self.cmd_buffer_retract,
@@ -615,9 +668,16 @@ class Box:
         self.address_errors = tuple(result.errors)
         if ADDRESS_WEDGE_WARNING in self.address_errors:
             self._warn(ADDRESS_WEDGE_WARNING)
+        # Legacy profiles belong to the box persisted at that address when they
+        # were written; the online box only claims addresses with no record.
+        owners = dict(result.online)
+        owners.update(self.store.known_addresses)
+        self.store.migrate_slot_profiles(owners)
         self.store.set_known_addresses(result.known)
+        self.box_ids = dict(result.online)
         self.drivers = {
-            address: box_protocol.BoxDriver(self.serial, address)
+            address: box_protocol.BoxDriver(
+                self.serial, address, on_bad_crc=self._observe_crc_error)
             for address in sorted(result.online)
         }
         self.drivers_ready = True
@@ -714,29 +774,35 @@ class Box:
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
         self.serial = None
+        # Nothing is polled after this; report no data rather than the last.
+        self.drivers_ready = False
+        self.snapshot = BoxSnapshot(loaded_slot=None)
         self.box_replies = {}
+        self.box_last.clear()
+        self.box_misses = {address: OFFLINE_POLLS for address in self.drivers}
         self.reactor.update_timer(self.poll_timer, self.reactor.NEVER)
 
     def get_status(self, eventtime):
+        """printer.box. Keep docs/status-api.md in step with every change."""
         snap = self.snapshot
         physical = self._slot_statuses(snap)
         slots = physical + [self._external_status(snap)]
         return {
             "api_version": API_VERSION,
+            "api_revision": API_REVISION,
+            # Legacy, frozen at 1: print mapping follows API_VERSION/API_REVISION.
             "print_mapping_version": 1,
             "print_info": self.print_info,
             "print_mapping": self.change_engine.mapping_status(),
-            "fluidd_widget_version": LEGACY_WIDGET_VERSION,
             "data_ready": snap.data_ready,
-            "status": box_protocol.status_name(snap.status_code),
-            "status_code": snap.status_code,
-            "state": box_protocol.state_name(snap.state_code),
-            "state_code": snap.state_code,
+            # Legacy, see docs/status-api.md: per-box data is in boxes.
             "temp_c": snap.temp_c,
             "humidity_pct": snap.humidity_pct,
+            "status": box_protocol.status_name(snap.relay_status_code),
+            "status_code": snap.relay_status_code,
+            "state": box_protocol.state_name(snap.relay_state_code),
+            "state_code": snap.relay_state_code,
             "loaded_slot": snap.loaded_slot,
-            "loaded_mask": snap.loaded_mask,
-            "slot_filament_mask": snap.slot_mask,
             "slots": slots,
             "boxes": self._boxes_status(),
             "materials": self.store.materials,
@@ -745,7 +811,6 @@ class Box:
             "unload_after_print_enabled": self.unload_after_print_enabled,
             "rfid_insert_reading_enabled": self.rfid_insert_reading_enabled,
             "rfid_startup_reading_enabled": self.rfid_startup_reading_enabled,
-            "tracking_active": snap.tracking,
             "filament_detected": snap.filament_detected,
             "filament_sensor_error": snap.filament_sensor_error,
             "load_path": self._load_path_status(snap),
@@ -762,12 +827,13 @@ class Box:
             return []
         boxes = []
         for address in sorted(self.drivers):
-            reply = self.box_replies.get(address)
+            online = self._box_online(address)
+            reply = self.box_last.get(address) if online else None
             status_code = reply.status if reply else None
             state_code = reply.box_state if reply else None
             boxes.append({
                 "address": address,
-                "online": reply is not None,
+                "online": online,
                 "slots": [self._global_slot(address, local)
                           for local in range(SLOTS_PER_BOX)],
                 "temp_c": reply.temp_c if reply else None,
@@ -782,15 +848,24 @@ class Box:
 
     def _fault_status(self, address):
         episode = self.fault_episodes.get(address)
-        if episode is None:
+        if episode is not None:
+            status_code, category = episode[0], episode[-1]
+        elif len(self._recent_crc_errors(address)) >= CRC_FAULT_COUNT:
+            status_code, category = box_protocol.STATUS_BAD_CRC, "advisory"
+        else:
             return None
-        status_code, category = episode[0], episode[-1]
+        title, message = box_protocol.status_text(status_code)
         return {
             "category": category,
             "status": box_protocol.status_name(status_code),
             "status_code": status_code,
-            "detail": box_protocol.status_detail(status_code),
+            "title": title,
+            "message": message,
         }
+
+    def _box_online(self, address):
+        return (address in self.drivers
+                and self.box_misses.get(address, 0) < OFFLINE_POLLS)
 
     def _external_status(self, snap):
         return self._slot_status(self.external_slot, snap, external=True)
@@ -816,9 +891,6 @@ class Box:
         clog = self._clog_status()
         return {
             "source_slot": snap.loaded_slot if self.is_valid_slot(snap.loaded_slot) else None,
-            "loaded_slot": snap.loaded_slot,
-            "loaded_mask": snap.loaded_mask,
-            "slot_filament_mask": snap.slot_mask,
             "box_addr": snap.path_box,
             "tracking_active": snap.tracking,
             "encoder": {
@@ -826,9 +898,11 @@ class Box:
                 "active": snap.path_box is not None and snap.tracking,
             },
             "buffer": {
-                "status_code": snap.buffer_status,
+                "state": (box_protocol.buffer_state_name(snap.buffer_state)
+                          if snap.buffer_status == box_protocol.STATUS_OK
+                          else None),
+                # Legacy, see docs/status-api.md.
                 "state_code": snap.buffer_state,
-                "active": snap.buffer_state not in (None, 0),
             },
             "printhead_sensor": {
                 "detected": snap.filament_detected,
@@ -870,13 +944,26 @@ class Box:
         return box_protocol.slot_label(slot, self.external_slot)
 
     def profile(self, slot):
-        return self.store.profile(self._runtime_slot_key(slot))
+        return self.store.profile(self._profile_key(slot))
 
     def set_profile(self, slot, profile):
-        self.store.set_profile(self._runtime_slot_key(slot), profile)
+        self.store.set_profile(self._profile_key(slot), profile)
 
     def clear_profile(self, slot):
-        self.store.clear_profile(self._runtime_slot_key(slot))
+        self.store.clear_profile(self._profile_key(slot))
+
+    def _profile_key(self, slot):
+        """Profiles follow the CFS, so they are stored by UniID, not address.
+
+        An address with no identified box keeps its legacy global-slot key,
+        which migration moves once a box is identified there.
+        """
+        key = self._runtime_slot_key(slot)
+        if key == EXTERNAL_PROFILE_KEY:
+            return key
+        address, local = self._address_slot(key)
+        uniid = self.box_ids.get(address)
+        return key if uniid is None else box_profile_key(uniid, local)
 
     def _runtime_slot_key(self, slot):
         if slot == EXTERNAL_PROFILE_KEY or slot == self.external_slot:
@@ -1164,7 +1251,9 @@ class Box:
         except Exception as exc:
             raise gcmd.error("[BOX]: Unable to read CFS state: %s" % exc)
         for slot in mapping.values():
-            if not self.is_valid_slot(slot):
+            if not self.is_valid_slot(slot) or (
+                    self.is_physical_slot(slot)
+                    and not self._box_online(self._address_slot(slot)[0])):
                 raise gcmd.error("[BOX]: %s is offline" % self.slot_label(slot))
             if self.is_physical_slot(slot) and not live.slot_mask & (1 << slot):
                 raise gcmd.error("[BOX]: %s has no filament" % self.slot_label(slot))
@@ -1200,8 +1289,8 @@ class Box:
         try:
             already_loaded = self.physical_load(slot)
         except Exception as exc:
-            raise gcmd.error(
-                "[BOX]: " + box_protocol.format_failed("BOX_LOAD", exc))
+            raise gcmd.error("[BOX]: " + box_protocol.format_failed(
+                "%s load" % self.slot_label(slot), exc))
         if already_loaded:
             self._info(gcmd, "%s already loaded; tracking active" % self.slot_label(slot))
         else:
@@ -1232,7 +1321,8 @@ class Box:
                     driver.unload_buffer(timeout=BUFFER_RETRACT_TIMEOUT),
                     "buffer retract")
         except Exception as exc:
-            raise gcmd.error("[BOX]: BOX_BUFFER_RETRACT failed: %s" % exc)
+            raise gcmd.error(
+                "[BOX]: " + box_protocol.format_failed("Buffer retract", exc))
         self._info(gcmd, "Box %d buffer retract complete" % address)
 
     def cmd_cut(self, gcmd):
@@ -1436,7 +1526,8 @@ class Box:
     def _presence_mask(self):
         mask = 0
         for address, local_mask in self.rfid_presence.items():
-            mask |= (local_mask & 0x0F) << ((address - 1) * SLOTS_PER_BOX)
+            if self._box_online(address):
+                mask |= (local_mask & 0x0F) << ((address - 1) * SLOTS_PER_BOX)
         return mask
 
     def _clear_rfid_watch(self, slot):
@@ -2408,7 +2499,8 @@ class Box:
             return False
         self.fault_episodes[address] = key
         self.fault_generation += 1
-        self.last_fatal_reason = str(reason)
+        # Operations prefix their own label: "<slot> load failed (CODE): ..."
+        self.last_fatal_reason = box_protocol.status_detail(status)
         stats = self.printer.lookup_object("print_stats")
         if stats.state in ("printing", "paused"):
             pending = self.change_engine.pending
@@ -2424,7 +2516,8 @@ class Box:
     def _record_command_fault(self, reply, context):
         if reply is None or reply.status not in CFS_COMMAND_FATAL_STATUSES:
             return False
-        reason = box_protocol.status_detail(reply.status)
+        reason = box_protocol.status_line(
+            reply.address, reply.status, fault=True)
         latched = self._latch_fatal_fault(
             reply.address, reply.status, reason)
         if latched:
@@ -2510,6 +2603,12 @@ class Box:
                 loaded = candidate
                 loaded_mask |= 1 << candidate
         self.box_replies = replies
+        for address in self.drivers:
+            if address in replies:
+                self.box_misses[address] = 0
+                self.box_last[address] = replies[address]
+            else:
+                self.box_misses[address] = self.box_misses.get(address, 0) + 1
         if loaded >= 0:
             self.path_owner = loaded
         elif detected is False:
@@ -2534,17 +2633,32 @@ class Box:
         path_address = None
         if self.is_physical_slot(loaded):
             path_address, _local = self._address_slot(loaded)
-        elif replies:
-            path_address = min(replies)
-        driver = self.drivers.get(path_address)
+        # The buffer is shared, so any responding CFS can report it. The same
+        # box feeds the legacy top-level temp/RH and status.
+        relay_address = path_address
+        if relay_address is None and replies:
+            relay_address = min(replies)
         state_reply = replies.get(path_address)
+        relay_reply = replies.get(relay_address)
         encoder_reply = None
         buffer_reply = None
-        if driver:
-            buffer_reply = driver.query_buffer(timeout=0.5)
-            if (self.is_physical_slot(loaded) and state_reply is not None
-                    and state_reply.box_state == box_protocol.BOX_STATE_PRINT):
-                encoder_reply = driver.query_encoder(timeout=0.5)
+        # Like the state reads above, a failed query leaves its value unknown
+        # rather than keeping the previous snapshot.
+        if relay_address in self.drivers:
+            try:
+                buffer_reply = self.drivers[relay_address].query_buffer(
+                    timeout=0.5)
+            except Exception as exc:
+                _klog("box %d buffer query failed: %s", relay_address, exc,
+                      level=logging.warning)
+        if (state_reply is not None
+                and state_reply.box_state == box_protocol.BOX_STATE_PRINT):
+            try:
+                encoder_reply = self.drivers[path_address].query_encoder(
+                    timeout=0.5)
+            except Exception as exc:
+                _klog("box %d encoder query failed: %s", path_address, exc,
+                      level=logging.warning)
 
         status_code = state_reply.status if state_reply else None
         state_code = state_reply.box_state if state_reply else None
@@ -2557,18 +2671,20 @@ class Box:
             data_ready=self.drivers_ready and not owner_reply_missing,
             status_code=status_code,
             state_code=state_code,
-            temp_c=state_reply.temp_c if state_reply else None,
-            humidity_pct=state_reply.humidity_pct if state_reply else None,
+            temp_c=relay_reply.temp_c if relay_reply else None,
+            humidity_pct=relay_reply.humidity_pct if relay_reply else None,
             loaded_slot=loaded,
             loaded_mask=loaded_mask,
             slot_mask=topology,
             tracking=tracking,
             filament_detected=detected,
             filament_sensor_error=sensor_error,
-            path_box=path_address if self.is_physical_slot(loaded) else None,
+            path_box=path_address,
             encoder_mm=encoder_reply.value if encoder_reply else None,
             buffer_status=buffer_reply.status if buffer_reply else None,
             buffer_state=buffer_reply.value if buffer_reply else None,
+            relay_status_code=relay_reply.status if relay_reply else None,
+            relay_state_code=relay_reply.box_state if relay_reply else None,
         )
         self.snapshot = snap
         return snap
@@ -2603,6 +2719,16 @@ class Box:
         if status == box_protocol.STATUS_OK:
             self.fault_episodes.pop(address, None)
             return
+        if status == box_protocol.STATUS_INVALID_PARAM:
+            _klog("box %d rejected a status query as invalid", address,
+                  level=logging.warning)
+            return
+        if status in CFS_LOG_ONLY_STATUSES:
+            _klog("box %d reported %s", address,
+                  box_protocol.status_name(status), level=logging.debug)
+            return
+        if status == box_protocol.STATUS_BAD_CRC:
+            return  # Counted by the driver for every reply.
 
         tracking_owner = self.tracking_owner
         tracking_owned = (
@@ -2625,14 +2751,12 @@ class Box:
                 self.runout_origin = tracking_owner.slot
                 self.runout_key = (address, tracking_owner.epoch)
                 if is_new:
-                    self._info(
-                        self.gcode,
-                        "CFS box %d spool runout %s"
-                        % (address, box_protocol.status_detail(status)))
+                    self._info(self.gcode, "Box %d spool ran out (%s)" % (
+                        address, box_protocol.status_code_label(status)))
             elif is_new:
-                self._warn(
-                    "CFS box %d reported %s without active tracking; advisory only"
-                    % (address, box_protocol.status_name(status)))
+                self._warn(box_protocol.status_line(
+                    address, status,
+                    note=None if path_owned else "not in use"))
             self.fault_episodes[address] = key
             return
 
@@ -2642,31 +2766,55 @@ class Box:
             key = self._fault_key(status, "runout")
             is_new = self.fault_episodes.get(address) != key
             if is_new:
-                _klog(
-                    "CFS box %d BUFFER_REFILL_STALLED during runout %s",
-                    address, box_protocol.status_detail(status))
+                _klog("box %d BUFFER_REFILL_STALLED during runout", address)
             self.fault_episodes[address] = key
             return
 
-        fatal = path_owned and status not in CFS_ADVISORY_STATUSES
+        fatal = path_owned
         key = self._fault_key(
             status, "fatal" if fatal else "advisory")
         if self.fault_episodes.get(address) == key:
             return
-        detail = "CFS box %d %s %s state=%s" % (
-            address,
-            "fault" if fatal else "status",
-            box_protocol.status_detail(status),
-            box_protocol.state_name(reply.box_state))
+        _klog("box %d %s status=%s state=%s", address,
+              "fault" if fatal else "advisory",
+              box_protocol.status_name(status),
+              box_protocol.state_name(reply.box_state),
+              level=logging.warning)
         if not fatal:
             self.fault_episodes[address] = key
-            self._warn(detail + "; advisory only")
+            self._warn(box_protocol.status_line(
+                address, status, note="not in use"))
             return
+        detail = box_protocol.status_line(address, status, fault=True)
 
         if self._latch_fatal_fault(address, status, detail):
             if self.change_engine.resume_recovery is not None:
                 detail = self.change_engine.recovery_notice()
             self._warn(detail)
+
+    def _recent_crc_errors(self, address):
+        now = self.reactor.monotonic()
+        recent = [stamp for stamp in self.crc_errors.get(address, ())
+                  if now - stamp < CRC_FAULT_WINDOW]
+        self.crc_errors[address] = recent
+        return recent
+
+    def _observe_crc_error(self, address):
+        # Shown by _fault_status while the window holds enough errors, so it
+        # needs no episode and survives tracking changes.
+        # Warn once per run of errors less than a window apart.
+        recent = self._recent_crc_errors(address)
+        if not recent:
+            self.crc_warned.discard(address)
+        recent.append(self.reactor.monotonic())
+        _klog("box %d rejected a corrupted message (%d in %ds)",
+              address, len(recent), CRC_FAULT_WINDOW, level=logging.warning)
+        if (len(recent) >= CRC_FAULT_COUNT
+                and address not in self.crc_warned
+                and not self._fatal_episode(address)):
+            self.crc_warned.add(address)
+            self._warn(box_protocol.status_line(
+                address, box_protocol.STATUS_BAD_CRC))
 
     def _check_clog(self, eventtime, snap):
         if snap.encoder_mm is None:
@@ -2734,7 +2882,9 @@ class Box:
             fault_generation = self.fault_generation
         self.check_operation_abort(fault_generation)
         driver, address, local = self._driver_for_slot(slot)
-        warning = None
+        if not self._box_online(address):
+            raise BoxError("Box %d is not responding (%s)"
+                           % (address, self.slot_label(slot)))
         with self._operation():
             live = self.read_live_state(include_topology=False)
             self.check_operation_abort(fault_generation)
@@ -2855,13 +3005,12 @@ class Box:
                 self.check_operation_abort(fault_generation)
             stage7 = driver.load_stage(local, 7, timeout=2.0)
             if stage7 is None:
-                warning = (
-                    "CFS did not respond to the final load nudge; printhead "
-                    "sensor was already confirmed")
-            elif stage7.status == 0x0E:
-                warning = (
-                    "CFS final nudge did not reach 3mm; printhead sensor was "
-                    "already confirmed")
+                _klog("box %d did not respond to the final load nudge; "
+                      "printhead sensor was already confirmed", address,
+                      level=logging.warning)
+            elif stage7.status == box_protocol.STATUS_STAGE7_NO_MOTION:
+                _klog("box %d final load nudge moved under 1.5 mm; printhead "
+                      "sensor was already confirmed", address)
             elif stage7.status != 0x00:
                 raise BoxError(box_protocol.status_detail(stage7.status))
 
@@ -2875,8 +3024,6 @@ class Box:
             self.runout_active = False
             self.runout_origin = None
             self.mark_hotend_feed_pending(slot)
-        if warning:
-            self._info(self.gcode, warning)
         self._report_encoder_delta(driver, load_encoder_start, "fed")
         return False
 
@@ -3081,9 +3228,7 @@ class Box:
             self.check_operation_abort(fault_generation)
             episode = self.fault_episodes.get(last.path_box)
             if episode is not None and episode[-1] == "fatal":
-                raise BoxError(
-                    "CFS box %d remains in fatal state %s"
-                    % (last.path_box, box_protocol.status_detail(episode[0])))
+                raise BoxError(box_protocol.status_detail(episode[0]))
             if (last.loaded_slot == loaded_slot
                     and last.filament_detected == detected
                     and last.tracking == tracking):

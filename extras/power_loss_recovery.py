@@ -1347,7 +1347,7 @@ class PowerLossRecovery:
             "total_layer": self.print_stats.info_total_layer,
         }
         dynamic["current_layer"] = self.print_stats.info_current_layer
-        dynamic["tool_mapping"] = engine.mapping_status()
+        dynamic["tool_mapping"] = engine.mapping_checkpoint()
         return {
             "dynamic": dynamic,
             "static": static,

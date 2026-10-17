@@ -120,18 +120,29 @@ class BoxChangeEngine:
                 "map": {str(tool): slot for tool, slot in self.tool_map.items()},
                 "active_tool": self.active_tool, "active_slot": self.active_slot}
 
+    def mapping_checkpoint(self):
+        """Persist external slot identities across CFS topology changes."""
+        state = self.mapping_status()
+        state["map"] = {tool: self.box._runtime_slot_key(slot)
+                        for tool, slot in state["map"].items()}
+        if self.active_slot is not None:
+            state["active_slot"] = self.box._runtime_slot_key(self.active_slot)
+        return state
+
     def restore_print_mapping(self, state):
         self.reset_print_mapping()
         if state is None or state.get("filename") is None:
             return
         try:
-            mapping = {int(tool): slot for tool, slot in state["map"].items()}
+            mapping = {int(tool): self.box._runtime_slot(slot)
+                       for tool, slot in state["map"].items()}
             if (not isinstance(state["filename"], str)
                     or any(not 0 <= tool <= 255 or type(slot) is not int
                            or not self.box.is_valid_slot(slot)
                            for tool, slot in mapping.items())):
                 raise ValueError()
-            tool, slot = state["active_tool"], state["active_slot"]
+            tool = state["active_tool"]
+            slot = self.box._runtime_slot(state["active_slot"])
             if tool is not None and (type(tool) is not int or tool not in mapping
                                      or type(slot) is not int
                                      or not self.box.is_valid_slot(slot)):
@@ -356,7 +367,8 @@ class BoxChangeEngine:
         try:
             live = self.box.read_live_state()
         except Exception as exc:
-            raise gcmd.error("[BOX]: BOX_UNLOAD failed: %s" % exc)
+            raise gcmd.error(
+                "[BOX]: " + box_protocol.format_failed("Unload", exc))
         if live.loaded_slot is None:
             raise gcmd.error("[BOX]: CFS loaded-slot state is unavailable")
         if live.loaded_slot < 0 and live.filament_detected is False:
@@ -422,7 +434,8 @@ class BoxChangeEngine:
                 gcmd, "Unload complete%s"
                 % (", heater off" if heater_used else ""))
         except Exception as exc:
-            raise gcmd.error("[BOX]: BOX_UNLOAD failed: %s" % exc)
+            raise gcmd.error(
+                "[BOX]: " + box_protocol.format_failed("Unload", exc))
         finally:
             if physical:
                 if success or previous_sensor:
@@ -711,13 +724,13 @@ class BoxChangeEngine:
 
     def recovery_instruction(self):
         status = self.recovery_status()
-        reason = status["reason"] or "Box recovery is incomplete"
+        reason = (status["reason"] or "Box recovery is incomplete").rstrip(".")
         action = self._recovery_action(status)
         return "Resume blocked: %s; %s, or CANCEL_PRINT" % (reason, action)
 
     def recovery_notice(self):
         status = self.recovery_status()
-        reason = status["reason"] or "Box recovery is incomplete"
+        reason = (status["reason"] or "Box recovery is incomplete").rstrip(".")
         pause_state = (
             "Print paused" if self._is_print_paused()
             else "Pausing print")

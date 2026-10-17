@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "bde5ae689302d052d6ce306a1bce5088cec4cadf0610358778143bf6bde65943",
-      "size": 133318
+      "sha256": "d379f1e0fe29186eacd6862db95face9f57a85f993ff21d9987294729036693f",
+      "size": 140504
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -17,16 +17,16 @@
       "size": 4588
     },
     "box_change.py": {
-      "sha256": "15f0aea5988ed0ca4ddc48e0461391e3ede9d35446a7c237be62c64c0bccc30b",
-      "size": 66856
+      "sha256": "80b416ad31192b87c74b40d49a318db464ce69dc5ea28a506b2be480821eee79",
+      "size": 67453
     },
     "box_gcode.py": {
       "sha256": "63e93fc165ad83e34d7cd954a3876f06aad2c1b86802b0cf8b2d6dc74ff6b8e1",
       "size": 2225
     },
     "box_protocol.py": {
-      "sha256": "4f5f928c964db5454fb74cdb1a109c2c50c50f6b727915416bab515a594f8157",
-      "size": 25140
+      "sha256": "9592a3e1f4b8fbb07195619473cbd3fcb64ea8179ed8e88c2fcee6324646fdaa",
+      "size": 27119
     },
     "cartographer.py": {
       "sha256": "ac787fe282f4dc2e64b3ebc4454332c4fd50ffdc0597d9e3935d6072e9572a2a",
@@ -69,8 +69,8 @@
       "size": 147204
     },
     "power_loss_recovery.py": {
-      "sha256": "b879621514236a18fade56622151931fb88cfe4a73f8f51e4eb1365fc4c70872",
-      "size": 74780
+      "sha256": "83197bee3e8eb096e677c20f8f3a903a7da3e66df0604897fc1c7e6430baa7ea",
+      "size": 74784
     },
     "prtouch.py": {
       "sha256": "c7f3204cc74a3cde8472b4adb552d9ca8907918819ce1ac3ca60b56c333e2cb6",

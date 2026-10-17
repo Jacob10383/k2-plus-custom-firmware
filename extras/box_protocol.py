@@ -166,85 +166,113 @@ def state_name(value):
     return "NO_RESPONSE" if value is None else STATE_NAMES.get(value, "UNKNOWN")
 
 
-# (meaning, what to check or None). Identifiers stay in STATUS_NAMES.
-STATUS_HINTS = {
+# (title, message) shown to users. Identifiers stay in STATUS_NAMES.
+STATUS_TEXT = {
+    STATUS_INVALID_PARAM: (
+        "Invalid command",
+        "The box rejected a command as invalid."),
+    STATUS_BAD_CRC: (
+        "Communication errors",
+        "The box is rejecting corrupted messages. If this keeps happening, "
+        "check its cable."),
+    STATUS_BUSY: (
+        "Box busy",
+        "The box is still finishing another operation."),
     STATUS_STAGE0_SENSOR_TIMEOUT: (
-        "filament never reached the path sensor on the way into the hub (7 s)",
-        "if filament is seated in the slot gears and not tangled",
-    ),
+        "Filament didn't reach the hub",
+        "Filament never reached the hub's sensor within 7 s. Check that "
+        "it's seated in the slot gears and not tangled."),
     STATUS_SLOT_EMPTY: (
-        "the chosen slot has no filament at the inlet",
-        None,
-    ),
+        "Slot is empty",
+        "There's no filament at this slot's inlet."),
     STATUS_STAGE0_ODOMETER_TIMEOUT: (
-        "the hub odometer did not move for 2 s",
-        "for a tangle, or whether the hub is turning filament",
-    ),
+        "Filament isn't moving",
+        "The hub's measuring wheel didn't turn for 2 s. Check for a tangle, "
+        "or that the hub is gripping the filament."),
     STATUS_FEED_TIMEOUT: (
-        "the hub fed for 25 s without filament finishing the path through the buffer to the printhead",
-        None,
-    ),
+        "Feed timed out",
+        "The hub fed for 25 s without filament reaching the printhead."),
     STATUS_OVERTRAVEL: (
-        "hub fed 3 m but filament never arrived",
-        "for PTFE disconnections",
-    ),
+        "Filament didn't arrive",
+        "The hub fed 3 m, but filament never reached the printhead. Check "
+        "for a disconnected PTFE tube."),
     STATUS_ODOMETER_STALLED: (
-        "the hub odometer stopped changing for 500 ms",
-        "for a jam or resistance in the filament path",
-    ),
+        "Filament stopped moving",
+        "The hub's measuring wheel stopped while feeding. Check for a jam "
+        "or resistance in the path."),
     STATUS_BUFFER_NOT_FULL: (
-        "the buffer never showed full after feeding",
-        None,
-    ),
+        "Buffer didn't fill",
+        "The buffer didn't report full within 3 s of feeding. Check the "
+        "PTFE into the buffer."),
     STATUS_UNLOAD_BUFFER_TIMEOUT: (
-        "the hub reversed and the buffer did not go empty in 5 s",
-        "for filament stuck in the buffer, or the PTFE between buffer and hub",
-    ),
+        "Filament couldn't pull back",
+        "The hub tried to pull back, but the buffer never released within "
+        "5 s, so the filament is likely jammed. Check for a jam between the "
+        "hub and the printhead."),
     STATUS_UNLOAD_HUB_PE_TIMEOUT: (
-        "retract waited for the hub path to clear, and it never did",
-        "for filament stuck in the hub",
-    ),
+        "Filament stuck in the hub",
+        "The retract waited for the hub path to clear, and it never did. "
+        "Check for filament stuck in the hub."),
     STATUS_UNLOAD_NO_FILAMENT: (
-        "the chosen slot is not showing filament present",
-        None,
-    ),
+        "Nothing to unload",
+        "This slot shows no filament at its inlet."),
     STATUS_UNLOAD_INLET_CLEAR: (
-        "retract from the hub started while the slot inlet still showed filament",
-        None,
-    ),
+        "Slot inlet already empty",
+        "The slot's inlet already showed no filament when the retract "
+        "started."),
     STATUS_UNLOAD_MOTOR_BLOCKED: (
-        "the hub motor stalled while pulling filament back",
-        "for a jam on retract",
-    ),
+        "Hub motor stalled",
+        "The hub motor stalled while pulling filament back. Check for a "
+        "jam."),
     STATUS_UNLOAD_ODOMETER_TIMEOUT: (
-        "the hub pulled back for 40 s without completion",
-        None,
-    ),
+        "Retract timed out",
+        "The hub pulled back for 40 s without the path clearing."),
     STATUS_RUNOUT: (
-        "the spool ran out",
-        None,
-    ),
+        "Spool ran out",
+        "The spool ran out."),
     STATUS_BUFFER_REFILL_STALLED: (
-        "the hub is moving filament, but the buffer stays empty",
-        "the PTFE from the hub into the buffer",
-    ),
+        "Buffer isn't refilling",
+        "The hub is feeding, but the buffer stays empty. Check the PTFE "
+        "from the hub into the buffer."),
     STATUS_BUFFER_REFILL_NO_MOTION: (
-        "the hub tried to refill the buffer, but the odometer moved less than 5 mm",
-        "for a jam or tangle in the filament path",
-    ),
+        "Buffer refill didn't move",
+        "The hub tried to refill the buffer, but the filament moved less "
+        "than 5 mm. Check for a jam or tangle."),
 }
 
 
-def status_detail(value):
+def status_text(value):
+    """(title, message). The title is a UI headline; the console shows the
+    message with status_code_label."""
+    if value is None:
+        return "No response", "The box didn't respond."
+    return STATUS_TEXT.get(
+        value, ("Unknown status", "The box reported an unknown status."))
+
+
+def status_code_label(value):
     name = status_name(value)
-    hint = STATUS_HINTS.get(value)
-    if hint is None:
-        return name
-    meaning, check = hint
-    body = meaning if meaning.endswith(".") else meaning + "."
-    if check:
-        body += " Check %s." % (check.rstrip("."),)
-    return "(%s): %s" % (name, body)
+    return "0x%02X" % (value,) if name == "UNKNOWN" else name
+
+
+# Shared buffer sensor bits: neither asserted is mid-travel; both is a fault.
+BUFFER_STATE_NAMES = {0: "middle", 1: "full", 2: "empty", 3: "fault"}
+
+
+def buffer_state_name(value):
+    return BUFFER_STATE_NAMES.get(value)
+
+
+def status_detail(value):
+    return "(%s): %s" % (status_code_label(value), status_text(value)[1])
+
+
+def status_line(address, value, fault=False, note=None):
+    code = status_code_label(value)
+    if note:
+        code += ", " + note
+    return "Box %d%s (%s): %s" % (
+        address, " fault" if fault else "", code, status_text(value)[1])
 
 
 SLOTS_PER_BOX = 4
@@ -562,14 +590,24 @@ def decode_auto_reply(frame, command, expected_address, expected_uniid=None):
 class BoxDriver:
     """Transport-backed, policy-free protocol client for one box."""
 
-    def __init__(self, serial, address):
+    def __init__(self, serial, address, on_bad_crc=None):
         self.serial = serial
         self.address = _box_address(address)
+        # Called with the address for every reply rejecting a corrupted frame.
+        self.on_bad_crc = on_bad_crc
 
     def _exchange(self, command, payload=(), timeout=DEFAULT_TIMEOUT):
         request = build_485_body(
             self.address, command, payload, header_byte=0xFF)
-        return self.serial.cmd_send_data_with_response(request, timeout)
+        frame = self.serial.cmd_send_data_with_response(request, timeout)
+        if frame and self.on_bad_crc is not None:
+            try:
+                status = decode_reply(frame, self.address, command).status
+            except ValueError:
+                status = None  # The caller's own decode reports it.
+            if status == STATUS_BAD_CRC:
+                self.on_bad_crc(self.address)
+        return frame
 
     def load_stage(self, slot, stage, timeout=DEFAULT_TIMEOUT):
         if stage not in LOAD_STAGE_STATUSES:
@@ -584,7 +622,7 @@ class BoxDriver:
     @contextmanager
     def load_session(self):
         with self.serial.request_session() as transport:
-            yield BoxDriver(transport, self.address)
+            yield BoxDriver(transport, self.address, self.on_bad_crc)
 
     def unload_buffer(self, timeout=DEFAULT_TIMEOUT):
         frame = self._exchange(CMD_UNLOAD, (0, 0), timeout)
