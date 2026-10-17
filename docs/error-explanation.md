@@ -4,24 +4,28 @@
 
 Errors reported by the CFS.
 
-| Error | Meaning | What to check |
+<!-- generated: cfs-errors -->
+| Error | What it means | Code |
 | --- | --- | --- |
-| `STAGE0_SENSOR_TIMEOUT` | The chosen slot started feeding, but filament never reached the path sensor on the way into the hub (7 s). | If filament is seated in the slot gears and not tangled. |
-| `SLOT_EMPTY` | The chosen slot has no filament at the inlet. | |
-| `STAGE0_ODOMETER_TIMEOUT` | Load started, but the hub odometer did not move for 2 s. | For a tangle, or whether the hub is turning filament. |
-| `FEED_TIMEOUT` | The hub fed for 25 s without filament finishing the path through the buffer to the printhead. | |
-| `OVERTRAVEL` | The hub measured 3 m of motion without the load completing. Filament left the hub but did not arrive. | For PTFE disconnections. |
-| `ODOMETER_STALLED` | During the feed, the hub odometer stopped changing for 500 ms. | For a jam or resistance in the filament path. |
-| `BUFFER_NOT_FULL` | After feeding, the buffer between never showed full. | |
-| `UNLOAD_BUFFER_TIMEOUT` | The hub reversed to empty the buffer, and the buffer did not go empty in 5 s. | For filament stuck in the buffer, or the PTFE between buffer and hub. |
-| `UNLOAD_HUB_PE_TIMEOUT` | Retract waited for the hub path to clear, and it never did. | For filament stuck in the hub. |
-| `UNLOAD_NO_FILAMENT` | The chosen slot is not showing filament present, so there is nothing to unload. | |
-| `UNLOAD_INLET_CLEAR` | Retract from the hub started while the slot inlet still showed filament there. | |
-| `UNLOAD_MOTOR_BLOCKED` | The hub motor stalled while pulling filament back. | For a jam on retract. |
-| `UNLOAD_ODOMETER_TIMEOUT` | The hub pulled back for 40 s without completion. | |
-| `RUNOUT` | The spool ran out. | |
-| `BUFFER_REFILL_STALLED` | During a print the hub is moving filament, but the buffer stays empty. | The PTFE from the hub into the buffer. |
-| `BUFFER_REFILL_NO_MOTION` | During a print the hub tried to refill the buffer, but the odometer moved less than 5 mm. | For a jam or tangle in the filament path. |
+| Communication errors | The box is rejecting corrupted messages. If this keeps happening, check its cable. | `BAD_CRC` (0x02) |
+| Filament didn't reach the hub | Filament never reached the hub's sensor within 7 s. Check that it's seated in the slot gears and not tangled. | `STAGE0_SENSOR_TIMEOUT` (0x05) |
+| Slot is empty | There's no filament at this slot's inlet. | `SLOT_EMPTY` (0x08) |
+| Filament isn't moving | The hub's measuring wheel didn't turn for 2 s. Check for a tangle, or that the hub is gripping the filament. | `STAGE0_ODOMETER_TIMEOUT` (0x09) |
+| Feed timed out | The hub fed for 25 s without filament reaching the printhead. | `FEED_TIMEOUT` (0x0A) |
+| Filament didn't arrive | The hub fed 3 m, but filament never reached the printhead. Check for a disconnected PTFE tube. | `OVERTRAVEL` (0x0B) |
+| Filament stopped moving | The hub's measuring wheel stopped while feeding. Check for a jam or resistance in the path. | `ODOMETER_STALLED` (0x0C) |
+| Buffer didn't fill | The buffer didn't report full within 3 s of feeding. Check the PTFE into the buffer. | `BUFFER_NOT_FULL` (0x0D) |
+| Filament couldn't pull back | The hub tried to pull back, but the buffer never released within 5 s, so the filament is likely jammed. Check for a jam between the hub and the printhead. | `UNLOAD_BUFFER_TIMEOUT` (0x13) |
+| Filament stuck in the hub | The retract waited for the hub path to clear, and it never did. Check for filament stuck in the hub. | `UNLOAD_HUB_PE_TIMEOUT` (0x14) |
+| Nothing to unload | This slot shows no filament at its inlet. | `UNLOAD_NO_FILAMENT` (0x16) |
+| Slot inlet already empty | The slot's inlet already showed no filament when the retract started. | `UNLOAD_INLET_CLEAR` (0x17) |
+| Hub motor stalled | The hub motor stalled while pulling filament back. Check for a jam. | `UNLOAD_MOTOR_BLOCKED` (0x19) |
+| Retract timed out | The hub pulled back for 40 s without the path clearing. | `UNLOAD_ODOMETER_TIMEOUT` (0x1A) |
+| Spool ran out | The spool ran out. | `RUNOUT` (0x50) |
+| Buffer isn't refilling | The hub is feeding, but the buffer stays empty. Check the PTFE from the hub into the buffer. | `BUFFER_REFILL_STALLED` (0x51) |
+| Buffer refill didn't move | The hub tried to refill the buffer, but the filament moved less than 5 mm. Check for a jam or tangle. | `BUFFER_REFILL_NO_MOTION` (0x52) |
+| Unknown status | The box reported an unknown status. | other |
+<!-- end generated: cfs-errors -->
 
 ## Motor control
 

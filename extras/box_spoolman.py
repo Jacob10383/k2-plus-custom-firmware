@@ -370,11 +370,3 @@ class SpoolmanLocationSync:
             ))
             lines.extend("  " + change for change in self.last_changes)
         gcmd.respond_info("[BOX]: " + "\n".join(lines))
-
-    def get_status(self):
-        return {
-            "enabled": self.enabled,
-            "ready": self.ready,
-            "running": self.running,
-            "last_result": self.last_result,
-        }

@@ -426,6 +426,14 @@ def encode_i16(value: int) -> bytes:
     return int(value).to_bytes(2, "little", signed=True)
 
 
+def encode_u32(value: int) -> bytes:
+    return int(value).to_bytes(4, "little", signed=False)
+
+
+def encode_i32(value: int) -> bytes:
+    return int(value).to_bytes(4, "little", signed=True)
+
+
 def encode_float32(value: float) -> bytes:
     return struct.pack("<f", float(value))
 
@@ -454,11 +462,31 @@ def decode_float32(payload: bytes) -> float:
     return struct.unpack("<f", payload)[0]
 
 
+def decode_u32(payload: bytes) -> int:
+    if len(payload) != 4:
+        raise RuntimeError(
+            "decode_u32 expected 4 bytes got len=%d payload_hex=%s"
+            % (len(payload), payload.hex()))
+    return int.from_bytes(payload, "little", signed=False)
+
+
+def decode_i32(payload: bytes) -> int:
+    if len(payload) != 4:
+        raise RuntimeError(
+            "decode_i32 expected 4 bytes got len=%d payload_hex=%s"
+            % (len(payload), payload.hex()))
+    return int.from_bytes(payload, "little", signed=True)
+
+
 def serialize_value(value, value_type: str) -> bytes:
     if value_type == "uint16_t":
         return encode_u16(int(value))
     if value_type == "int16_t":
         return encode_i16(int(value))
+    if value_type == "uint32_t":
+        return encode_u32(int(value))
+    if value_type == "int32_t":
+        return encode_i32(int(value))
     if value_type == "float":
         return encode_float32(float(value))
     raise ValueError(f"Unsupported value_type: {value_type}")
@@ -469,6 +497,10 @@ def deserialize_value(payload: bytes, value_type: str):
         return decode_u16(payload)
     if value_type == "int16_t":
         return decode_i16(payload)
+    if value_type == "uint32_t":
+        return decode_u32(payload)
+    if value_type == "int32_t":
+        return decode_i32(payload)
     if value_type == "float":
         return decode_float32(payload)
     raise ValueError(f"Unsupported value_type: {value_type}")
@@ -518,7 +550,7 @@ def coerce_override_value(param):
         return None
     if param.value_type == "float":
         return float(raw)
-    if param.value_type in ("uint16_t", "int16_t"):
+    if param.value_type in ("uint16_t", "int16_t", "uint32_t", "int32_t"):
         return int(float(raw))
     return raw
 
@@ -566,6 +598,8 @@ class RegistryParam:
     key: str
     value_type: str
     configurable: bool
+    # Initial reference value, or None for unknown calibration/live state.
+    # Only explicit cfg overrides create requested write targets.
     value: object | None
     tolerance: float | None
     # Runtime override state populated from `[motor_control]` config.
@@ -1363,9 +1397,10 @@ class MotorParamExecutor:
             timeout: float = MOTOR_COMMAND_TIMEOUT) -> list[dict]:
         """Read calibration params (0x09, 0x19) and warn if near-zero.
 
-        These params have ``override=True`` in the map because they are
-        dynamic/calibration-dependent.  We read them to populate their
-        ``value`` field and emit a warning if any are near zero.
+        These calibration IDs are selected by ``CALIBRATION_PARAM_IDS``.
+        Their map reference values are unknown until readback. We populate
+        the runtime ``value`` field and warn if any are near zero; constructor
+        zeroes are not evidence that a motor has been calibrated.
         """
         axis = target.axis
         results = []
@@ -2742,7 +2777,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         value_type = param.value_type
         if value_type == "float":
             return float(raw_value)
-        if value_type in ("uint16_t", "int16_t"):
+        if value_type in ("uint16_t", "int16_t", "uint32_t", "int32_t"):
             return int(float(raw_value))
         raise RuntimeError(f"unsupported value type {value_type}")
 

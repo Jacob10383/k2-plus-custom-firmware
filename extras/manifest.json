@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "208ce90c97fcecd9480ea97debe8581fb13cc857eaa05efd28148cb0ba7516c8",
-      "size": 132712
+      "sha256": "18fbe99d864989defce2baa8e06438c567959d520667bb365ff1c3f42f16c7a8",
+      "size": 142084
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -17,20 +17,20 @@
       "size": 4588
     },
     "box_change.py": {
-      "sha256": "15f0aea5988ed0ca4ddc48e0461391e3ede9d35446a7c237be62c64c0bccc30b",
-      "size": 66856
+      "sha256": "80b416ad31192b87c74b40d49a318db464ce69dc5ea28a506b2be480821eee79",
+      "size": 67453
     },
     "box_gcode.py": {
       "sha256": "63e93fc165ad83e34d7cd954a3876f06aad2c1b86802b0cf8b2d6dc74ff6b8e1",
       "size": 2225
     },
     "box_protocol.py": {
-      "sha256": "4f5f928c964db5454fb74cdb1a109c2c50c50f6b727915416bab515a594f8157",
-      "size": 25140
+      "sha256": "9592a3e1f4b8fbb07195619473cbd3fcb64ea8179ed8e88c2fcee6324646fdaa",
+      "size": 27119
     },
     "box_spoolman.py": {
-      "sha256": "a6dad518d6e542d8528680cf7037d777b8fa3484b28ac3a14813472151108255",
-      "size": 15291
+      "sha256": "c07d972334e28bcab2c5c93b96fccabd37a5004e9ec44802f56aa7eb5f461535",
+      "size": 15085
     },
     "cartographer.py": {
       "sha256": "ac787fe282f4dc2e64b3ebc4454332c4fd50ffdc0597d9e3935d6072e9572a2a",
@@ -41,8 +41,8 @@
       "size": 2994
     },
     "extended_zone_transform.py": {
-      "sha256": "c38fda7c4181bd5a2f122688117e1c9cb26b55e17c8b9ca6ca2d9ed0ec725462",
-      "size": 19686
+      "sha256": "d930a770f3fb3f4c07881113cdce593b2e6ae32574e9aeaf21380c6609a9b233",
+      "size": 20025
     },
     "external_rfid_reader.py": {
       "sha256": "5b6b63ba8fb847e87874d1f4620d1bd33ee52122a4a05fbc71f58ba274c32be3",
@@ -65,16 +65,16 @@
       "size": 3496
     },
     "motor_control.py": {
-      "sha256": "694fba546bd1a51b78931c5343738daf987a0a0ae86f4c76be8e2da9512156e1",
-      "size": 185280
+      "sha256": "f38b9cc8dfbad3a13eb1a0e389b0b03564ec6775876f195adcbb60ee8f95baaa",
+      "size": 186554
     },
     "motor_map.json": {
-      "sha256": "d4f143b0ff2522165992bef5053a07f295fa7bc8cb0fef4a937179706388fee1",
-      "size": 321924
+      "sha256": "7e3a0bcbb7d080beb6704f7de15baa5cf64f7cef91a646baa6f6628e8bc061e2",
+      "size": 147204
     },
     "power_loss_recovery.py": {
-      "sha256": "b879621514236a18fade56622151931fb88cfe4a73f8f51e4eb1365fc4c70872",
-      "size": 74780
+      "sha256": "83197bee3e8eb096e677c20f8f3a903a7da3e66df0604897fc1c7e6430baa7ea",
+      "size": 74784
     },
     "prtouch.py": {
       "sha256": "c7f3204cc74a3cde8472b4adb552d9ca8907918819ce1ac3ca60b56c333e2cb6",
