@@ -421,20 +421,23 @@ class Box:
         self.store = BoxStore(config.get(
             "state_path", "/mnt/UDISK/printer_data/filament_box.json"))
 
+        # Service moves are written with 3 decimals; round so "already at
+        # the wastebin" matches the position those moves leave behind.
+        self.wastebin_x = round(config.getfloat("wastebin_pos_x", 133.0), 3)
+        self.wastebin_y = round(config.getfloat("wastebin_pos_y", 378.0), 3)
+        # The pad's back edge is the wastebin row the scraper passes run on.
         self.clean_pad_left_x = config.getfloat("clean_pad_left_x", 154.0)
         self.clean_pad_right_x = config.getfloat("clean_pad_right_x", 166.0)
         self.clean_pad_front_y = config.getfloat("clean_pad_front_y", 367.0)
-        self.clean_pad_back_y = config.getfloat("clean_pad_back_y", 378.0)
         self.clean_pad_passes = config.getint(
             "clean_pad_passes", 1, minval=1)
         for legacy_name in (
-                "clean_left_pos_x", "clean_right_pos_x", "clean_right_pos_y"):
+                "clean_left_pos_x", "clean_right_pos_x", "clean_right_pos_y",
+                "clean_pad_back_y"):
             config.get(legacy_name, None)
         if (self.clean_pad_left_x >= self.clean_pad_right_x
-                or self.clean_pad_front_y >= self.clean_pad_back_y):
+                or self.clean_pad_front_y >= self.wastebin_y):
             raise config.error("Invalid clean pad boundaries")
-        self.wastebin_x = config.getfloat("wastebin_pos_x", 133.0)
-        self.wastebin_y = config.getfloat("wastebin_pos_y", 378.0)
         self.filament_retry_moves = _parse_retry_moves(config.get(
             "filament_retry_moves", DEFAULT_FILAMENT_RETRY_MOVES),
             config.error)
@@ -2044,7 +2047,7 @@ class Box:
             left = self.clean_pad_left_x
             right = self.clean_pad_right_x
             front = self.clean_pad_front_y
-            back = self.clean_pad_back_y
+            back = self.wastebin_y
             y_steps = max(
                 1, int(round((back - front) / CLEAN_SERPENTINE_Y_STEP)))
             center_x = (left + right) / 2.0
@@ -2068,10 +2071,7 @@ class Box:
                         x=x, y=y, velocity=self.clean_velocity)
                 self._service_move(x=center_x, velocity=self.clean_velocity)
                 self._service_move(y=back, velocity=self.clean_velocity)
-            self._service_move(
-                x=self.wastebin_x, velocity=self.clean_velocity)
-            self._service_move(
-                y=self.wastebin_y, velocity=self.travel_velocity)
+            self.move_to_wastebin()
             toolhead.wait_moves()
         finally:
             restore_motion_limits(
@@ -2121,12 +2121,21 @@ class Box:
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            self._service_move(
-                x=self.wastebin_x + 10.0, y=self.wastebin_y,
-                velocity=self.travel_velocity)
-            self._service_move(
-                x=self.wastebin_x, y=self.wastebin_y,
-                velocity=self.travel_velocity)
+            # The flapper must be struck in X. It reaches forward to about
+            # Y355 left of about X140, so stage diagonally at +15 X / -28 Y
+            # (clear at any X), climb Y in the clear X column, then make the
+            # X stroke. Already at wastebin Y, only the X stroke is needed.
+            # Like every flapper or pad contact, the stroke uses
+            # clean_velocity.
+            if abs(position[1] - self.wastebin_y) >= 1.0e-6:
+                approach_x = self.wastebin_x + 15.0
+                if abs(position[0] - approach_x) >= 1.0e-6:
+                    self._service_move(
+                        x=approach_x, y=self.wastebin_y - 28.0,
+                        velocity=self.travel_velocity)
+                self._service_move(
+                    y=self.wastebin_y, velocity=self.travel_velocity)
+            self._service_move(x=self.wastebin_x, velocity=self.clean_velocity)
         finally:
             restore_motion_limits(
                 self.gcode, "_box_wastebin_limits", include_gcode=True, move=0)
@@ -2142,15 +2151,16 @@ class Box:
             self.printer, self.gcode, "_box_filament_retry",
             include_gcode=True)
         try:
+            self.move_to_wastebin()
             self.gcode.run_script_from_command("G90")
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
-            wastebin = {"x": self.wastebin_x, "y": self.wastebin_y}
-            for move in (wastebin,) + self.filament_retry_moves + (wastebin,):
+            for move in self.filament_retry_moves:
                 self._service_move(velocity=self.travel_velocity, **move)
+            self.move_to_wastebin()
             toolhead.wait_moves()
         finally:
             restore_motion_limits(

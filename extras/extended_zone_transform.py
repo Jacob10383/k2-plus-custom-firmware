@@ -496,6 +496,16 @@ class ExtendedZoneTransform:
         self.last_position[:] = pos
         return pos
 
+    def get_status(self, eventtime=None):
+        """Expose the zone to macros"""
+        in_zone = False
+        if self.toolhead is not None:
+            in_zone = self._is_extended_y(self.toolhead.get_position()[1])
+        return {
+            "standard_y_max": self.standard_y_max,
+            "in_extended_zone": in_zone,
+        }
+
     cmd_EXTENDED_ZONE_TRANSFORM_STATUS_help = "Show extended-zone transform status"
 
     def cmd_EXTENDED_ZONE_TRANSFORM_STATUS(self, gcmd):
