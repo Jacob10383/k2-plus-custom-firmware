@@ -96,7 +96,7 @@ class SpoolmanLocationSync:
         self.ready = False
         self.running = False
         self.dirty = False
-        self.field_checked = False
+        self.field_keys = None
         self.last_result = "never run"
         self.last_changes = ()
         self.timer = self.reactor.register_timer(self._start_run)
@@ -229,19 +229,24 @@ class SpoolmanLocationSync:
     # ------------------------------------------------------------------
 
     def _ensure_field(self):
-        if self.field_checked:
-            return
+        """Return the defined spool extra-field keys, creating ours if
+        missing. Cached until a sync fails, so a field deleted in Spoolman
+        is recreated on the next retry."""
+        if self.field_keys is not None:
+            return self.field_keys
         fields = _spoolman_request("GET", "/v1/field/spool") or []
-        if not any(isinstance(field, dict)
-                   and field.get("key") == self.slot_field
-                   for field in fields):
+        keys = {field.get("key") for field in fields
+                if isinstance(field, dict)}
+        if self.slot_field not in keys:
             _spoolman_request(
                 "POST", "/v1/field/spool/%s" % self.slot_field,
                 {"name": self.slot_field_name, "field_type": "text"})
             _klog("created spool extra field %s", self.slot_field)
-        self.field_checked = True
+            keys.add(self.slot_field)
+        self.field_keys = frozenset(keys)
+        return self.field_keys
 
-    def _plan(self, spools, desired, owned):
+    def _plan(self, spools, desired, owned, field_keys):
         """Return ``[(spool_id, patch, description)]`` for every change."""
         changes = []
         seen = set()
@@ -254,15 +259,17 @@ class SpoolmanLocationSync:
                 continue
             seen.add(spool_id)
             extra = spool.get("extra")
-            extra = dict(extra) if isinstance(extra, dict) else {}
+            extra = extra if isinstance(extra, dict) else {}
             current_label = _decode_extra(extra.get(self.slot_field))
+            # PATCH replaces all extra values and Spoolman rejects keys of
+            # deleted fields, so resend only values of defined fields.
+            extra = {key: value for key, value in extra.items()
+                     if key in field_keys}
             current_location = (spool.get("location") or "").strip()
             if spool_id in desired:
                 label, location, display = desired[spool_id]
                 if current_label == label and current_location == location:
                     continue
-                # Resend the other extra keys so both merge and replace
-                # semantics of PATCH leave them intact.
                 extra[self.slot_field] = json.dumps(label)
                 changes.append((
                     spool_id, {"location": location, "extra": extra},
@@ -290,11 +297,12 @@ class SpoolmanLocationSync:
         failures = []
         missing = []
         try:
-            self._ensure_field()
+            field_keys = self._ensure_field()
             spools = _spoolman_request("GET", "/v1/spool")
             if not isinstance(spools, list):
                 raise SpoolmanError("GET /v1/spool returned no list")
-            changes, missing = self._plan(spools, desired, owned)
+            changes, missing = self._plan(
+                spools, desired, owned, field_keys)
             for spool_id, patch, description in changes:
                 try:
                     _spoolman_request("PATCH", "/v1/spool/%d" % spool_id, patch)
@@ -318,6 +326,7 @@ class SpoolmanLocationSync:
                       "(deleted or archived?)" % spool_id)
         self.last_changes = tuple(applied)
         if error:
+            self.field_keys = None
             self.last_result = "failed: %s" % error
             _klog("sync failed: %s", error, level=logging.warning)
             self.dirty = True
@@ -341,7 +350,7 @@ class SpoolmanLocationSync:
                 "spoolman_location_sync: True in [box]")
         if not self.ready:
             raise gcmd.error("[BOX]: CFS is not ready yet")
-        self.field_checked = False
+        self.field_keys = None
         self.request(delay=0.0)
         gcmd.respond_info("[BOX]: Spoolman location sync queued")
 
