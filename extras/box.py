@@ -20,6 +20,7 @@ from extras.box_addr import ADDRESS_WEDGE_WARNING, MAX_ADDRESSES, AutoAddressMan
 from extras.box_change import BoxChangeEngine
 from extras.box_gcode import read_metadata
 from extras.box_catalog import resolve_material
+from extras.box_spoolman import SpoolmanLocationSync
 from extras.motion_limits import restore_motion_limits, save_motion_limits
 
 
@@ -493,6 +494,7 @@ class Box:
         self.last_topology_refresh = 0.0
         self.spoolman_generation = 0
         self.spoolman_tokens = {}
+        self.spoolman_pending = {}
         self.clog_event_count = 0
         self.clog_baseline = None
         self.last_clog = {"extruder_mm": None, "encoder_mm": None}
@@ -505,6 +507,7 @@ class Box:
 
         self.address_manager = AutoAddressManager(self.box_count, self.store.known_addresses)
         self.change_engine = BoxChangeEngine(self, config)
+        self.spoolman_sync = SpoolmanLocationSync(self, config)
 
         self.poll_timer = self.reactor.register_timer(self._poll)
         self.enumeration_started = False
@@ -574,6 +577,10 @@ class Box:
             ("_BOX_RFID_MAP_SET", self.cmd_rfid_map_set, "Save an RFID mapping"),
             ("_BOX_RFID_MAP_DELETE", self.cmd_rfid_map_delete,
              "Delete an RFID mapping"),
+            ("BOX_SPOOLMAN_SYNC", self.spoolman_sync.cmd_sync,
+             "Reconcile Spoolman spool locations with the CFS"),
+            ("BOX_SPOOLMAN_SYNC_STATUS", self.spoolman_sync.cmd_status,
+             "Show Spoolman location sync state"),
         )
         for name, handler, description in commands:
             if name in SAFE_WIDGET_COMMANDS:
@@ -621,6 +628,7 @@ class Box:
         self._initialize_rfid()
         self._register_t_commands()
         self.printer.send_event("box:ready")
+        self.spoolman_sync.start()
         if self.klippy_ready:
             self.reactor.update_timer(
                 self.poll_timer, self.reactor.monotonic() + POLL_START_DELAY)
@@ -710,6 +718,8 @@ class Box:
         self._invalidate_tracking_session()
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
+        self.spoolman_pending.clear()
+        self.spoolman_sync.stop()
         self.serial = None
         self.reactor.update_timer(self.poll_timer, self.reactor.NEVER)
 
@@ -746,6 +756,7 @@ class Box:
             "load_path": self._load_path_status(snap),
             "recovery": self.change_engine.recovery_status(),
             "driver_ready": self.drivers_ready,
+            "spoolman_location_sync": self.spoolman_sync.get_status(),
         }
 
     def _slot_statuses(self, snap):
@@ -833,9 +844,24 @@ class Box:
 
     def set_profile(self, slot, profile):
         self.store.set_profile(self._runtime_slot_key(slot), profile)
+        self._request_spoolman_sync(slot)
 
     def clear_profile(self, slot):
         self.store.clear_profile(self._runtime_slot_key(slot))
+        self._request_spoolman_sync(slot)
+
+    def _request_spoolman_sync(self, slot):
+        if self._runtime_slot_key(slot) != EXTERNAL_PROFILE_KEY:
+            self.spoolman_sync.request()
+
+    def slot_identity_pending(self, slot):
+        """True while an RFID read or Spoolman lookup may still replace
+        this slot's profile."""
+        if slot in self.rfid_pending:
+            return True
+        slot_key = self._runtime_slot_key(slot)
+        token = self.spoolman_pending.get(slot_key)
+        return token is not None and token == self.spoolman_tokens.get(slot_key)
 
     def _runtime_slot_key(self, slot):
         if slot == EXTERNAL_PROFILE_KEY or slot == self.external_slot:
@@ -1423,12 +1449,14 @@ class Box:
         if self.rfid_insert_reading_enabled:
             self.rfid_pending.add(slot)
             self._snapshot_rfid_cache(slot)
+        self.spoolman_sync.request()
 
     def _rfid_removed(self, slot):
         self._clear_rfid_watch(slot)
         self.rfid_live_slots.discard(slot)
         self.rfid_percent.pop(slot, None)
         self._invalidate_spoolman(slot)
+        self.spoolman_sync.request()
 
     def _reconcile_presence(self, address, current):
         current &= 0x0F
@@ -1783,6 +1811,7 @@ class Box:
         display_slot = self._runtime_slot(slot_key)
         token = self.spoolman_tokens.get(slot_key, 0) + 1
         self.spoolman_tokens[slot_key] = token
+        self.spoolman_pending[slot_key] = token
         generation = self.spoolman_generation
         self._info(
             self.gcode, "%s: fetching Spoolman ID %d"
@@ -1795,6 +1824,11 @@ class Box:
                 spool = None
 
             def complete(eventtime):
+                if self.spoolman_pending.get(slot_key) == token:
+                    del self.spoolman_pending[slot_key]
+                    # A failed lookup may not touch the profile, so wake
+                    # location sync explicitly once the slot settles.
+                    self._request_spoolman_sync(slot_key)
                 if (generation != self.spoolman_generation
                         or self.spoolman_tokens.get(slot_key) != token):
                     self._info(

@@ -44,6 +44,8 @@ Klipper and Cartographer commands remain in their own documentation.
 | `_BOX_SET_RFID_STARTUP_READING [ENABLE=0\|1]` | Enables or disables RFID reads during CFS startup. |
 | `_BOX_RFID_MAP_SET CODE= MATERIAL= BRAND= NAME= [TARGET_TEMP=]` | Saves an unknown-tag mapping. |
 | `_BOX_RFID_MAP_DELETE CODE=` | Deletes an RFID mapping. |
+| `BOX_SPOOLMAN_SYNC` | Reconciles Spoolman spool locations and CFS slot fields with the CFS now. Requires `spoolman_location_sync: True`. |
+| `BOX_SPOOLMAN_SYNC_STATUS` | Shows Spoolman location sync settings, state, and the last changes made. |
 
 ## Probe commands
 

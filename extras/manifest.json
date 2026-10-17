@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "481b530f92096827e8f74fa6e26b92a6d29093d6a9026bd4a6afdf6ff6f3ead3",
-      "size": 131061
+      "sha256": "208ce90c97fcecd9480ea97debe8581fb13cc857eaa05efd28148cb0ba7516c8",
+      "size": 132712
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -27,6 +27,10 @@
     "box_protocol.py": {
       "sha256": "4f5f928c964db5454fb74cdb1a109c2c50c50f6b727915416bab515a594f8157",
       "size": 25140
+    },
+    "box_spoolman.py": {
+      "sha256": "47e4126439a9a5039549094f7f64268336f0b4a02965000066ad785419faa90b",
+      "size": 14806
     },
     "cartographer.py": {
       "sha256": "ac787fe282f4dc2e64b3ebc4454332c4fd50ffdc0597d9e3935d6072e9572a2a",
