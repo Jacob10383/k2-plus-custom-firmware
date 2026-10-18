@@ -52,7 +52,9 @@ holder is not tracked.
 
 A slot's spool is only known after an RFID read or **Select spool**. With
 **Read RFID on insertion** off, a newly inserted spool keeps the previous
-slot's spool until you select the new one.
+slot's spool until you select the new one. With it on, the slot is skipped
+while its tag is being read; if no valid read arrives within 60 seconds (an
+unreadable or missing tag), the slot's current spool is used.
 
 All names and the removal behavior are configurable; see
 [Config reference](config-reference.md#cfs-box). `BOX_SPOOLMAN_SYNC` forces a

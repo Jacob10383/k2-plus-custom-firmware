@@ -53,6 +53,9 @@ ACTIVE_POLL = 1.0
 IDLE_POLL = 5.0
 TOPOLOGY_POLL = 15.0
 RFID_REFRESH = 30.0
+# After this long without a valid RFID read, location sync stops waiting for
+# one and uses the slot's current profile; a failed read never completes.
+RFID_PENDING_SYNC_GRACE = 60.0
 ERROR_BACKOFF = 10.0
 # Consecutive missed state reads before a CFS reports offline; one dropped
 # RS-485 frame must not flicker a box offline or hide its slots.
@@ -538,6 +541,7 @@ class Box:
         self.unknown_rfid = {}
         self.rfid_presence = {}
         self.rfid_pending = set()
+        self.rfid_pending_since = {}
         self.rfid_snapshot = {}
         self.rfid_seen_invalid = set()
         self.rfid_live_slots = set()
@@ -985,7 +989,10 @@ class Box:
         """True while an RFID read or Spoolman lookup may still replace
         this slot's profile."""
         if slot in self.rfid_pending:
-            return True
+            since = self.rfid_pending_since.get(slot)
+            if (since is not None and self.reactor.monotonic() - since
+                    < RFID_PENDING_SYNC_GRACE):
+                return True
         slot_key = self._runtime_slot_key(slot)
         token = self.spoolman_pending.get(slot_key)
         return token is not None and token == self.spoolman_tokens.get(slot_key)
@@ -1428,6 +1435,7 @@ class Box:
         self.store.set_setting("rfid_insert_reading_enabled", enabled)
         if not enabled:
             self.rfid_pending.clear()
+            self.rfid_pending_since.clear()
             self.rfid_snapshot.clear()
             self.rfid_seen_invalid.clear()
         for driver in self.drivers.values():
@@ -1557,6 +1565,7 @@ class Box:
 
     def _clear_rfid_watch(self, slot):
         self.rfid_pending.discard(slot)
+        self.rfid_pending_since.pop(slot, None)
         self.rfid_snapshot.pop(slot, None)
         self.rfid_seen_invalid.discard(slot)
 
@@ -1578,8 +1587,14 @@ class Box:
         self.rfid_snapshot.pop(slot, None)
         self.rfid_seen_invalid.discard(slot)
         if self.rfid_insert_reading_enabled:
+            now = self.reactor.monotonic()
             self.rfid_pending.add(slot)
+            self.rfid_pending_since[slot] = now
             self._snapshot_rfid_cache(slot)
+            # Re-run sync once the grace ends in case the read never completes.
+            self.reactor.register_callback(
+                lambda eventtime: self.spoolman_sync.request(),
+                now + RFID_PENDING_SYNC_GRACE + 0.5)
         self.spoolman_sync.request()
 
     def _rfid_removed(self, slot):
