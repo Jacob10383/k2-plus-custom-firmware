@@ -1551,6 +1551,11 @@ class PowerLossRecovery:
         loaded = False
         try:
             path = self._validate_snapshot(snapshot)
+            box = self.printer.lookup_object("box", None)
+            if box is not None:
+                # The recovered job keeps its checkpoint map, not one set
+                # for the next new print.
+                box.discard_next_print_map()
             self.v_sd._reset_file()
             self.v_sd._load_file(
                 gcmd, snapshot["file"]["path"], check_subdirs=True)

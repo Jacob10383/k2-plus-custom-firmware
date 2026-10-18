@@ -29,7 +29,9 @@ EXTERNAL_PROFILE_KEY = "external"
 # docs/box-status-api.md in the firmware repo). API_VERSION changes only on a
 # break clients must handle; API_REVISION on every additive schema change.
 API_VERSION = 1
-API_REVISION = 2
+API_REVISION = 3
+# A BOX_PRINT_MAP map is dropped if no print file loads within this time.
+NEXT_PRINT_MAP_TIMEOUT = 600.0
 SAFE_WIDGET_COMMANDS = frozenset((
     "_BOX_SLOT_SET",
     "_BOX_SLOT_CLEAR",
@@ -565,6 +567,7 @@ class Box:
         self.klippy_ready = False
         self.registered_tools = set()
         self.print_info = None
+        self.next_print_map = None
         self._register_commands()
         self.printer.register_event_handler("serial_485:ready", self._serial_ready)
         self.printer.register_event_handler("klippy:ready", self._klippy_ready)
@@ -585,6 +588,9 @@ class Box:
                 event, self.change_engine.reset_print_recovery)
             self.printer.register_event_handler(
                 event, self._reset_runout_defer)
+        # After reset_print_recovery, which clears the previous job's map.
+        self.printer.register_event_handler(
+            "virtual_sdcard:load_file", self._apply_next_print_map)
 
     # ------------------------------------------------------------------
     # Lifecycle and public status
@@ -594,6 +600,8 @@ class Box:
         commands = (
             ("BOX_PRINT_INFO", self.cmd_print_info, "Inspect tools used by a print"),
             ("BOX_PRINT_START", self.cmd_print_start, "Start a print with a tool map"),
+            ("BOX_PRINT_MAP", self.cmd_print_map,
+             "Set the tool map for the next print start"),
             ("BOX_SELECT_SLOT", self.cmd_select_slot,
              "Switch to SLOT (unload, load, purge), ignoring the print's tool map"),
             ("BOX_LOAD", self.cmd_load,
@@ -770,6 +778,7 @@ class Box:
 
     def _disconnect(self, *args):
         self.change_engine.reset_print_mapping()
+        self.next_print_map = None
         self._invalidate_tracking_session()
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
@@ -1223,11 +1232,7 @@ class Box:
     def cmd_print_info(self, gcmd):
         self._inspect_print(gcmd, self._print_idle(gcmd))
 
-    def cmd_print_start(self, gcmd):
-        sd = self._print_idle(gcmd)
-        info = self._inspect_print(gcmd, sd)
-        if not info["tools"]:
-            raise gcmd.error("[BOX]: No filament usage metadata; start this file normally")
+    def _parse_print_map(self, gcmd):
         try:
             mapping = {}
             for entry in gcmd.get("MAP", "").split(","):
@@ -1240,23 +1245,42 @@ class Box:
                 mapping[tool] = slot
         except ValueError:
             raise gcmd.error("[BOX]: MAP must contain unique tool:slot pairs, e.g. 2:0,3:1")
-        used = {item["tool"] for item in info["tools"]}
+        return mapping
+
+    def _used_tools(self, error, tools):
+        if not tools:
+            raise error("[BOX]: No filament usage metadata; start this file normally")
+        return {item["tool"] for item in tools}
+
+    def _check_map_tools(self, error, used, mapping):
         if set(mapping) != used:
-            raise gcmd.error("[BOX]: Map every tool used by this file: %s" %
-                             ", ".join("T%d" % tool for tool in sorted(used)))
+            raise error("[BOX]: Map every tool used by this file: %s" %
+                        ", ".join("T%d" % tool for tool in sorted(used)))
+
+    def _check_print_targets(self, error, mapping):
         if not self.drivers_ready:
-            raise gcmd.error("[BOX]: Filament slots are not ready")
+            raise error("[BOX]: Filament slots are not ready")
         try:
             live = self.read_live_state()
         except Exception as exc:
-            raise gcmd.error("[BOX]: Unable to read CFS state: %s" % exc)
+            raise error("[BOX]: Unable to read CFS state: %s" % exc)
         for slot in mapping.values():
             if not self.is_valid_slot(slot) or (
                     self.is_physical_slot(slot)
                     and not self._box_online(self._address_slot(slot)[0])):
-                raise gcmd.error("[BOX]: %s is offline" % self.slot_label(slot))
+                raise error("[BOX]: %s is offline" % self.slot_label(slot))
             if self.is_physical_slot(slot) and not live.slot_mask & (1 << slot):
-                raise gcmd.error("[BOX]: %s has no filament" % self.slot_label(slot))
+                raise error("[BOX]: %s has no filament" % self.slot_label(slot))
+
+    def cmd_print_start(self, gcmd):
+        # A map from BOX_PRINT_MAP that no print used yet is replaced, not merged.
+        self.next_print_map = None
+        sd = self._print_idle(gcmd)
+        info = self._inspect_print(gcmd, sd)
+        used = self._used_tools(gcmd.error, info["tools"])
+        mapping = self._parse_print_map(gcmd)
+        self._check_map_tools(gcmd.error, used, mapping)
+        self._check_print_targets(gcmd.error, mapping)
         try:
             self._register_tools(used)
         except Exception as exc:
@@ -1276,6 +1300,50 @@ class Box:
             # Any other exception from a G-code handler shuts Klipper down.
             raise gcmd.error("[BOX]: Unable to start %s: %s"
                              % (info["filename"], exc))
+
+    def cmd_print_map(self, gcmd):
+        self._print_idle(gcmd)
+        mapping = self._parse_print_map(gcmd)
+        if not mapping:
+            raise gcmd.error("[BOX]: MAP must contain unique tool:slot pairs, e.g. 2:0,3:1")
+        self._check_print_targets(gcmd.error, mapping)
+        self.next_print_map = (
+            mapping, self.reactor.monotonic() + NEXT_PRINT_MAP_TIMEOUT)
+        self._info(gcmd, "Tool map set for the next print")
+
+    def discard_next_print_map(self):
+        self.next_print_map = None
+
+    def _apply_next_print_map(self, *args):
+        """Install a BOX_PRINT_MAP map on the file the next print loaded.
+
+        Runs inside the start command, so raising refuses the print before
+        Virtual SD schedules its first line. The map is used once either way.
+        """
+        pending, self.next_print_map = self.next_print_map, None
+        if pending is None:
+            return
+        mapping, expires = pending
+        if self.reactor.monotonic() > expires:
+            _klog("dropped a BOX_PRINT_MAP map no print used")
+            return
+        sd = self.printer.lookup_object("virtual_sdcard")
+        path = sd.current_file.name
+        filename = os.path.relpath(path, sd.sdcard_dirname)
+        error = self.gcode.error
+        try:
+            used = self._used_tools(error, read_metadata(path)["tools"])
+            self._check_map_tools(error, used, mapping)
+            self._check_print_targets(error, mapping)
+            self._register_tools(used)
+            self.change_engine.tool_map = mapping
+            self.change_engine.mapping_filename = filename
+        except Exception as exc:
+            sd._reset_file()
+            if isinstance(exc, error):
+                raise
+            # Any other exception from a G-code handler shuts Klipper down.
+            raise error("[BOX]: Unable to start %s: %s" % (filename, exc))
 
     def cmd_select_slot(self, gcmd):
         self.change_engine.change(

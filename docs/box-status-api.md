@@ -1,8 +1,9 @@
-# Box status API
+# Box client API
 
-`printer.box` is the Moonraker status object for the CFS boxes. This file is
-the contract for every client that reads it. It ships with the firmware as
-`docs/box-status-api.md`, next to the `extras/box.py` that produces it.
+`printer.box` (the Moonraker status object for the CFS boxes) and the Box
+commands clients send. This file is the contract for every client that uses
+them. It ships with the firmware as `docs/box-status-api.md`, next to the
+`extras/box.py` that implements it.
 
 ## Versioning
 
@@ -17,6 +18,7 @@ Both cover the whole object, print mapping included.
 |---|---|
 | 1 | The original schema. `api_revision` is absent; treat a missing value as `1`. Print mapping (`print_info`, `print_mapping`, `BOX_PRINT_INFO`, `BOX_PRINT_START`, `BOX_SELECT_SLOT`) arrived partway through and is present when `print_mapping_version == 1`. |
 | 2 | Print mapping is always present. Adds `api_revision`, `boxes[]`, `load_path.buffer.state`. Top-level `status`/`state`, `temp_c`/`humidity_pct`, `load_path.buffer.state_code`, and `print_mapping_version` become legacy. Removes `fluidd_widget_version`, `loaded_mask`, `slot_filament_mask`, `tracking_active`, `load_path.loaded_slot`, `load_path.loaded_mask`, `load_path.slot_filament_mask`, `load_path.buffer.status_code`, `load_path.buffer.active`. |
+| 3 | Adds `BOX_PRINT_MAP`. |
 
 ## Clients
 
@@ -34,10 +36,9 @@ gap. The external spool is the last physical slot + 1, so it moves when boxes
 are added.
 
 `slots[]` is the flat list of these numbers; `SLOT=` and the slot side of
-`MAP=` use them. `T<n>` loads slot `n`, except during a print started with
-`BOX_PRINT_START MAP=`, where it is the file's tool `n` and loads its mapped
-slot. `boxes[]` has one entry per discovered CFS. Join on `address`, never
-array position:
+`MAP=` use them. `T<n>` loads slot `n`, except during a mapped print (see
+[Print mapping](#print-mapping)). `boxes[]` has one entry per discovered CFS.
+Join on `address`, never array position:
 
 | Field | Meaning |
 |---|---|
@@ -70,6 +71,23 @@ nothing is loaded.
 
 `data_ready` is `false` before the first poll and while the box feeding the
 path is not answering.
+
+## Print mapping
+
+A map sends each tool the file uses to a slot: `MAP=<tool>:<slot>,...`, for
+example `MAP=0:4,1:2`. It must list every tool the file uses, including tools
+left on their own slot, and nothing else. `BOX_PRINT_INFO FILENAME=` puts that
+list in `print_info.tools`.
+
+| Command | Effect |
+|---|---|
+| `BOX_PRINT_START FILENAME= MAP=` | Checks the map against the file and starts it. |
+| `BOX_PRINT_MAP MAP=` | Revision 3. Checks the slots and keeps the map for the next print, however it is started. That start checks the map against its file and is refused if they disagree. The next print file loaded within 10 minutes uses it once; after that it is dropped. `BOX_PRINT_START` and power-loss recovery discard it. |
+
+Starting needs every mapped slot online and, except the external spool, loaded
+with filament. During a mapped print `print_mapping.map` holds the map, `T<n>`
+loads the slot mapped to tool `n`, and `BOX_SELECT_SLOT SLOT=` loads a slot
+directly. The map is cleared when the print ends, errors, or is cancelled.
 
 ## Legacy fields
 

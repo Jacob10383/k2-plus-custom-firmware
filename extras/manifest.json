@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "d379f1e0fe29186eacd6862db95face9f57a85f993ff21d9987294729036693f",
-      "size": 140504
+      "sha256": "67edbb3cede4b7a4b265baefcd61d268c6387ab9ff596667225bf97e219b0c35",
+      "size": 143361
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -69,8 +69,8 @@
       "size": 147204
     },
     "power_loss_recovery.py": {
-      "sha256": "83197bee3e8eb096e677c20f8f3a903a7da3e66df0604897fc1c7e6430baa7ea",
-      "size": 74784
+      "sha256": "cfc56e57042110da1b538d49ad5cae8ebb7ea33906074469705dded2eec541b3",
+      "size": 75035
     },
     "prtouch.py": {
       "sha256": "c7f3204cc74a3cde8472b4adb552d9ca8907918819ce1ac3ca60b56c333e2cb6",
