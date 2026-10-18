@@ -29,7 +29,7 @@ EXTERNAL_PROFILE_KEY = "external"
 # docs/box-status-api.md in the firmware repo). API_VERSION changes only on a
 # break clients must handle; API_REVISION on every additive schema change.
 API_VERSION = 1
-API_REVISION = 3
+API_REVISION = 4
 # A BOX_PRINT_MAP map is dropped if no print file loads within this time.
 NEXT_PRINT_MAP_TIMEOUT = 600.0
 SAFE_WIDGET_COMMANDS = frozenset((
@@ -1302,10 +1302,12 @@ class Box:
                              % (info["filename"], exc))
 
     def cmd_print_map(self, gcmd):
-        self._print_idle(gcmd)
         mapping = self._parse_print_map(gcmd)
         if not mapping:
-            raise gcmd.error("[BOX]: MAP must contain unique tool:slot pairs, e.g. 2:0,3:1")
+            # An empty MAP clears a map an earlier start never used.
+            self.discard_next_print_map()
+            return
+        self._print_idle(gcmd)
         self._check_print_targets(gcmd.error, mapping)
         self.next_print_map = (
             mapping, self.reactor.monotonic() + NEXT_PRINT_MAP_TIMEOUT)

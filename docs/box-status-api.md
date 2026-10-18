@@ -19,6 +19,7 @@ Both cover the whole object, print mapping included.
 | 1 | The original schema. `api_revision` is absent; treat a missing value as `1`. Print mapping (`print_info`, `print_mapping`, `BOX_PRINT_INFO`, `BOX_PRINT_START`, `BOX_SELECT_SLOT`) arrived partway through and is present when `print_mapping_version == 1`. |
 | 2 | Print mapping is always present. Adds `api_revision`, `boxes[]`, `load_path.buffer.state`. Top-level `status`/`state`, `temp_c`/`humidity_pct`, `load_path.buffer.state_code`, and `print_mapping_version` become legacy. Removes `fluidd_widget_version`, `loaded_mask`, `slot_filament_mask`, `tracking_active`, `load_path.loaded_slot`, `load_path.loaded_mask`, `load_path.slot_filament_mask`, `load_path.buffer.status_code`, `load_path.buffer.active`. |
 | 3 | Adds `BOX_PRINT_MAP`. |
+| 4 | `BOX_PRINT_MAP` with an empty `MAP=` clears a stored map. |
 
 ## Clients
 
@@ -82,7 +83,7 @@ list in `print_info.tools`.
 | Command | Effect |
 |---|---|
 | `BOX_PRINT_START FILENAME= MAP=` | Checks the map against the file and starts it. |
-| `BOX_PRINT_MAP MAP=` | Revision 3. Checks the slots and keeps the map for the next print, however it is started. That start checks the map against its file and is refused if they disagree. The next print file loaded within 10 minutes uses it once; after that it is dropped. `BOX_PRINT_START` and power-loss recovery discard it. |
+| `BOX_PRINT_MAP MAP=` | Revision 3. Checks the slots and keeps the map for the next print, however it is started. That start checks the map against its file and is refused if they disagree. The next print file loaded within 10 minutes uses it once; after that it is dropped. `BOX_PRINT_START` and power-loss recovery discard it, and from revision 4 so does an empty `MAP=`. |
 
 Starting needs every mapped slot online and, except the external spool, loaded
 with filament. During a mapped print `print_mapping.map` holds the map, `T<n>`
