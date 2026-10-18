@@ -53,8 +53,9 @@ ACTIVE_POLL = 1.0
 IDLE_POLL = 5.0
 TOPOLOGY_POLL = 15.0
 RFID_REFRESH = 30.0
-# After this long without a valid RFID read, location sync stops waiting for
-# one and uses the slot's current profile; a failed read never completes.
+# After this long without RFID read progress on its CFS, location sync stops
+# waiting for a slot's read and uses its current profile; a failed read never
+# completes. Reads are sequential, so each completed read restarts the wait.
 RFID_PENDING_SYNC_GRACE = 60.0
 ERROR_BACKOFF = 10.0
 # Consecutive missed state reads before a CFS reports offline; one dropped
@@ -1587,15 +1588,25 @@ class Box:
         self.rfid_snapshot.pop(slot, None)
         self.rfid_seen_invalid.discard(slot)
         if self.rfid_insert_reading_enabled:
-            now = self.reactor.monotonic()
             self.rfid_pending.add(slot)
-            self.rfid_pending_since[slot] = now
+            self._arm_rfid_pending_grace(slot)
             self._snapshot_rfid_cache(slot)
-            # Re-run sync once the grace ends in case the read never completes.
-            self.reactor.register_callback(
-                lambda eventtime: self.spoolman_sync.request(),
-                now + RFID_PENDING_SYNC_GRACE + 0.5)
         self.spoolman_sync.request()
+
+    def _arm_rfid_pending_grace(self, slot):
+        now = self.reactor.monotonic()
+        self.rfid_pending_since[slot] = now
+        # Re-run sync once the grace ends in case the read never completes.
+        self.reactor.register_callback(
+            lambda eventtime: self.spoolman_sync.request(),
+            now + RFID_PENDING_SYNC_GRACE + 0.5)
+
+    def _rfid_read_progress(self, slot):
+        """A read finished, so the CFS is working through its queue."""
+        address, _local = self._address_slot(slot)
+        for other in self._pending_rfid_slots(address):
+            if other != slot:
+                self._arm_rfid_pending_grace(other)
 
     def _rfid_removed(self, slot):
         self._clear_rfid_watch(slot)
@@ -1885,6 +1896,7 @@ class Box:
         if not self._rfid_should_apply(slot, sample):
             return "stale"
         self._clear_rfid_watch(slot)
+        self._rfid_read_progress(slot)
         if not self._apply_rfid_record(slot, record, fields):
             self.rfid_live_slots.discard(slot)
             self.rfid_percent.pop(slot, None)
@@ -1919,6 +1931,7 @@ class Box:
                 self.rfid_live_slots.add(slot)
                 self._read_rfid_remaining(slot)
             self._clear_rfid_watch(slot)
+            self._rfid_read_progress(slot)
         return applied
 
     def _refresh_rfid_remaining(self):
