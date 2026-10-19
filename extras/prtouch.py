@@ -1090,7 +1090,7 @@ class PRTouchEndstopWrapper:
 def load_config(config):
     prtouch = PRTouchEndstopWrapper(config)
     if prtouch.register_as_probe:
+        # PrinterProbe registers itself as "probe" via ProbeList.
         pprobe = _PRTouchPrinterProbe(config, prtouch)
-        config.get_printer().add_object('probe', pprobe)
         prtouch._printer_probe = pprobe
     return prtouch

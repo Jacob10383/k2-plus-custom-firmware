@@ -117,7 +117,6 @@ SNAP_RETRACT_MM = 1.2
 
 CUT_SAFE_Z = 2.0
 CUT_LIMIT_VELOCITY = 800
-CUT_LIMIT_ACCEL = 7500
 CUT_LIMIT_CRUISE = 1.0 / 3.0
 CUT_LIMIT_SCV = 10
 CUT_RETURN_WAIT = 3.0
@@ -504,6 +503,7 @@ class Box:
         self.cut_y = config.getfloat("cut_pos_y", 200.0)
         self.cut_velocity = config.getfloat(
             "cut_velocity", 30000.0, above=0.0)
+        self.cut_accel = config.getfloat("cut_accel", 7500.0, above=0.0)
         self.retract_velocity = config.getfloat(
             "retract_velocity", 3000.0, above=0.0)
         self.external_feed_velocity = config.getfloat(
@@ -2353,9 +2353,9 @@ class Box:
             self._set_cut_x_limit(toolhead, min(old_position_min, self.cut_x - 5.0))
             self.gcode.run_script_from_command("G90")
             self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
+                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%g "
                 "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
-                % (CUT_LIMIT_VELOCITY, CUT_LIMIT_ACCEL,
+                % (CUT_LIMIT_VELOCITY, self.cut_accel,
                    CUT_LIMIT_CRUISE, CUT_LIMIT_SCV))
             self._service_move(
                 x=self.pre_cut_x, y=self.cut_y, velocity=self.travel_velocity)

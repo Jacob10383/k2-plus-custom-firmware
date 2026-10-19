@@ -230,14 +230,6 @@ def preflight_bootstrap(*, replace: list[str] | None) -> None:
             )
 
 
-def preflight_update_extras() -> None:
-    require_root()
-    require_udisk()
-    extras_dir = ROOT / "klipper" / "klippy" / "extras"
-    if not extras_dir.is_dir():
-        raise SystemExit(f"missing existing Klipper extras directory: {extras_dir}")
-
-
 def clone_repo(url: str, dest: Path, *, branch: str | None, replace: bool) -> bool:
     if dest.exists() and not replace:
         log(f"{dest.name} already exists; skipping clone")
@@ -382,28 +374,6 @@ def fetch_json(url: str):
         raise SystemExit(f"failed to fetch {url}: {exc}") from exc
 
 
-def fetch_json_sha256(url: str, expected_sha256: str):
-    def attempt():
-        with urllib.request.urlopen(url, timeout=60) as response:
-            return response.read()
-
-    try:
-        data = retry_network(f"fetching {url}", attempt)
-    except Exception as exc:
-        raise SystemExit(f"failed to fetch {url}: {exc}") from exc
-
-    actual = hashlib.sha256(data).hexdigest()
-    if actual != expected_sha256:
-        raise SystemExit(
-            f"{url} checksum mismatch: expected {expected_sha256}, got {actual}"
-        )
-
-    try:
-        return json.loads(data.decode())
-    except Exception as exc:
-        raise SystemExit(f"{url} did not contain valid JSON: {exc}") from exc
-
-
 def fetch_release_index() -> dict:
     index = fetch_json(RELEASE_INDEX_URL)
     if not isinstance(index, dict):
@@ -427,8 +397,8 @@ def release_index_file_sha256(index: dict, key: str) -> str:
     return digest
 
 
-def install_bootstrap_update(index: dict | None = None) -> bool:
-    index = index or fetch_release_index()
+def install_bootstrap_update() -> bool:
+    index = fetch_release_index()
     digest = release_index_file_sha256(index, "bootstrap")
     if BOOTSTRAP_INSTALL_PATH.is_file() and file_sha256(BOOTSTRAP_INSTALL_PATH) == digest:
         log("bootstrap already current")
@@ -721,58 +691,6 @@ def install_timelapse() -> None:
     log(f"wrote {dest}")
 
 
-def install_kalico_extras(index: dict | None = None) -> list[Path]:
-    extras_dir = ROOT / "klipper" / "klippy" / "extras"
-    extras_dir.mkdir(parents=True, exist_ok=True)
-
-    index = index or fetch_release_index()
-    extras = index.get("extras")
-    if not isinstance(extras, dict):
-        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain an extras object")
-    manifest_sha256 = extras.get("manifest_sha256")
-    if (
-        not isinstance(manifest_sha256, str)
-        or len(manifest_sha256) != 64
-        or any(c not in "0123456789abcdef" for c in manifest_sha256)
-    ):
-        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a valid extras manifest SHA256")
-
-    manifest_url = object_url(manifest_sha256)
-    manifest = fetch_json_sha256(manifest_url, manifest_sha256)
-    if not isinstance(manifest, dict):
-        raise SystemExit(f"{manifest_url} did not contain an object")
-    if manifest.get("format") != "k2-extras-sha256-v1" or manifest.get("version") != FIRMWARE_VERSION:
-        raise SystemExit(f"{manifest_url} has an unsupported extras manifest format")
-    files = manifest.get("files")
-    if not isinstance(files, dict):
-        raise SystemExit(f"{manifest_url} did not contain a files object")
-
-    changed = []
-    for name, meta in sorted(files.items()):
-        if (
-            not isinstance(name, str)
-            or "/" in name
-            or name.startswith(".")
-            or not isinstance(meta, dict)
-            or not isinstance(meta.get("sha256"), str)
-        ):
-            raise SystemExit(f"{manifest_url} contains invalid file metadata")
-        digest = meta["sha256"]
-        dest = extras_dir / name
-        if dest.is_file() and file_sha256(dest) == digest:
-            log(f"{name} already current")
-            continue
-        log(f"installing {name}" if not dest.exists() else f"updating {name}")
-        download_sha256(
-            object_url(digest),
-            dest,
-            digest,
-        )
-        changed.append(dest)
-    return changed
-
-
-
 def verify_cartographer_package() -> None:
     python = ROOT / "klippy-env" / "bin" / "python"
     klipper_path = str(ROOT / "klipper")
@@ -1051,8 +969,8 @@ def main() -> None:
         "--update",
         nargs="*",
         metavar="TARGET",
-        choices=["bootstrap", "extras", "configs"],
-        help="update bootstrap, R2-managed Kalico extras, and/or k2 configs (configs keep SAVE_CONFIG, overrides.cfg, extra files, and probe mode)",
+        choices=["bootstrap", "configs"],
+        help="update bootstrap and/or k2 configs (configs keep SAVE_CONFIG, overrides.cfg, extra files, and probe mode); Kalico extras update with Klipper",
     )
     mode.add_argument(
         "--set-timezone",
@@ -1112,31 +1030,18 @@ def main() -> None:
 
     if args.update is not None:
         update_bootstrap = not args.update or "bootstrap" in args.update
-        update_extras = not args.update or "extras" in args.update
         update_configs = "configs" in args.update
-        index = None
         bootstrap_changed = False
-        changed = []
 
         header("K2 Update")
         if update_bootstrap:
             require_root()
-            index = fetch_release_index()
             with step("Updating bootstrap"):
-                bootstrap_changed = install_bootstrap_update(index)
-            if bootstrap_changed and (update_extras or update_configs):
+                bootstrap_changed = install_bootstrap_update()
+            if bootstrap_changed and update_configs:
                 log("Relaunching updated bootstrap...")
                 os.execv(sys.argv[0], sys.argv)
                 return
-
-        if update_extras:
-            preflight_update_extras()
-            index = index or fetch_release_index()
-            with step("Updating Kalico extras"):
-                changed = install_kalico_extras(index)
-            if changed and not update_configs:
-                with step("Restarting Klipper"):
-                    service_control("restart", ["klipper"])
 
         if update_configs:
             require_root()
@@ -1146,12 +1051,6 @@ def main() -> None:
         notes = []
         if update_bootstrap:
             notes.append("Bootstrap updated" if bootstrap_changed else "Bootstrap already current")
-        if update_extras:
-            notes.append(
-                f"Updated {len(changed)} Kalico extras file(s)"
-                if changed
-                else "Kalico extras already current"
-            )
         if update_configs:
             notes.append("Configs updated")
         success("; ".join(notes))
@@ -1175,9 +1074,6 @@ def main() -> None:
     if should_run("klipper"):
         with step("Cloning Kalico (klipper)"):
             clone_repo(KALICO_REPO, ROOT / "klipper", branch=KALICO_BRANCH, replace=should_replace("klipper"))
-
-        with step("Installing Kalico extras"):
-            install_kalico_extras()
 
     if should_run("moonraker"):
         with step("Cloning Moonraker"):

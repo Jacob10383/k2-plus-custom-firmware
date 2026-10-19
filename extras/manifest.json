@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "5bf7dbb7ac5fe8f3f51579ed70d97d9a22013a025c57e99d8cb91a78817fc5a6",
-      "size": 143398
+      "sha256": "358b6a99a6094e298dea5cb5f6cb6ea4129fd25159163f67acb869b8eed375a5",
+      "size": 143447
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -61,20 +61,20 @@
       "size": 3496
     },
     "motor_control.py": {
-      "sha256": "f38b9cc8dfbad3a13eb1a0e389b0b03564ec6775876f195adcbb60ee8f95baaa",
-      "size": 186554
+      "sha256": "0a900dd3ca42d009db2320407b0d45517d108f79cc7b4370f8756b70c9850c22",
+      "size": 186559
     },
     "motor_map.json": {
       "sha256": "7e3a0bcbb7d080beb6704f7de15baa5cf64f7cef91a646baa6f6628e8bc061e2",
       "size": 147204
     },
     "power_loss_recovery.py": {
-      "sha256": "cfc56e57042110da1b538d49ad5cae8ebb7ea33906074469705dded2eec541b3",
-      "size": 75035
+      "sha256": "9180e8ea5fd81b2422da31c67096f3173b8ea4441665540fdbf169a1ebf91992",
+      "size": 75173
     },
     "prtouch.py": {
-      "sha256": "c7f3204cc74a3cde8472b4adb552d9ca8907918819ce1ac3ca60b56c333e2cb6",
-      "size": 47505
+      "sha256": "c83be0966a81955f721495268c62d3f31a2eb6b8e189d16e70b9604a28bd531f",
+      "size": 47514
     },
     "ptc_power_limiter.py": {
       "sha256": "0fb1cf65edb1af2d85d4cddf7c08fe3a18562051bc438ba7afcd7018b57555ff",
@@ -89,8 +89,8 @@
       "size": 7088
     },
     "z_align.py": {
-      "sha256": "46a15499fc3bc8c8d9387655c463ebb64643f3c1a17c5884a79dddbc53bce76c",
-      "size": 34095
+      "sha256": "c14477e17dbe03ecae5d18af8c20b339315ebb50e931951975daa484abb2bfbd",
+      "size": 34638
     }
   },
   "format": "k2-extras-sha256-v1",

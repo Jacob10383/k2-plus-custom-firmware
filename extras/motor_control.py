@@ -4109,7 +4109,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         if EXTRUDER_AXES[0] not in axes:
             return
         stepper_enable = self.printer.lookup_object("stepper_enable")
-        stepper_enable.motor_debug_enable("extruder", 0)
+        stepper_enable.set_motors_enable(["extruder"], False)
 
     def _handle_runtime_recoverable_fault(self, detail: dict,
                                           fault_details: dict[str, dict]):
