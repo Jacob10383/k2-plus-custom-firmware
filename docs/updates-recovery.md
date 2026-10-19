@@ -2,16 +2,14 @@
 
 ## Update the firmware stack
 
+Update Klipper from the update manager in Fluidd or Mainsail. The firmware's
+Klipper extras are part of [Kalico](https://github.com/Jacob10383/kalico) and
+update with it.
+
+Update bootstrap:
+
 ```sh
 bootstrap --update
-```
-
-This updates bootstrap and the firmware's Klipper extras. To update one part
-only:
-
-```sh
-bootstrap --update bootstrap
-bootstrap --update extras
 ```
 
 ## Update the printer configuration
