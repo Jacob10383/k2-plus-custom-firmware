@@ -1949,23 +1949,16 @@ overrides used by startup, fault handling, and command execution.
 
 
 
-K2_PIN_LAYOUT = {
-    "motor_x_dir": ("PB9", 0),
-    "motor_x_step": ("PB10", 0),
-    "motor_x_stall": ("PB11", None),
-    "motor_y_dir": ("!PB7", 0),
-    "motor_y_step": ("PB8", 0),
-    "motor_y_stall": ("PB12", None),
-    "motor_z_dir": ("PB5", 0),
-    "motor_z_step": ("PB6", 1),
-    "motor_z_stall": ("PB13", None),
-    "motor_z1_dir": ("PA1", 1),
-    "motor_z1_step": ("PB15", 1),
-    "motor_z1_stall": ("PA10", None),
-    "motor_e_stall": ("nozzle_mcu:PB12", None),
-}
+# Motor ids match Kalico's [stepper_*] sections, which own the STEP/DIR pins.
+STEPPER_AXES = ("x", "y", "z", "z1")
 
-PIN_OPTIONS = tuple(K2_PIN_LAYOUT)
+STALL_PIN_LAYOUT = {
+    "motor_x_stall": "PB12",
+    "motor_y_stall": "PB11",
+    "motor_z_stall": "PB13",
+    "motor_z1_stall": "PA10",
+    "motor_e_stall": "nozzle_mcu:PB12",
+}
 
 OUTPUT_PIN_OPTIONS = (
     "motor_x_dir",
@@ -1978,12 +1971,13 @@ OUTPUT_PIN_OPTIONS = (
     "motor_z1_step",
 )
 
+PIN_OPTIONS = OUTPUT_PIN_OPTIONS + tuple(STALL_PIN_LAYOUT)
+
 
 @dataclass(frozen=True)
 class MotorPinConfig:
     raw: str
     pin_desc: str
-    startup_value: int | None
 
 
 @dataclass(frozen=True)
@@ -2006,13 +2000,15 @@ class MotorControlConfigModel:
             if option.lower() in accepted
         }
         pins = {
-            option: MotorPinConfig(
-                raw=pin_desc,
-                pin_desc=pin_desc,
-                startup_value=startup_value,
-            )
-            for option, (pin_desc, startup_value) in K2_PIN_LAYOUT.items()
+            option: MotorPinConfig(raw=pin_desc, pin_desc=pin_desc)
+            for option, pin_desc in STALL_PIN_LAYOUT.items()
         }
+        for axis in STEPPER_AXES:
+            stepper = config.getsection("stepper_" + axis)
+            for kind in ("dir", "step"):
+                pin_desc = stepper.get(kind + "_pin")
+                pins[f"motor_{axis}_{kind}"] = MotorPinConfig(
+                    raw=pin_desc, pin_desc=pin_desc)
         sensor_option = config.get(
             "mcu_temperature_sensors", ", ".join(ALL_AXES)).strip().lower()
         sensor_axes = () if sensor_option in ("", "none") else tuple(
@@ -2493,27 +2489,20 @@ Drives STEP/DIR address straps for the stock Creality MCU during discovery.
 
 
 
+# Physical levels. Each driver latches its RS-485 address from them:
+# addr = 0x81 + DIR + 2 * STEP. Pins also start at these levels.
 PIN_DIR_SEQUENCE = (
-    ("motor_x_dir", 0),
-    ("motor_x_step", 0),
     ("motor_y_dir", 0),
     ("motor_y_step", 0),
+    ("motor_x_dir", 1),
+    ("motor_x_step", 0),
     ("motor_z_dir", 0),
     ("motor_z_step", 1),
     ("motor_z1_dir", 1),
     ("motor_z1_step", 1),
 )
 
-PIN_NORMAL_SEQUENCE = (
-    ("motor_x_dir", 0),
-    ("motor_x_step", 0),
-    ("motor_y_dir", 1),
-    ("motor_y_step", 0),
-    ("motor_z_dir", 0),
-    ("motor_z_step", 0),
-    ("motor_z1_dir", 0),
-    ("motor_z1_step", 0),
-)
+PIN_NORMAL_SEQUENCE = tuple((option, 0) for option, _level in PIN_DIR_SEQUENCE)
 
 
 def _shareable_pin_desc(pin_desc: str) -> str:
@@ -2531,6 +2520,7 @@ class MotorPinManager:
         self.mcu = printer.lookup_object("mcu")
         self.ppins = printer.lookup_object("pins")
         self.outputs = {}
+        self._inverted = {}
         self._init_outputs()
 
     def _init_outputs(self):
@@ -2540,20 +2530,24 @@ class MotorPinManager:
                 raise RuntimeError(f"missing required output pin config for {option}")
             self.ppins.allow_multi_use_pin(_shareable_pin_desc(pin_cfg.pin_desc))
             pin = self.ppins.setup_pin("digital_out", pin_cfg.pin_desc)
-            initial = int(pin_cfg.startup_value or 0)
+            # Klipper writes logical values; undo the [stepper_*] pin's "!".
+            inverted = self.ppins.parse_pin(
+                pin_cfg.pin_desc, can_invert=True)["invert"]
+            initial = dict(PIN_DIR_SEQUENCE)[option] ^ inverted
             pin.setup_max_duration(0.0)
             pin.setup_start_value(initial, initial)
             self.outputs[option] = pin
+            self._inverted[option] = inverted
 
     def _schedule_sequence(
             self, sequence: Iterable[tuple[str, int]]):
         start = (
             self.mcu.estimated_print_time(self.reactor.monotonic())
             + 0.05)
-        for idx, (attr, value) in enumerate(sequence):
+        for idx, (attr, level) in enumerate(sequence):
             pin = self.outputs[attr]
             when = start + idx * 0.003
-            pin.set_digital(when, value)
+            pin.set_digital(when, level ^ self._inverted[attr])
         # set_digital queues future writes. Do not broadcast the address-latch
         # request (or leave cleanup) before the final write's scheduled time.
         deadline = when + 0.010
@@ -2624,8 +2618,8 @@ STARTUP_STEP_FUNCTIONS = {
     "protect_recheck": 0x0C,
 }
 STARTUP_SERIAL_AXIS_BY_ADDR = {
-    0x81: "X",
-    0x82: "Y",
+    0x81: "Y",
+    0x82: "X",
     0x83: "Z",
     0x84: "Z1",
 }

@@ -1013,7 +1013,7 @@
     }
   },
   "x": {
-    "_addr": "0x81",
+    "_addr": "0x82",
     "_firmware": {
       "identifier": "mot2_002_081",
       "file": "mot2_023_C30-mot2_002_081.bin",
@@ -2026,7 +2026,7 @@
     }
   },
   "y": {
-    "_addr": "0x82",
+    "_addr": "0x81",
     "_firmware": {
       "identifier": "mot2_002_081",
       "file": "mot2_023_C30-mot2_002_081.bin",
