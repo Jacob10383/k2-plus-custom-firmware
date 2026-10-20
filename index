@@ -13,7 +13,7 @@
     "size": 16777216
   },
   "rootfs": {
-    "sha256": "df034ac492d2f3c3f5909b87d7f16d7711e5179740c5d77e65642efb15e32bf3",
+    "sha256": "f875493432c20b9148d90313b2f1b3d1e0df2e0db3db2abee99851ac20049c46",
     "size": 314572800
   },
   "swap": {
