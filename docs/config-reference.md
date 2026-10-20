@@ -60,6 +60,20 @@ clean_pad_passes: 1         # Complete silicone scrub passes
 clean_velocity: 12000.0     # Nozzle-clean feedrate, mm/min
 snap_fan_speed: 1.0         # Part-fan speed during flush-clean-snap, 0-1
 snap_fan_dwell_ms: 3000     # Part-fan dwell before snap retract, ms
+
+# Spoolman location sync (see CFS > Spoolman). Placeholders in
+# spoolman_location and spoolman_slot_format: {box} 1-4, {slot} 1-4,
+# {letter} A-D, {tool} zero-based T number.
+spoolman_location_sync: False # Master switch; False never writes to Spoolman
+spoolman_location: K2 Plus  # Location for spools in a CFS slot, max 64 chars
+spoolman_slot_field: cfs_slot # Spool extra-field key (a-z, 0-9, _), created if missing
+spoolman_slot_field_name: CFS Slot # Display name used when creating the field
+spoolman_slot_format: {box}{letter} # Slot field value, e.g. 2A; must be unique per slot
+spoolman_removed_location: Shelf # Location for spools that left the CFS; empty clears it
+spoolman_removed_policy: if_unchanged # if_unchanged: only if location is still spoolman_location
+                            # always: always set spoolman_removed_location
+                            # keep: never change location, only clear the slot field
+spoolman_sync_on_startup: True # Reconcile once after the CFS starts
 ```
 
 ## External RFID Reader

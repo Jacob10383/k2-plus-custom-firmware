@@ -24,6 +24,43 @@ Open a slot, choose **Select spool**, then save it. Its filament details and
 remaining weight are shown in Filament Box, and it becomes the active Spoolman
 spool when that slot is loaded.
 
+### Location sync
+
+Optionally, the printer keeps each spool's Spoolman **location** in step with
+the CFS. It is off by default. Turn it on in `[box]`:
+
+```ini
+[box]
+spoolman_location_sync: True
+```
+
+While it is on:
+
+- A spool in a CFS slot (linked by its RFID tag or with **Select spool**) gets
+  location `K2 Plus` and a **CFS Slot** extra field such as `2A`. The field is
+  created in Spoolman automatically.
+- When the spool is removed, or the slot is linked to a different spool, the
+  CFS Slot field is cleared. Its location becomes `Shelf`, unless you already
+  moved it somewhere else in Spoolman.
+- After Klipper starts, spools removed while the printer was off are released
+  the same way.
+
+Only spools whose CFS Slot field matches a slot on a CFS that is currently
+online are released. Spools you placed at `K2 Plus` by hand without a slot
+field, and spools in a CFS that is offline, are not touched. The external spool
+holder is not tracked.
+
+A slot's spool is only known after an RFID read or **Select spool**. With
+**Read RFID on insertion** off, a newly inserted spool keeps the previous
+slot's spool until you select the new one. With it on, the slot is skipped
+while its tag is being read. The CFS reads one slot at a time; if that CFS
+finishes no read for 60 seconds (an unreadable or missing tag), the slot's
+current spool is used.
+
+All names and the removal behavior are configurable; see
+[Config reference](config-reference.md#cfs-box). `BOX_SPOOLMAN_SYNC` forces a
+full reconcile and `BOX_SPOOLMAN_SYNC_STATUS` shows the last result.
+
 ## RFID
 
 If you do not plan to write your own RFID tags for your spools, you can ignore
