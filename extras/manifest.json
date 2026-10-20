@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "14dad13861f48699c77cecd2407c71bba848bc50bc582f45e17ed0d98a0f3237",
-      "size": 143439
+      "sha256": "09d8d5fd274dd8a3aabdbf438001218d12e0edfe3c33fa24195518bab1366b84",
+      "size": 147326
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -17,8 +17,8 @@
       "size": 4588
     },
     "box_change.py": {
-      "sha256": "80b416ad31192b87c74b40d49a318db464ce69dc5ea28a506b2be480821eee79",
-      "size": 67453
+      "sha256": "703a4f33ef9084085535ee27a284847022427b054365c367104ec89591ae7931",
+      "size": 67695
     },
     "box_gcode.py": {
       "sha256": "63e93fc165ad83e34d7cd954a3876f06aad2c1b86802b0cf8b2d6dc74ff6b8e1",
@@ -65,27 +65,27 @@
       "size": 3496
     },
     "motor_control.py": {
-      "sha256": "f38b9cc8dfbad3a13eb1a0e389b0b03564ec6775876f195adcbb60ee8f95baaa",
-      "size": 186554
+      "sha256": "462ce8091677b83a81aeb4cfc0042bc97d34b3fc9bfb2c5d10d1e4aee8f3df7c",
+      "size": 186853
     },
     "motor_map.json": {
-      "sha256": "7e3a0bcbb7d080beb6704f7de15baa5cf64f7cef91a646baa6f6628e8bc061e2",
+      "sha256": "cfaacabd6bd87f6b463fdc3f0b6689480a5ac79e165eced64853c5bb37983701",
       "size": 147204
     },
     "power_loss_recovery.py": {
-      "sha256": "83197bee3e8eb096e677c20f8f3a903a7da3e66df0604897fc1c7e6430baa7ea",
-      "size": 74784
+      "sha256": "9180e8ea5fd81b2422da31c67096f3173b8ea4441665540fdbf169a1ebf91992",
+      "size": 75173
     },
     "prtouch.py": {
-      "sha256": "c7f3204cc74a3cde8472b4adb552d9ca8907918819ce1ac3ca60b56c333e2cb6",
-      "size": 47505
+      "sha256": "c83be0966a81955f721495268c62d3f31a2eb6b8e189d16e70b9604a28bd531f",
+      "size": 47514
     },
     "ptc_power_limiter.py": {
       "sha256": "0fb1cf65edb1af2d85d4cddf7c08fe3a18562051bc438ba7afcd7018b57555ff",
       "size": 3584
     },
     "serial_485.py": {
-      "sha256": "48e766cfaf5b3ad052070899914b7d43ea35e8b39a1acbebf8dff8216b005d29",
+      "sha256": "618aeca44aa408df5287939ba452d488f2725ee2d182ceb8f329f78cd27f8605",
       "size": 31143
     },
     "temperature_fan_manual_floor.py": {
@@ -93,8 +93,8 @@
       "size": 7088
     },
     "z_align.py": {
-      "sha256": "46a15499fc3bc8c8d9387655c463ebb64643f3c1a17c5884a79dddbc53bce76c",
-      "size": 34095
+      "sha256": "c14477e17dbe03ecae5d18af8c20b339315ebb50e931951975daa484abb2bfbd",
+      "size": 34638
     }
   },
   "format": "k2-extras-sha256-v1",

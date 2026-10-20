@@ -226,7 +226,7 @@ class ZAlign:
         z_tilt.z_helper.adjust_steppers = adjust
         self._z_tilt = z_tilt
 
-    def _handle_motor_off(self, _print_time):
+    def _handle_motor_off(self, *_args):
         self._learn_delta = None
         self._bottom_anchor = None
 
@@ -381,19 +381,30 @@ class ZAlign:
         return max(1, int(distance / self._step_distance) * 2)
 
     def _enable_z_align_steppers(self):
+        # Returns the reactor time at which the enable pins take effect.
         stepper_enable = self.printer.lookup_object('stepper_enable', None)
-        if stepper_enable is None or not hasattr(stepper_enable, 'motor_debug_enable'):
+        if stepper_enable is None or not hasattr(stepper_enable, 'set_motors_enable'):
             raise self.printer.command_error(
-                'Z_ALIGN requires stepper_enable.motor_debug_enable')
+                'Z_ALIGN requires stepper_enable.set_motors_enable')
+        did_enable = False
         for stepper_index in range(len(self.endstop_pin_z)):
             stepper_name = 'stepper_z' if stepper_index == 0 else 'stepper_z%d' % (
                 stepper_index,)
             try:
-                stepper_enable.motor_debug_enable(stepper_name, 1)
+                if stepper_enable.set_motors_enable([stepper_name], True):
+                    did_enable = True
             except Exception as err:
                 raise self.printer.command_error(
                     'Z_ALIGN failed enabling %s before MCU z_align: %s'
                     % (stepper_name, err))
+        now = self.reactor.monotonic()
+        if not did_enable:
+            return now
+        # Enable is scheduled on the toolhead timeline (~BUFFER_TIME_START
+        # ahead when idle); the MCU z_align command runs immediately.
+        enable_time = self._toolhead.get_last_move_time()
+        lead = enable_time - self._main_mcu.estimated_print_time(now)
+        return now + max(0., lead)
 
     def _force_stop_mcu_z_align(self):
         if self._z_align_force_stop_cmd is None:
@@ -555,9 +566,9 @@ class ZAlign:
         self._learn_delta = None
         self._bottom_anchor = None
         self._reset_runtime()
-        self._enable_z_align_steppers()
+        start_time = self._enable_z_align_steppers()
         self._state = 'mcu_start'
-        self.reactor.update_timer(self._timer, self.reactor.NOW)
+        self.reactor.update_timer(self._timer, start_time)
         return True
 
     def wait_prepare_complete(self):

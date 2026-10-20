@@ -150,8 +150,7 @@ class BoxChangeEngine:
         except (KeyError, TypeError, ValueError, AttributeError):
             raise ValueError("Invalid saved Box print mapping")
         self.box._register_tools(mapping)
-        self.tool_map = mapping
-        self.mapping_filename = state["filename"]
+        self.box._install_print_map(mapping, state["filename"], "restored")
         self.active_tool, self.active_slot = tool, slot
 
     def select_tool(self, gcmd, tool):
@@ -1441,10 +1440,14 @@ class BoxChangeEngine:
         request.last_error = str(exc)
         if request.runout_recovery:
             self._restore_pre_box_target(request)
+        # Retract, cut, and unload act on the outgoing slot, not the target.
+        if (request.last_step in ("retract", "cut", "unload")
+                and request.source is not None):
+            label = self._loaded_label(request.source)
+        else:
+            label = self._slot_label(request.target, request.target_tool)
         message = box_protocol.format_failed(
-            "%s %s" % (self._slot_label(request.target, request.target_tool),
-                       request.last_step or "change"),
-            request.last_error)
+            "%s %s" % (label, request.last_step or "change"), request.last_error)
         if request.print_context:
             self.block_resume(message)
             if not self._is_print_paused():

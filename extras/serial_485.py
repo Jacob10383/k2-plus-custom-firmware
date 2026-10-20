@@ -115,9 +115,9 @@ def get_address_desc(addr):
     elif addr == 0x22:
         return "MDLY (Y-Belt)"
     elif addr == 0x81:
-        return "Motor X"
-    elif addr == 0x82:
         return "Motor Y"
+    elif addr == 0x82:
+        return "Motor X"
     elif addr == 0x83:
         return "Motor Z"
     elif addr == 0x84:
