@@ -18,10 +18,13 @@ bootstrap --update
 bootstrap --update configs
 ```
 
-This installs the latest [K2 configuration](https://github.com/Jacob10383/kalico/tree/main/config/k2)
-and keeps your `SAVE_CONFIG` block, `overrides.cfg`, files you added and your
-probe mode. A copy of the previous configuration is left in
-`printer_data/config/config_backups/`.
+This installs the [K2 configuration](https://github.com/Jacob10383/kalico/tree/main/config/k2)
+from the installed Klipper, so update Klipper first to get the latest. It keeps
+your `SAVE_CONFIG` block, `overrides.cfg`, files you added and your probe mode.
+Every other shipped file, including `moonraker.conf`, is replaced, so make
+config changes in `overrides.cfg` (see
+[Changing settings](config-reference.md#changing-settings)). A copy of the
+previous configuration is left in `printer_data/config/config_backups/`.
 
 ## Replace the printer configuration
 

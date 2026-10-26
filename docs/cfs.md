@@ -20,9 +20,17 @@ firmware reports CFS status, errors, and troubleshooting information.
 ## Spoolman
 
 You can optionally link a Spoolman spool to each CFS slot from Filament Box.
+First connect Spoolman by uncommenting `[spoolman]` in `moonraker.conf` and
+setting `server:` to your Spoolman address. `bootstrap --update configs`
+replaces `moonraker.conf`, so add it again after updating the configuration.
+
 Open a slot, choose **Select spool**, then save it. Its filament details and
 remaining weight are shown in Filament Box, and it becomes the active Spoolman
 spool when that slot is loaded.
+
+To also set each linked spool's Spoolman location to its CFS slot, add
+`[spoolman_location]` to `overrides.cfg`. See
+[Spoolman Location](config-reference.md#spoolman-location).
 
 ## RFID
 

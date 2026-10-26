@@ -29,7 +29,7 @@ Errors reported by the CFS.
 
 ## Motor control
 
-Protection bits from the motor boards. Several can be set at once. X/Y/Z/Z1 shut the printer down; the extruder pauses and can be cleared.
+Error bits from the motor boards. Several can be set at once. X/Y/Z/Z1 shut the printer down; the extruder pauses and can be cleared.
 
 | Error | Meaning |
 | --- | --- |
@@ -37,6 +37,7 @@ Protection bits from the motor boards. Several can be set at once. X/Y/Z/Z1 shut
 | `encoder read error` | The motor MCU failed to read the encoder. |
 | `software peak overcurrent` | Phase current spiked over the peak limit. |
 | `software continuous overcurrent` | Phase current stayed over the continuous limit long enough to trip. |
+| `hardware overcurrent` | The motor board's hardware current protection tripped. |
 | `speed feedback continuously over limit` | Measured speed stayed above the protect limit. |
 | `position feedback over limit` | Encoder position went past the software position limit. |
 | `position command mutation` | The motion command jumped farther/faster than the protect rate. |
@@ -46,5 +47,11 @@ Protection bits from the motor boards. Several can be set at once. X/Y/Z/Z1 shut
 | `motor phase not connected` | Phase check saw an open phase. |
 | `motor phase resistance mismatch` | Phase resistances disagree by more than the tolerance. |
 | `motor check other error` | Startup phase check failed for some other reason. |
+
+Warning bits from the motor boards:
+
+| Warning | Meaning |
+| --- | --- |
+| `communication error` | The motor board reported a communication error. |
 | `motor power supply too low` | Motor-board supply voltage is below the minimum. |
 | `MCU overheating` | The motor MCU temperature is above the protect limit. |

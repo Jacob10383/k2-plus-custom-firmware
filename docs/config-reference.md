@@ -5,6 +5,36 @@ Standard Klipper and Cartographer configuration remains in their own
 documentation. Values shown are the shipped baseline or the source default
 when the shipped config leaves an option unset.
 
+## Changing settings
+
+Make every printer config change in `overrides.cfg`. It loads last, so anything set
+there wins over the shipped files, and `bootstrap --update configs` keeps it
+while replacing the other shipped `.cfg` files. Add the section header and
+only the options you change:
+
+```ini
+[box]
+box_count: 2
+
+[extended_zone_transform]
+safe_x_max: 225.0
+```
+
+`overrides.cfg` also holds the `START_PRINT` defaults:
+
+```ini
+[gcode_macro _START_PRINT_VARS]
+variable_heat_soak: 0                 # Bed heat-soak time, minutes
+variable_offset_ASA: 0                # Z offset for ASA prints, mm
+variable_offset_DEFAULT: 0.00         # Z offset for other materials, mm
+variable_adaptive_axis_twist_comp: 0  # 1 calibrates twist over the print area (not with PRTouch as the probe)
+variable_prtouch_scrub: 0             # 1 scrubs the nozzle on the plate tab before probing
+gcode:
+```
+
+Add `variable_offset_<MATERIAL>` for other materials, using the material name
+the slicer sends.
+
 ## Serial RS-485 Bus
 
 Shared serial bus used by CFS/box, motor control, and belt tension modules.
@@ -42,24 +72,27 @@ retract_velocity: 3000.0    # Retraction/snap/cut-assist feedrate, mm/min
 external_feed_velocity: 600.0 # External/manual feedrate, mm/min
 toolchange_z_hop: 2.0       # Z clearance for toolchange travel, mm
 wastebin_pos_x: 133.0       # Wastebin X coordinate
-wastebin_pos_y: 378.0       # Wastebin Y coordinate
+wastebin_pos_y: 378.0       # Wastebin Y coordinate; also the scraper row and pad back edge
+filament_retry_moves: Y350, X300, Y50, X50 # Moves before retrying a stalled load or blocked unload
 travel_velocity: 18000.0    # XY service-move feedrate, mm/min
 z_velocity: 600.0           # Z service-move feedrate, mm/min
 pre_cut_pos_x: 10.0         # X position used before/after the cut stroke
 # cut_pos_x: <unset>        # Cutter X position; normally saved by calibration
 cut_pos_y: 200.0            # Y position used for the cut sequence
 cut_velocity: 30000.0       # Cut move feedrate, mm/min
+cut_accel: 6000.0           # Toolhead accel for cutter strokes, mm/s2
 pre_cut_cal_pos_x: -5.0     # Starting X position for cut-position calibration
 check_cut_pos_x_max: -5.5   # Highest accepted X hit during cutter check/calibration
 check_cut_pos_x_min: -9.5   # Lowest accepted X hit during cutter check/calibration
 clean_pad_left_x: 154.0     # Silicone pad left X edge
 clean_pad_right_x: 166.0    # Silicone pad right X edge
 clean_pad_front_y: 367.0    # Silicone pad front Y edge
-clean_pad_back_y: 378.0     # Silicone pad back Y edge
 clean_pad_passes: 1         # Complete silicone scrub passes
-clean_velocity: 12000.0     # Nozzle-clean feedrate, mm/min
+clean_velocity: 9000.0      # Flap strike, scraper, and pad feedrate, mm/min
 snap_fan_speed: 1.0         # Part-fan speed during flush-clean-snap, 0-1
 snap_fan_dwell_ms: 3000     # Part-fan dwell before snap retract, ms
+clog_detection: True        # Pause when the extruder feeds but the CFS stops refilling
+clog_extruder_length: 80    # Extruder feed with no CFS refill before pausing, mm; minimum 30
 ```
 
 ## External RFID Reader
@@ -69,13 +102,26 @@ snap_fan_dwell_ms: 3000     # Part-fan dwell before snap retract, ms
 beep_enabled: true          # Enable the scan-success buzzer
 ```
 
+## Spoolman Location
+
+Writes each linked spool's CFS slot to its Spoolman location. Not enabled in
+the shipped config; add it to `overrides.cfg`. Needs Spoolman connected in
+Moonraker (see [Spoolman](cfs.md#spoolman)).
+
+```ini
+[spoolman_location]
+location: Box {box} Slot {slot} # Location while the spool is in a slot
+update_removed: True        # Change the location when the spool leaves the CFS
+removed_location:           # Location after it leaves; empty clears it
+```
+
 ## PR Touch
 
 K2 load-cell probe and multi-sample Z-home settings.
 
 ```ini
 [prtouch]
-z_offset: 0                 # Probe offset; required
+z_offset: 0                 # Probe offset
 register_as_probe: False    # Keep PRTouch as an alternate prtouch: chip
 speed: 5                    # Probe speed, mm/s
 lift_speed: 40              # Probe lift speed, mm/s
@@ -115,6 +161,7 @@ pres_release_timeout: 0.250 # Release acknowledgement timeout, seconds
 pres_ack_timeout: 0.250     # Pressure acknowledgement timeout, seconds
 pres_rearm_delay: 0.010     # Delay before rearming pressure detection, seconds
 pres_cs0_pin: nozzle_mcu:PB13, nozzle_mcu:PB14
+# pres_cs1_pin … pres_cs7_pin: additional pressure-sensor channels, unset by default
 ```
 
 ## Motor Control
@@ -125,31 +172,15 @@ parameter overrides, calibration, and motor fault reporting.
 ```ini
 [motor_control]
 cut_pos_offset: 0.4         # Added to measured cutter hit when saving cut_pos_x
+mcu_temperature_sensors: x, y, z, z1, e # Motors shown as motor_<axis>_MCU temperature sensors; none disables
 
 x_param_stall_pos_err_rad: 0.007
 y_param_stall_pos_err_rad: 0.007
-x_controller_cur_filter_param_en: 1
-y_controller_cur_filter_param_en: 1
-z_controller_cur_filter_param_en: 1
-z1_controller_cur_filter_param_en: 1
-```
-
-Motor pin options and their defaults:
-
-```ini
-motor_x_dir: PB9
-motor_x_step: PB10
-motor_x_stall: PB11
-motor_y_dir: !PB7
-motor_y_step: PB8
-motor_y_stall: PB12
-motor_z_dir: PB5
-motor_z_step: PB6
-motor_z_stall: PB13
-motor_z1_dir: PA1
-motor_z1_step: PB15
-motor_z1_stall: PA10
-motor_e_stall: nozzle_mcu:PB12
+x_protection_param_prt_track_err_time: 0.1
+y_protection_param_prt_track_err_time: 0.1
+z_protection_param_prt_track_err_time: 0.1
+z1_protection_param_prt_track_err_time: 0.1
+e_protection_param_prt_track_err_time: 0.1
 ```
 
 Motor firmware overrides use `{axis}_{parameter}`, where axis is `e`, `x`,
@@ -159,7 +190,6 @@ is used. All five axes accept these parameter names:
 ??? abstract "Motor firmware parameter names"
 
     ```text
-    cmd_int_param_char_cmd_support
     controller_cur_filter_param_en
     controller_cur_filter_param_fc
     controller_cur_loop_pid_fal_param_a
@@ -185,11 +215,6 @@ is used. All five axes accept these parameter names:
     controller_spd_loop_pid_param_kc
     controller_spd_loop_pid_param_ki
     controller_spd_loop_pid_param_kp
-    controller_td_fhan_param_f0
-    controller_td_param_d_gain
-    controller_td_param_dd_gain
-    controller_td_param_en
-    controller_td_param_h0_gain_h
     motor_param_Ke
     motor_param_L
     motor_param_R
@@ -205,6 +230,7 @@ is used. All five axes accept these parameter names:
     protection_param_mcu_temp_max
     protection_param_power_voltage_min
     protection_param_protect_en
+    protection_param_prt_continuous_clear_time_s
     protection_param_prt_continuous_cur_A
     protection_param_prt_continuous_time_s
     protection_param_prt_over_speed_rad_s
@@ -212,7 +238,6 @@ is used. All five axes accept these parameter names:
     protection_param_prt_peak_cur_A
     protection_param_prt_track_err_time
     protection_param_prt_track_max_err
-    stall_pos_err_rad_for_slicer
     step_controller_param_subdivision
     zazen_param_zazen_en
     zazen_param_zazen_gain_cur_ki
@@ -299,7 +324,7 @@ Routes moves safely into the K2 extended Y area before bed-mesh compensation.
 [extended_zone_transform]
 standard_y_max: 352.0      # Normal Y envelope
 extended_y_max: 380.0      # Extended Y envelope
-safe_x_min: 122.0          # Minimum X allowed while entering extended Y
+safe_x_min: 132.0          # Minimum X allowed while entering extended Y
 safe_x_max: 230.0          # Maximum X allowed while entering extended Y
 ```
 
@@ -317,16 +342,6 @@ maximum_recovery_z: 350.0   # Maximum aligned K2 recovery clearance, mm
 recovery_travel_speed: 100.0 # XY recovery travel, mm/s
 recovery_z_speed: 15.0      # Z recovery move speed, mm/s
 nozzle_standby: 140.0       # Nozzle target during reference recovery
-```
-
-## Motion Limits
-
-Adds commands to save and restore velocity, accel, cruise ratio, square-corner
-velocity, and optional G-code state.
-
-```ini
-[motion_limits]
-# config options: none
 ```
 
 ## Chamber Heater Circulation Fan
@@ -351,12 +366,11 @@ stall.
 
 ```ini
 [fan_feedback]
-fans: PC6, nozzle_mcu:PA12, nozzle_mcu:PC13 # Tach pins to monitor
-shutdown_fans: PC6       # Fans that shut down the printer on confirmed stall
-pause_fans: nozzle_mcu:PA12, nozzle_mcu:PC13 # Fans that pause/warn on stall
+fan_objects: heater_fan chamber_heater_fan, heater_fan heatbreak_fan, fan # Fans to monitor
+shutdown_fans: heater_fan chamber_heater_fan # Fans that shut down the printer on confirmed stall
+pause_fans: heater_fan heatbreak_fan, fan # Fans that pause the print on confirmed stall; warn when idle
 warn_fans:               # Fans that only warn on stall
-fan_drivers: heater_fan chamber_heater_fan, heater_fan heatbreak_fan, fan # Matching fan objects
-fan_names: chamber heater fan, heatbreak fan, part cooling fan # Matching display names
+fan_names: chamber heater fan, heatbreak fan, part cooling fan # Display names, in fan_objects order
 poll_interval: 1.0       # Tach poll interval, seconds
 confirm_seconds: 20.0    # Stall duration before action, seconds
 repeat_warn_seconds: 1800.0 # Repeat warning interval, seconds
