@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,8 @@ BOOTSTRAP_INSTALL_PATH = Path("/usr/bin/bootstrap")
 TIMEZONE_URL = "https://ipapi.co/timezone"
 NETWORK_ATTEMPTS = 3
 NETWORK_DELAY_SECONDS = 3
+# Older snapshots are zipped; Moonraker is slow with many files under config/.
+CONFIG_BACKUPS_KEPT_UNZIPPED = 2
 
 SERVICES_TO_STOP = ["moonraker", "klipper", "klipper-mcu"]
 SERVICES_TO_START = ["klipper", "moonraker"]
@@ -589,7 +592,71 @@ def backup_config_dir() -> Path | None:
     for item in items:
         shutil.move(str(item), dest / item.name)
     log(f"backed up {len(items)} item(s) -> {dest}")
+    try:
+        zip_old_config_backups(dest.parent, dest)
+    except Exception as exc:
+        log_warn(f"could not zip older config backups: {exc}")
     return dest
+
+
+def raise_walk_error(exc: OSError) -> None:
+    raise exc
+
+
+def zip_config_backup(folder: Path) -> Path:
+    archive = folder.with_name(f"{folder.name}.zip")
+    partial = folder.with_name(f"{folder.name}.zip.partial")
+    try:
+        # The K2 has no RTC, so files written before NTP sync can predate 1980.
+        with zipfile.ZipFile(
+            partial, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
+        ) as zf:
+            # os.walk instead of rglob: rglob skips unreadable dirs, and the
+            # folder is deleted once the zip is written.
+            for dir_path, dir_names, file_names in os.walk(folder, onerror=raise_walk_error):
+                dir_names.sort()
+                here = Path(dir_path)
+                zf.write(here, here.relative_to(folder.parent).as_posix())
+                for entry in sorted(file_names) + [d for d in dir_names if (here / d).is_symlink()]:
+                    path = here / entry
+                    name = path.relative_to(folder.parent).as_posix()
+                    st = path.lstat()
+                    if stat.S_ISLNK(st.st_mode):
+                        info = zipfile.ZipInfo(name, time.localtime(st.st_mtime)[:6])
+                        info.create_system = 3
+                        info.external_attr = 0o120777 << 16
+                        zf.writestr(info, os.readlink(path))
+                    elif stat.S_ISREG(st.st_mode):
+                        zf.write(path, name)
+                    else:
+                        raise OSError(f"not a regular file: {name}")
+        partial.replace(archive)
+    finally:
+        partial.unlink(missing_ok=True)
+    shutil.rmtree(folder)
+    return archive
+
+
+def zip_old_config_backups(backups_dir: Path, current: Path) -> None:
+    folders = sorted(
+        path for path in backups_dir.glob("bootstrap-replace-*")
+        if path.is_dir() and not path.is_symlink() and path != current
+    )
+    # The current snapshot always stays unzipped, even if a wrong clock sorts it first.
+    older = folders[:max(0, len(folders) - (CONFIG_BACKUPS_KEPT_UNZIPPED - 1))]
+    zipped = 0
+    for folder in older:
+        if folder.with_name(f"{folder.name}.zip").exists():
+            log_warn(f"{folder.name}.zip already exists; leaving {folder.name} unzipped")
+            continue
+        try:
+            zip_config_backup(folder)
+        except Exception as exc:
+            log_warn(f"could not zip {folder.name}: {exc}")
+            continue
+        zipped += 1
+    if zipped:
+        log(f"zipped {zipped} older config backup(s) in {backups_dir}")
 
 
 def install_k2_configs() -> None:
