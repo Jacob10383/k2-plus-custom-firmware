@@ -5,8 +5,8 @@
       "size": 22040
     },
     "box.py": {
-      "sha256": "5b0971c71336ff8fdbfba66831c6589b50ae0051bbebbc0529f888f9bbf88695",
-      "size": 144391
+      "sha256": "066a8ba67b37d97d230fb42864ae042c277739f93f9f40dba15914b4ccee7898",
+      "size": 145200
     },
     "box_addr.py": {
       "sha256": "09c5597847f58e455d26e9faff459db9279223009820fcf0fa7e900f3c60c530",
@@ -83,6 +83,10 @@
     "serial_485.py": {
       "sha256": "618aeca44aa408df5287939ba452d488f2725ee2d182ceb8f329f78cd27f8605",
       "size": 31143
+    },
+    "spoolman_location.py": {
+      "sha256": "48accdf096bb046ed0e20319cbe353059f680a6708ea15c89dd27033891009f6",
+      "size": 15569
     },
     "temperature_fan_manual_floor.py": {
       "sha256": "231bd9e32781b6fa2f70a1240e3ab68e48c5d675b0b151f290300174a351b943",

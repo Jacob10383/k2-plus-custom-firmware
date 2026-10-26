@@ -4,8 +4,8 @@
     "size": 38989
   },
   "extras": {
-    "manifest_sha256": "cea954b8356175c5e17fb096aec1728065e8efbd0ec6ad725aa6fd12419bcf9c",
-    "manifest_size": 3235
+    "manifest_sha256": "f8457ace2014e040ab8cb809119fe35a7fe0fc0f6b95cb080fc828c10ea4d7f5",
+    "manifest_size": 3376
   },
   "format": "k2-release-index-v1",
   "kernel": {

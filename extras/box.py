@@ -373,8 +373,17 @@ class BoxStore:
             "rfid_reserve", "")).strip().strip("\x00").strip()
         if reserve:
             clean["rfid_reserve"] = reserve
+        # A spool is only in one place: the newest link wins.
+        unlinked = []
+        if clean["spoolman_id"] is not None:
+            for other, value in self.data["slots"].items():
+                if (other != str(key)
+                        and value.get("spoolman_id") == clean["spoolman_id"]):
+                    value["spoolman_id"] = None
+                    unlinked.append(other)
         self.data["slots"][str(key)] = clean
         self.save()
+        return unlinked
 
     def clear_profile(self, key):
         if self.data["slots"].pop(str(key), None) is not None:
@@ -956,7 +965,14 @@ class Box:
         return self.store.profile(self._profile_key(slot))
 
     def set_profile(self, slot, profile):
-        self.store.set_profile(self._profile_key(slot), profile)
+        unlinked = self.store.set_profile(self._profile_key(slot), profile)
+        if not unlinked:
+            return
+        labels = {str(self._profile_key(other)): self.slot_label(other)
+                  for other in self.physical_slots + (self.external_slot,)}
+        for key in unlinked:
+            self._info(self.gcode, "Spoolman spool %s unlinked from %s" % (
+                profile["spoolman_id"], labels.get(key, "a disconnected CFS")))
 
     def clear_profile(self, slot):
         self.store.clear_profile(self._profile_key(slot))
