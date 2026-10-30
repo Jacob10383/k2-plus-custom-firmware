@@ -3,9 +3,10 @@
 #
 # MCU-assisted Z prep helper for integrated homing.
 #
-# Coordinates the MCU-side dual-Z photoelectric alignment before final host
-# Z homing. XY homing can run while the MCU alignment is active; the post-align
-# bed rise is a normal homing move.
+# Coordinates the MCU-side photoelectric bottom alignment (one switch per Z
+# motor: two on a K2 Plus, one on a K2 Pro) before final host Z homing. XY
+# homing can run while the MCU alignment is active; the post-align bed rise is
+# a normal homing move.
 #
 # Example config with current Python defaults:
 # [z_align]
@@ -605,8 +606,8 @@ class ZAlign:
             values = [float(value) for value in frame]
             steppers = self._z_steppers()
             z_min, z_max = self._toolhead.get_kinematics().rails[2].get_range()
-            if len(values) != len(steppers) or len(values) != 2:
-                raise ValueError('expected two Z positions')
+            if not values or len(values) != len(steppers):
+                raise ValueError('expected one position per Z stepper')
             if not all(math.isfinite(value) for value in values):
                 raise ValueError('non-finite Z position')
             if min(values) < z_min or max(values) > z_max:

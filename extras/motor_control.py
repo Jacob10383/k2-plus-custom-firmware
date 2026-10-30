@@ -1238,6 +1238,318 @@ class MotorFirmwareClient:
         }
 
 # ──────────────────────────────────────────────────────────────────────────
+# motor_control_debug_surface
+# ──────────────────────────────────────────────────────────────────────────
+
+"""Debug/status command mixin for motor control."""
+
+
+
+
+
+class MotorControlDebugSurfaceMixin:
+    def _iter_runtime_cfg_override_params(self, axes: tuple[str, ...] | None = None):
+        allowed = set(self.managed_axes if axes is None else axes)
+        for (axis, key), param in self.registry.by_axis_key.items():
+            if not param.override_active:
+                continue
+            if axis not in allowed:
+                continue
+            yield param
+
+    def _collect_cfg_override_status(self, axes: tuple[str, ...] | None = None,
+                                     timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
+        results = []
+        ok = mismatch = errors = 0
+        for param in self._iter_runtime_cfg_override_params(axes=axes):
+            target = self._coerce_value(param, param.override_value)
+            try:
+                current = self.axes.target(param.axis).sys_param_read(
+                    param, timeout=timeout)["value"]
+                matches = param_values_match(current, target, param)
+                entry = {
+                    "axis": param.axis,
+                    "axis_label": self._format_axis_label(param.axis),
+                    "key": param.key,
+                    "cfg_key": param.cfg_key,
+                    "target_value": target,
+                    "current_value": current,
+                    "matches": bool(matches),
+                }
+                if matches:
+                    ok += 1
+                else:
+                    mismatch += 1
+            except Exception as exc:
+                entry = {
+                    "axis": param.axis,
+                    "axis_label": self._format_axis_label(param.axis),
+                    "key": param.key,
+                    "cfg_key": param.cfg_key,
+                    "target_value": target,
+                    "current_value": None,
+                    "matches": False,
+                    "error": repr(exc),
+                }
+                errors += 1
+            results.append(entry)
+        return {
+            "count": len(results),
+            "ok": ok,
+            "mismatch": mismatch,
+            "errors": errors,
+            "results": results,
+        }
+
+    def _format_cfg_override_status_line(self, entry: dict) -> str:
+        axis_label = entry["axis_label"]
+        key = entry["key"]
+        target = entry.get("target_value")
+        current = entry.get("current_value")
+        if entry.get("error"):
+            return (
+                f"{axis_label} {key}: ERROR | cfg={target} | err={entry['error']}"
+            )
+        state = "OK" if entry.get("matches") else "MISMATCH"
+        return (
+            f"{axis_label} {key}: {state} | cfg={target} | current={current}"
+        )
+
+    def _read_axis_calibration_status(self, axis: str) -> dict:
+        axis_label = self._format_axis_label(axis)
+        try:
+            entries = self.axes.read_calibration_params(
+                axis,
+                timeout=MOTOR_COMMAND_TIMEOUT)
+        except Exception as exc:
+            return {
+                "axis": axis,
+                "axis_label": axis_label,
+                "values": {},
+                "near_zero": False,
+                "unsafe_entries": [],
+                "error": repr(exc),
+            }
+
+        values = {}
+        errors = {}
+        unsafe_entries = []
+        for entry in entries:
+            key = entry["key"]
+            value_entry = {
+                "param_id": entry.get("param_id"),
+                "value": entry.get("value"),
+                "near_zero": bool(entry.get("near_zero")),
+                "near_zero_threshold": entry.get("near_zero_threshold"),
+            }
+            if entry.get("error"):
+                value_entry["error"] = entry["error"]
+                errors[key] = entry["error"]
+            values[key] = value_entry
+            if entry.get("near_zero"):
+                unsafe_entries.append(entry)
+
+        result = {
+            "axis": axis,
+            "axis_label": axis_label,
+            "values": values,
+            "near_zero": bool(unsafe_entries),
+            "unsafe_entries": unsafe_entries,
+        }
+        if errors:
+            result["errors"] = errors
+        return result
+
+    def _collect_calibration_status(self) -> list[dict]:
+        return [
+            self._read_axis_calibration_status(axis)
+            for axis in self.managed_axes
+        ]
+
+    def _format_calibration_status_line(self, entry: dict) -> str:
+        axis_label = entry["axis_label"]
+        if entry.get("error"):
+            return "Calibration %s: ERROR %s" % (axis_label, entry["error"])
+
+        values = entry.get("values", {})
+        offset = values.get("param_elec_offset", {}).get("value")
+        offset_err = values.get("param_elec_offset_err_deg", {}).get("value")
+        line = (
+            "Calibration %s: offset=%s pulse | offset_err=%s deg" % (
+                axis_label,
+                self._format_decimal(offset),
+                self._format_decimal(offset_err),
+            )
+        )
+        if entry.get("near_zero"):
+            thresholds = {
+                self._format_unsafe_calibration_threshold(unsafe_entry)
+                for unsafe_entry in entry.get("unsafe_entries", [])
+            }
+            threshold_text = ", ".join(sorted(thresholds)) or "near zero"
+            line += " | UNSAFE %s" % (threshold_text,)
+        if entry.get("errors"):
+            error_text = ", ".join(
+                "%s=%s" % (key, value)
+                for key, value in sorted(entry["errors"].items())
+            )
+            line += " | errors: %s" % (error_text,)
+        return line
+
+    def _transport_ready_status(self) -> dict:
+        return {
+            "serial485_transport_ready": bool(
+                self.transport is not None
+                and self.transport.is_configured()),
+            "nozzle_transport_ready": bool(
+                self.extruder_transport is not None
+                and self.extruder_transport.is_configured()),
+        }
+
+    def _build_status_snapshot(self) -> dict:
+        homing_session = self._get_homing_session_state()
+        decoded_fault_detail = {
+            axis: describe_fault_detail(detail)
+            for axis, detail in sorted(self.motor_fault_detail.items())
+        }
+        return {
+            "implementation": "active-python",
+            "controller_class": self.__class__.__name__,
+            "axis_controller_class": self.axes.__class__.__name__,
+            "transport_class": self.transport.__class__.__name__,
+            **self._transport_ready_status(),
+            "registry_param_count": len(self.registry.by_axis_key),
+            "is_ready": self.is_ready,
+            "motor_params_init": self.motor_params_init,
+            "motor_ready": self.is_ready and self.motor_params_init,
+            "is_homing": self.is_homing,
+            "homing_move_depth": self._homing_move_depth,
+            "homing_session_active": homing_session["active"],
+            "homing_session_aborted": homing_session["aborted"],
+            "homing_abort_in_progress": homing_session["abort_in_progress"],
+            "startup_started": self._startup_started,
+            "startup_complete": self._startup_complete,
+            "startup_step_index": self._startup_step_index,
+            "startup_step_count": len(self._startup_steps()),
+            "startup_error": self._startup_error,
+            "runtime_cfg_override_count": len(self._runtime_cfg_overrides),
+            "stall_state": self.stall_monitor.read_all(),
+            "cut_check_active": bool(self.is_check_cut_pos_start),
+            "cut_latched": bool(self.cut_state),
+            "cut_pos_offset": self.cut_pos_offset,
+            "fault_cleanup_pending": self._fault_cleanup_pending,
+            "fault_cleanup_axes": sorted(self._fault_cleanup_axes),
+            "fault_cleanup_homing_fault": self._fault_cleanup_homing_fault,
+            "fault_cleanup_startup_fault": self._fault_cleanup_startup_fault,
+            "startup_fault_clear_ok": self._startup_fault_clear_ok,
+            "startup_fault_clear_result": self._startup_fault_clear_result,
+            "motor_error_code": self.motor_error_code,
+            "motor_warning_code": self.motor_warning_code,
+            "motor_fault_detail": self.motor_fault_detail,
+            "motor_fault_detail_decoded": decoded_fault_detail,
+            "calibration": self._collect_calibration_status(),
+        }
+
+    def cmd_MOTOR_STATUS(self, gcmd):
+        status = self._build_status_snapshot()
+        if self._gcmd_raw_detail(gcmd):
+            gcmd.respond_info(
+                "MOTOR_STATUS %s" % (
+                    json.dumps(status, default=str),))
+            return status
+        if status["motor_ready"]:
+            gcmd.respond_info("Motor control: ready")
+        elif status["startup_complete"] and status["startup_error"]:
+            gcmd.respond_info(
+                "Motor control: startup failed (%s)" % (status["startup_error"],))
+        elif status["startup_started"]:
+            gcmd.respond_info(
+                "Motor control: starting (step %d/%d)" % (
+                    status["startup_step_index"] + 1,
+                    status["startup_step_count"],
+                ))
+        else:
+            gcmd.respond_info("Motor control: idle")
+        gcmd.respond_info(
+            "Serial485 transport: %s" % (
+                "ready" if status["serial485_transport_ready"] else "not ready",))
+        gcmd.respond_info(
+            "Nozzle transport: %s" % (
+                "ready" if status["nozzle_transport_ready"] else "not ready",))
+        active_faults = {
+            axis: detail
+            for axis, detail in sorted(self.motor_fault_detail.items())
+            if detail.get("active")
+        }
+        if active_faults:
+            gcmd.respond_info(
+                "Active faults: %s" % (self._format_fault_summary(active_faults),))
+        else:
+            gcmd.respond_info("Active faults: none")
+        for entry in status["calibration"]:
+            gcmd.respond_info(self._format_calibration_status_line(entry))
+        if status["fault_cleanup_pending"]:
+            gcmd.respond_info(
+                "Fault cleanup: pending axes=%s" % (
+                    ",".join(status["fault_cleanup_axes"]) or "none",))
+        if status["startup_fault_clear_result"]:
+            gcmd.respond_info(status["startup_fault_clear_result"])
+        return status
+
+    def cmd_MOTOR_CFG_OVERRIDE_STATUS(self, gcmd):
+        try:
+            if gcmd.get("NUM", None) is not None or gcmd.get("EXTRUDER", None) is not None:
+                raise RuntimeError(
+                    "Use AXIS=%s; NUM and EXTRUDER are not supported"
+                    % (self._format_axis_labels(self.managed_axes),))
+            axis_raw = gcmd.get("AXIS", None)
+            axes = (self._parse_managed_axis_spec(axis_raw)
+                    if axis_raw is not None else None)
+            raw_detail = self._gcmd_raw_detail(gcmd)
+            status = self._collect_cfg_override_status(
+                axes=axes, timeout=MOTOR_COMMAND_TIMEOUT)
+            if raw_detail:
+                gcmd.respond_info("MOTOR_CFG_OVERRIDE_STATUS %s" % (status,))
+                return status
+            if status["count"] == 0:
+                gcmd.respond_info("MOTOR_CFG_OVERRIDE_STATUS no live cfg-backed param overrides")
+                return status
+            for entry in status["results"]:
+                gcmd.respond_info(self._format_cfg_override_status_line(entry))
+            gcmd.respond_info(
+                "MOTOR_CFG_OVERRIDE_STATUS summary count=%d ok=%d mismatch=%d errors=%d" %
+                (status["count"], status["ok"], status["mismatch"], status["errors"]))
+            return status
+        except Exception as exc:
+            raise gcmd.error(str(exc))
+
+    def cmd_MOTOR_RETRY_STARTUP(self, gcmd):
+        self._begin_startup(force=True, allow_auto_retry=False)
+        gcmd.respond_info("motor control startup retry scheduled")
+
+    def cmd_MOTOR_QUERY_FAULTS(self, gcmd):
+        try:
+            start_time = self.reactor.monotonic()
+            result = self.query_protection_status(
+                axes=self.managed_axes, timeout=MOTOR_COMMAND_TIMEOUT)
+            elapsed_ms = (self.reactor.monotonic() - start_time) * 1000.0
+            lines = ["MOTOR_QUERY_FAULTS elapsed_ms=%.3f" % (elapsed_ms,)]
+            for axis in self.managed_axes:
+                detail = result[axis]
+                err = int(detail["error_code"] or 0)
+                warn = int(detail["warning_code"] or 0)
+                frame_status = int(detail.get("frame_status") or 0)
+                active = detail["active"]
+                lines.append(
+                    "%s: error=0x%08X  warning=0x%08X  frame_status=0x%02X  active=%s"
+                    % (axis.upper(), err, warn, frame_status, active))
+            for line in lines:
+                gcmd.respond_info(line)
+            return {"axes": result, "elapsed_ms": elapsed_ms}
+        except Exception as exc:
+            raise gcmd.error(str(exc))
+
+# ──────────────────────────────────────────────────────────────────────────
 # motor_param_runtime
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -1608,7 +1920,6 @@ AXIS_NUM_MAP = {
     5: EXTRUDER_AXIS,
 }
 AXIS_TO_NUM_MAP = {axis: num for num, axis in AXIS_NUM_MAP.items()}
-STARTUP_PROBE_ADDRS = tuple(0x80 + i for i in range(1, 5))
 EXTRUDER_BOOTSTRAP_ADDR = 0x81
 EXTRUDER_MIN_RUNTIME_ADDR = 0x81
 EXTRUDER_MAX_RUNTIME_ADDR = 0x8F
@@ -1742,8 +2053,11 @@ class AxisApplyResult:
 
 class MotorAxisController:
     def __init__(self, registry: MotorParamRegistry, *,
-                 serial_transport, extruder_transport):
+                 serial_transport, extruder_transport,
+                 kinematic_axes=KINEMATIC_AXES):
         self.registry = registry
+        self.kinematic_axes = tuple(kinematic_axes)
+        self.all_axes = self.kinematic_axes + EXTRUDER_AXES
         self.executor = MotorParamExecutor(registry)
         self.serial_transport = serial_transport
         self.extruder_transport = extruder_transport
@@ -1753,7 +2067,7 @@ class MotorAxisController:
         self.extruder_addr = EXTRUDER_BOOTSTRAP_ADDR
         self._serial_targets = {
             axis: self._make_serial_target(axis)
-            for axis in KINEMATIC_AXES
+            for axis in self.kinematic_axes
         }
         self._extruder_target = self._make_extruder_target()
 
@@ -1779,10 +2093,13 @@ class MotorAxisController:
 
     def target(self, axis: str) -> MotorAxisTarget:
         axis = str(axis).strip().lower()
-        if axis in KINEMATIC_AXES:
+        if axis in self._serial_targets:
             return self._serial_targets[axis]
         if axis == EXTRUDER_AXIS:
             return self._extruder_target
+        if axis in KINEMATIC_AXES:
+            raise RuntimeError(
+                f"motor axis {axis!r} is not listed in [motor_control] motor_axes")
         raise RuntimeError(f"unsupported motor axis {axis!r}")
 
     def apply_overrides(
@@ -1835,7 +2152,8 @@ class MotorAxisController:
     def probe_serial_axes(
             self, timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
         results = {}
-        for addr in STARTUP_PROBE_ADDRS:
+        for addr in sorted(
+                target.addr for target in self._serial_targets.values()):
             results[f"0x{addr:02X}"] = self.serial_client.startup_probe_addr(
                 addr, timeout=timeout)
         return results
@@ -1892,11 +2210,11 @@ class MotorAxisController:
             self, timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
         return {
             "mode": "normal_stall",
-            "axes": ALL_AXES,
+            "axes": self.all_axes,
             "packets": [
                 self.target(axis).set_stall_mode(
                     0x02, timeout=timeout)
-                for axis in ALL_AXES
+                for axis in self.all_axes
             ],
         }
 
@@ -1950,7 +2268,9 @@ overrides used by startup, fault handling, and command execution.
 
 
 # Motor ids match Kalico's [stepper_*] sections, which own the STEP/DIR pins.
-STEPPER_AXES = ("x", "y", "z", "z1")
+# XY are always closed-loop motors; Z/Z1 are optional (a K2 Pro drives Z
+# with a plain stepper driver and has no Z motors on the bus).
+REQUIRED_MOTOR_AXES = ("x", "y")
 
 STALL_PIN_LAYOUT = {
     "motor_x_stall": "PB12",
@@ -1960,16 +2280,14 @@ STALL_PIN_LAYOUT = {
     "motor_e_stall": "nozzle_mcu:PB12",
 }
 
-OUTPUT_PIN_OPTIONS = (
-    "motor_x_dir",
-    "motor_x_step",
-    "motor_y_dir",
-    "motor_y_step",
-    "motor_z_dir",
-    "motor_z_step",
-    "motor_z1_dir",
-    "motor_z1_step",
-)
+
+
+def output_pin_options(axes) -> tuple[str, ...]:
+    return tuple(
+        f"motor_{axis}_{kind}" for axis in axes for kind in ("dir", "step"))
+
+
+OUTPUT_PIN_OPTIONS = output_pin_options(KINEMATIC_AXES)
 
 PIN_OPTIONS = OUTPUT_PIN_OPTIONS + tuple(STALL_PIN_LAYOUT)
 
@@ -1985,7 +2303,8 @@ class MotorControlConfigModel:
     raw_options: dict[str, str | None]
     cut_pos_offset: float
     pins: dict[str, MotorPinConfig]
-    mcu_temperature_sensors: tuple[str, ...] = ALL_AXES
+    motor_axes: tuple[str, ...] = KINEMATIC_AXES
+    mcu_temperature_sensors: tuple[str, ...] = KINEMATIC_AXES + EXTRUDER_AXES
 
     @classmethod
     def from_config(cls, config, param_options=()):
@@ -1999,340 +2318,46 @@ class MotorControlConfigModel:
             for option in config.fileconfig.options(config.section)
             if option.lower() in accepted
         }
+        motor_axes = cls._parse_motor_axes(config)
+        managed_axes = motor_axes + EXTRUDER_AXES
+        stall_options = {f"motor_{axis}_stall" for axis in managed_axes}
         pins = {
             option: MotorPinConfig(raw=pin_desc, pin_desc=pin_desc)
             for option, pin_desc in STALL_PIN_LAYOUT.items()
+            if option in stall_options
         }
-        for axis in STEPPER_AXES:
+        for axis in motor_axes:
             stepper = config.getsection("stepper_" + axis)
             for kind in ("dir", "step"):
                 pin_desc = stepper.get(kind + "_pin")
                 pins[f"motor_{axis}_{kind}"] = MotorPinConfig(
                     raw=pin_desc, pin_desc=pin_desc)
         sensor_option = config.get(
-            "mcu_temperature_sensors", ", ".join(ALL_AXES)).strip().lower()
+            "mcu_temperature_sensors", ", ".join(managed_axes)).strip().lower()
         sensor_axes = () if sensor_option in ("", "none") else tuple(
             axis.strip() for axis in sensor_option.split(","))
-        if any(axis not in ALL_AXES for axis in sensor_axes):
+        if any(axis not in managed_axes for axis in sensor_axes):
             raise config.error(
                 "mcu_temperature_sensors must be a comma-separated list of "
-                "x, y, z, z1, e, or none")
+                "%s, or none" % (", ".join(managed_axes),))
         return cls(
             raw_options=raw,
             cut_pos_offset=config.getfloat("cut_pos_offset", 0.4),
             pins=pins,
+            motor_axes=motor_axes,
             mcu_temperature_sensors=tuple(dict.fromkeys(sensor_axes)),
         )
 
-# ──────────────────────────────────────────────────────────────────────────
-# motor_control_debug_surface
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Debug/status command mixin for motor control."""
-
-
-
-
-
-class MotorControlDebugSurfaceMixin:
-    def _iter_runtime_cfg_override_params(self, axes: tuple[str, ...] | None = None):
-        allowed = set(axes) if axes is not None else None
-        for (axis, key), param in self.registry.by_axis_key.items():
-            if not param.override_active:
-                continue
-            if allowed is not None and axis not in allowed:
-                continue
-            yield param
-
-    def _collect_cfg_override_status(self, axes: tuple[str, ...] | None = None,
-                                     timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
-        results = []
-        ok = mismatch = errors = 0
-        for param in self._iter_runtime_cfg_override_params(axes=axes):
-            target = self._coerce_value(param, param.override_value)
-            try:
-                current = self.axes.target(param.axis).sys_param_read(
-                    param, timeout=timeout)["value"]
-                matches = param_values_match(current, target, param)
-                entry = {
-                    "axis": param.axis,
-                    "axis_label": self._format_axis_label(param.axis),
-                    "key": param.key,
-                    "cfg_key": param.cfg_key,
-                    "target_value": target,
-                    "current_value": current,
-                    "matches": bool(matches),
-                }
-                if matches:
-                    ok += 1
-                else:
-                    mismatch += 1
-            except Exception as exc:
-                entry = {
-                    "axis": param.axis,
-                    "axis_label": self._format_axis_label(param.axis),
-                    "key": param.key,
-                    "cfg_key": param.cfg_key,
-                    "target_value": target,
-                    "current_value": None,
-                    "matches": False,
-                    "error": repr(exc),
-                }
-                errors += 1
-            results.append(entry)
-        return {
-            "count": len(results),
-            "ok": ok,
-            "mismatch": mismatch,
-            "errors": errors,
-            "results": results,
-        }
-
-    def _format_cfg_override_status_line(self, entry: dict) -> str:
-        axis_label = entry["axis_label"]
-        key = entry["key"]
-        target = entry.get("target_value")
-        current = entry.get("current_value")
-        if entry.get("error"):
-            return (
-                f"{axis_label} {key}: ERROR | cfg={target} | err={entry['error']}"
-            )
-        state = "OK" if entry.get("matches") else "MISMATCH"
-        return (
-            f"{axis_label} {key}: {state} | cfg={target} | current={current}"
-        )
-
-    def _read_axis_calibration_status(self, axis: str) -> dict:
-        axis_label = self._format_axis_label(axis)
-        try:
-            entries = self.axes.read_calibration_params(
-                axis,
-                timeout=MOTOR_COMMAND_TIMEOUT)
-        except Exception as exc:
-            return {
-                "axis": axis,
-                "axis_label": axis_label,
-                "values": {},
-                "near_zero": False,
-                "unsafe_entries": [],
-                "error": repr(exc),
-            }
-
-        values = {}
-        errors = {}
-        unsafe_entries = []
-        for entry in entries:
-            key = entry["key"]
-            value_entry = {
-                "param_id": entry.get("param_id"),
-                "value": entry.get("value"),
-                "near_zero": bool(entry.get("near_zero")),
-                "near_zero_threshold": entry.get("near_zero_threshold"),
-            }
-            if entry.get("error"):
-                value_entry["error"] = entry["error"]
-                errors[key] = entry["error"]
-            values[key] = value_entry
-            if entry.get("near_zero"):
-                unsafe_entries.append(entry)
-
-        result = {
-            "axis": axis,
-            "axis_label": axis_label,
-            "values": values,
-            "near_zero": bool(unsafe_entries),
-            "unsafe_entries": unsafe_entries,
-        }
-        if errors:
-            result["errors"] = errors
-        return result
-
-    def _collect_calibration_status(self) -> list[dict]:
-        return [
-            self._read_axis_calibration_status(axis)
-            for axis in ALL_AXES
-        ]
-
-    def _format_calibration_status_line(self, entry: dict) -> str:
-        axis_label = entry["axis_label"]
-        if entry.get("error"):
-            return "Calibration %s: ERROR %s" % (axis_label, entry["error"])
-
-        values = entry.get("values", {})
-        offset = values.get("param_elec_offset", {}).get("value")
-        offset_err = values.get("param_elec_offset_err_deg", {}).get("value")
-        line = (
-            "Calibration %s: offset=%s pulse | offset_err=%s deg" % (
-                axis_label,
-                self._format_decimal(offset),
-                self._format_decimal(offset_err),
-            )
-        )
-        if entry.get("near_zero"):
-            thresholds = {
-                self._format_unsafe_calibration_threshold(unsafe_entry)
-                for unsafe_entry in entry.get("unsafe_entries", [])
-            }
-            threshold_text = ", ".join(sorted(thresholds)) or "near zero"
-            line += " | UNSAFE %s" % (threshold_text,)
-        if entry.get("errors"):
-            error_text = ", ".join(
-                "%s=%s" % (key, value)
-                for key, value in sorted(entry["errors"].items())
-            )
-            line += " | errors: %s" % (error_text,)
-        return line
-
-    def _transport_ready_status(self) -> dict:
-        return {
-            "serial485_transport_ready": bool(
-                self.transport is not None
-                and self.transport.is_configured()),
-            "nozzle_transport_ready": bool(
-                self.extruder_transport is not None
-                and self.extruder_transport.is_configured()),
-        }
-
-    def _build_status_snapshot(self) -> dict:
-        homing_session = self._get_homing_session_state()
-        decoded_fault_detail = {
-            axis: describe_fault_detail(detail)
-            for axis, detail in sorted(self.motor_fault_detail.items())
-        }
-        return {
-            "implementation": "active-python",
-            "controller_class": self.__class__.__name__,
-            "axis_controller_class": self.axes.__class__.__name__,
-            "transport_class": self.transport.__class__.__name__,
-            **self._transport_ready_status(),
-            "registry_param_count": len(self.registry.by_axis_key),
-            "is_ready": self.is_ready,
-            "motor_params_init": self.motor_params_init,
-            "motor_ready": self.is_ready and self.motor_params_init,
-            "is_homing": self.is_homing,
-            "homing_move_depth": self._homing_move_depth,
-            "homing_session_active": homing_session["active"],
-            "homing_session_aborted": homing_session["aborted"],
-            "homing_abort_in_progress": homing_session["abort_in_progress"],
-            "startup_started": self._startup_started,
-            "startup_complete": self._startup_complete,
-            "startup_step_index": self._startup_step_index,
-            "startup_step_count": len(self._startup_steps()),
-            "startup_error": self._startup_error,
-            "runtime_cfg_override_count": len(self._runtime_cfg_overrides),
-            "stall_state": self.stall_monitor.read_all(),
-            "cut_check_active": bool(self.is_check_cut_pos_start),
-            "cut_latched": bool(self.cut_state),
-            "cut_pos_offset": self.cut_pos_offset,
-            "fault_cleanup_pending": self._fault_cleanup_pending,
-            "fault_cleanup_axes": sorted(self._fault_cleanup_axes),
-            "fault_cleanup_homing_fault": self._fault_cleanup_homing_fault,
-            "fault_cleanup_startup_fault": self._fault_cleanup_startup_fault,
-            "startup_fault_clear_ok": self._startup_fault_clear_ok,
-            "startup_fault_clear_result": self._startup_fault_clear_result,
-            "motor_error_code": self.motor_error_code,
-            "motor_warning_code": self.motor_warning_code,
-            "motor_fault_detail": self.motor_fault_detail,
-            "motor_fault_detail_decoded": decoded_fault_detail,
-            "calibration": self._collect_calibration_status(),
-        }
-
-    def cmd_MOTOR_STATUS(self, gcmd):
-        status = self._build_status_snapshot()
-        if self._gcmd_raw_detail(gcmd):
-            gcmd.respond_info(
-                "MOTOR_STATUS %s" % (
-                    json.dumps(status, default=str),))
-            return status
-        if status["motor_ready"]:
-            gcmd.respond_info("Motor control: ready")
-        elif status["startup_complete"] and status["startup_error"]:
-            gcmd.respond_info(
-                "Motor control: startup failed (%s)" % (status["startup_error"],))
-        elif status["startup_started"]:
-            gcmd.respond_info(
-                "Motor control: starting (step %d/%d)" % (
-                    status["startup_step_index"] + 1,
-                    status["startup_step_count"],
-                ))
-        else:
-            gcmd.respond_info("Motor control: idle")
-        gcmd.respond_info(
-            "Serial485 transport: %s" % (
-                "ready" if status["serial485_transport_ready"] else "not ready",))
-        gcmd.respond_info(
-            "Nozzle transport: %s" % (
-                "ready" if status["nozzle_transport_ready"] else "not ready",))
-        active_faults = {
-            axis: detail
-            for axis, detail in sorted(self.motor_fault_detail.items())
-            if detail.get("active")
-        }
-        if active_faults:
-            gcmd.respond_info(
-                "Active faults: %s" % (self._format_fault_summary(active_faults),))
-        else:
-            gcmd.respond_info("Active faults: none")
-        for entry in status["calibration"]:
-            gcmd.respond_info(self._format_calibration_status_line(entry))
-        if status["fault_cleanup_pending"]:
-            gcmd.respond_info(
-                "Fault cleanup: pending axes=%s" % (
-                    ",".join(status["fault_cleanup_axes"]) or "none",))
-        if status["startup_fault_clear_result"]:
-            gcmd.respond_info(status["startup_fault_clear_result"])
-        return status
-
-    def cmd_MOTOR_CFG_OVERRIDE_STATUS(self, gcmd):
-        try:
-            if gcmd.get("NUM", None) is not None or gcmd.get("EXTRUDER", None) is not None:
-                raise RuntimeError(
-                    "Use AXIS=XYZZ1E; NUM and EXTRUDER are not supported")
-            axis_raw = gcmd.get("AXIS", None)
-            axes = self._parse_axis_spec(axis_raw) if axis_raw is not None else None
-            raw_detail = self._gcmd_raw_detail(gcmd)
-            status = self._collect_cfg_override_status(
-                axes=axes, timeout=MOTOR_COMMAND_TIMEOUT)
-            if raw_detail:
-                gcmd.respond_info("MOTOR_CFG_OVERRIDE_STATUS %s" % (status,))
-                return status
-            if status["count"] == 0:
-                gcmd.respond_info("MOTOR_CFG_OVERRIDE_STATUS no live cfg-backed param overrides")
-                return status
-            for entry in status["results"]:
-                gcmd.respond_info(self._format_cfg_override_status_line(entry))
-            gcmd.respond_info(
-                "MOTOR_CFG_OVERRIDE_STATUS summary count=%d ok=%d mismatch=%d errors=%d" %
-                (status["count"], status["ok"], status["mismatch"], status["errors"]))
-            return status
-        except Exception as exc:
-            raise gcmd.error(str(exc))
-
-    def cmd_MOTOR_RETRY_STARTUP(self, gcmd):
-        self._begin_startup(force=True, allow_auto_retry=False)
-        gcmd.respond_info("motor control startup retry scheduled")
-
-    def cmd_MOTOR_QUERY_FAULTS(self, gcmd):
-        try:
-            start_time = self.reactor.monotonic()
-            result = self.query_protection_status(
-                axes=ALL_AXES, timeout=MOTOR_COMMAND_TIMEOUT)
-            elapsed_ms = (self.reactor.monotonic() - start_time) * 1000.0
-            lines = ["MOTOR_QUERY_FAULTS elapsed_ms=%.3f" % (elapsed_ms,)]
-            for axis in ALL_AXES:
-                detail = result[axis]
-                err = int(detail["error_code"] or 0)
-                warn = int(detail["warning_code"] or 0)
-                frame_status = int(detail.get("frame_status") or 0)
-                active = detail["active"]
-                lines.append(
-                    "%s: error=0x%08X  warning=0x%08X  frame_status=0x%02X  active=%s"
-                    % (axis.upper(), err, warn, frame_status, active))
-            for line in lines:
-                gcmd.respond_info(line)
-            return {"axes": result, "elapsed_ms": elapsed_ms}
-        except Exception as exc:
-            raise gcmd.error(str(exc))
+    @staticmethod
+    def _parse_motor_axes(config) -> tuple[str, ...]:
+        raw = config.get("motor_axes", ", ".join(KINEMATIC_AXES))
+        axes = {axis.strip() for axis in raw.lower().split(",") if axis.strip()}
+        if (any(axis not in KINEMATIC_AXES for axis in axes)
+                or any(axis not in axes for axis in REQUIRED_MOTOR_AXES)):
+            raise config.error(
+                "motor_axes must be a comma-separated list of x, y, z, z1 "
+                "that includes x and y")
+        return tuple(axis for axis in KINEMATIC_AXES if axis in axes)
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_stall_monitor
@@ -2502,8 +2527,6 @@ PIN_DIR_SEQUENCE = (
     ("motor_z1_step", 1),
 )
 
-PIN_NORMAL_SEQUENCE = tuple((option, 0) for option, _level in PIN_DIR_SEQUENCE)
-
 
 def _shareable_pin_desc(pin_desc: str) -> str:
     desc = pin_desc.strip()
@@ -2519,12 +2542,20 @@ class MotorPinManager:
         self.reactor = printer.get_reactor()
         self.mcu = printer.lookup_object("mcu")
         self.ppins = printer.lookup_object("pins")
+        # Only managed motors are strapped; their levels don't depend on
+        # whether the other motors exist.
+        options = set(output_pin_options(config_model.motor_axes))
+        self.dir_sequence = tuple(
+            (option, level) for option, level in PIN_DIR_SEQUENCE
+            if option in options)
+        self.normal_sequence = tuple(
+            (option, 0) for option, _level in self.dir_sequence)
         self.outputs = {}
         self._inverted = {}
         self._init_outputs()
 
     def _init_outputs(self):
-        for option in OUTPUT_PIN_OPTIONS:
+        for option, start_level in self.dir_sequence:
             pin_cfg = self.config_model.pins.get(option)
             if pin_cfg is None:
                 raise RuntimeError(f"missing required output pin config for {option}")
@@ -2533,7 +2564,7 @@ class MotorPinManager:
             # Klipper writes logical values; undo the [stepper_*] pin's "!".
             inverted = self.ppins.parse_pin(
                 pin_cfg.pin_desc, can_invert=True)["invert"]
-            initial = dict(PIN_DIR_SEQUENCE)[option] ^ inverted
+            initial = start_level ^ inverted
             pin.setup_max_duration(0.0)
             pin.setup_start_value(initial, initial)
             self.outputs[option] = pin
@@ -2559,10 +2590,10 @@ class MotorPinManager:
             self.reactor.pause(now + remaining)
 
     def set_motor_pin_dir(self):
-        return self._schedule_sequence(PIN_DIR_SEQUENCE)
+        return self._schedule_sequence(self.dir_sequence)
 
     def set_motor_pin_normal(self):
-        return self._schedule_sequence(PIN_NORMAL_SEQUENCE)
+        return self._schedule_sequence(self.normal_sequence)
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_control
@@ -2643,13 +2674,16 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             (param.cfg_key for param in self.registry.by_axis_key.values()))
         self._runtime_cfg_overrides = self.registry.apply_config_overrides(
             self.config_model.raw_options)
+        self.kinematic_axes = self.config_model.motor_axes
+        self.managed_axes = self.kinematic_axes + EXTRUDER_AXES
         self.transport = Serial485TransportAdapter.from_printer(self.printer)
         self.extruder_transport = NozzleTransparentTransportAdapter(
             nozzle_mcu)
         self.axes = MotorAxisController(
             self.registry,
             serial_transport=self.transport,
-            extruder_transport=self.extruder_transport)
+            extruder_transport=self.extruder_transport,
+            kinematic_axes=self.kinematic_axes)
         self.pin_manager = MotorPinManager(self.printer, self.config_model)
         self.stall_monitor = MotorStallMonitor(
             config, replacement=self, config_model=self.config_model)
@@ -2748,7 +2782,8 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             ("CALIBRATE_CUT_POS", self.cmd_CALIBRATE_CUT_POS,
              "CALIBRATE_CUT_POS"),
             ("MOTOR_CALIBRATE", self.cmd_MOTOR_CALIBRATE,
-             "MOTOR_CALIBRATE AXIS=XYZZ1 [DETAIL=raw] | MOTOR_CALIBRATE AXIS=E STAGE=encoder|offset|1|2 [DETAIL=raw]"),
+             "MOTOR_CALIBRATE AXIS=%s [DETAIL=raw] | MOTOR_CALIBRATE AXIS=E STAGE=encoder|offset|1|2 [DETAIL=raw]"
+             % (self._format_axis_labels(self.kinematic_axes),)),
         ))
 
     def _register_debug_commands(self):
@@ -2756,7 +2791,8 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             ("MOTOR_QUERY_FAULTS", self.cmd_MOTOR_QUERY_FAULTS,
              "MOTOR_QUERY_FAULTS Live query and print error/warning/status codes for all axes with elapsed time"),
             ("MOTOR_CFG_OVERRIDE_STATUS", self.cmd_MOTOR_CFG_OVERRIDE_STATUS,
-             "MOTOR_CFG_OVERRIDE_STATUS [AXIS=XYZZ1E] [DETAIL=raw] Report live cfg-backed targets and current board values"),
+             "MOTOR_CFG_OVERRIDE_STATUS [AXIS=%s] [DETAIL=raw] Report live cfg-backed targets and current board values"
+             % (self._format_axis_labels(self.managed_axes),)),
             ("MOTOR_RETRY_STARTUP", self.cmd_MOTOR_RETRY_STARTUP,
              "MOTOR_RETRY_STARTUP Restart motor-control startup"),
         ))
@@ -2798,14 +2834,27 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                 axes.append(axis)
         return tuple(axes)
 
+    def _parse_managed_axis_spec(self, raw_value: str | None) -> tuple[str, ...]:
+        axes = self._parse_axis_spec(raw_value)
+        unmanaged = [axis for axis in axes if axis not in self.managed_axes]
+        if unmanaged:
+            raise RuntimeError(
+                "AXIS=%s is not listed in [motor_control] motor_axes" % (
+                    self._format_axis_labels(unmanaged),))
+        return axes
+
     @staticmethod
     def _format_axis_label(axis: str) -> str:
         return "Z1" if axis == "z1" else axis.upper()
 
+    def _format_axis_labels(self, axes) -> str:
+        return "".join(self._format_axis_label(axis) for axis in axes)
+
     def _calibration_usage_examples(self) -> tuple[str, ...]:
         return (
             "MOTOR_CALIBRATE AXIS=X",
-            "MOTOR_CALIBRATE AXIS=XYZZ1",
+            "MOTOR_CALIBRATE AXIS=%s" % (
+                self._format_axis_labels(self.kinematic_axes),),
             "MOTOR_CALIBRATE AXIS=E STAGE=encoder",
             "MOTOR_CALIBRATE AXIS=E STAGE=1",
             "MOTOR_CALIBRATE AXIS=E STAGE=offset",
@@ -3006,7 +3055,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
 
     def _parse_axis_selection(self, raw_value: str | None) -> tuple[str, ...]:
         try:
-            return self._parse_axis_spec(raw_value)
+            return self._parse_managed_axis_spec(raw_value)
         except RuntimeError as exc:
             self._raise_calibration_usage(str(exc))
 
@@ -3245,7 +3294,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             ("stall_mode", self.axes.set_normal_stall_mode),
             ("protect_check", partial(
                 self._startup_check_axis_protection,
-                "motors", ALL_AXES, timeout=MOTOR_COMMAND_TIMEOUT)),
+                "motors", self.managed_axes, timeout=MOTOR_COMMAND_TIMEOUT)),
             ("protect_clear", partial(
                 self._startup_clear_axis_faults,
                 "motors")),
@@ -3254,7 +3303,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                 "motors", timeout=MOTOR_COMMAND_TIMEOUT)),
             ("apply_overrides", partial(
                 self._startup_apply_axis_set_overrides,
-                ALL_AXES,
+                self.managed_axes,
                 override_timeout=MOTOR_COMMAND_TIMEOUT,
                 calibration_timeout=MOTOR_COMMAND_TIMEOUT)),
         )
@@ -3675,10 +3724,10 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             self, mode: int, timeout: float = MOTOR_COMMAND_TIMEOUT):
         return self.axes.set_homing_stall_mode(int(mode), timeout=timeout)
 
-    def query_protection_status(self, axes=ALL_AXES,
+    def query_protection_status(self, axes=None,
                                 data: int = PROTECTION_QUERY_DATA,
                                 timeout: float = MOTOR_COMMAND_TIMEOUT):
-        axes = tuple(axes)
+        axes = self.managed_axes if axes is None else tuple(axes)
         result = self.axes.check_protection(
             axes, data=data, timeout=timeout)
         for axis, detail in result.items():
@@ -3688,19 +3737,19 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                 self._clear_fault_state((axis,))
         return result
 
-    def clear_fault_latches(self, axes=ALL_AXES, data: int = 5,
+    def clear_fault_latches(self, axes=None, data: int = 5,
                             timeout: float = MOTOR_NO_ACK_TIMEOUT):
-        axes = tuple(axes)
+        axes = self.managed_axes if axes is None else tuple(axes)
         result = self.axes.clear_fault_latches(
             axes, data=data, timeout=timeout)
         self._clear_fault_state(tuple(result.keys()))
         return result
 
-    def recover_faults_for_homing_start(self, axes=KINEMATIC_AXES,
+    def recover_faults_for_homing_start(self, axes=None,
                                         query_data: int = PROTECTION_QUERY_DATA,
                                         clear_data: int = 5,
                                         timeout: float = MOTOR_COMMAND_TIMEOUT):
-        axes = tuple(axes)
+        axes = self.kinematic_axes if axes is None else tuple(axes)
         before = self.query_protection_status(
             axes=axes, data=query_data, timeout=timeout)
         active_before = {
@@ -3744,19 +3793,19 @@ class MotorControl(MotorControlDebugSurfaceMixin):
     def query_kinematic_protection_status(self, data: int = PROTECTION_QUERY_DATA,
                                      timeout: float = MOTOR_COMMAND_TIMEOUT):
         return self.query_protection_status(
-            axes=KINEMATIC_AXES, data=data, timeout=timeout)
+            axes=self.kinematic_axes, data=data, timeout=timeout)
 
     def clear_kinematic_fault_latches(
             self, data: int = 5,
             timeout: float = MOTOR_NO_ACK_TIMEOUT):
         return self.clear_fault_latches(
-            axes=KINEMATIC_AXES, data=data, timeout=timeout)
+            axes=self.kinematic_axes, data=data, timeout=timeout)
 
     def recover_kinematic_faults_for_homing_start(
             self, query_data: int = PROTECTION_QUERY_DATA,
             clear_data: int = 5, timeout: float = MOTOR_COMMAND_TIMEOUT):
         return self.recover_faults_for_homing_start(
-            axes=KINEMATIC_AXES, query_data=query_data, clear_data=clear_data,
+            axes=self.kinematic_axes, query_data=query_data, clear_data=clear_data,
             timeout=timeout)
 
     def _get_homing_session_state(self):
@@ -3874,7 +3923,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         invalidate_axes = axes
         startup_fault = self._fault_cleanup_startup_fault
         if self._fault_cleanup_homing_fault:
-            invalidate_axes = tuple(sorted(set(KINEMATIC_AXES).union(axes)))
+            invalidate_axes = tuple(sorted(set(self.kinematic_axes).union(axes)))
             _klog(
                 "fault cleanup invalidating full kinematic homing state "
                 "after homing-time fault axes=%s", invalidate_axes,
@@ -4451,7 +4500,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
     def _process_protection_poll(self):
         try:
             axes_result = {}
-            for axis in ALL_AXES:
+            for axis in self.managed_axes:
                 try:
                     axes_result.update(
                         self.query_protection_status(
@@ -4481,7 +4530,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
                               source: str = "manual"):
         if axis is None:
             return self._query_protection_axes(
-                axes=ALL_AXES, data=data, timeout=timeout, source=source)
+                axes=self.managed_axes, data=data, timeout=timeout, source=source)
         axis_name = axis if isinstance(axis, str) else self._axis_from_num(int(axis))
         return self._query_protection_axes(
             axes=(axis_name,), data=data, timeout=timeout,
