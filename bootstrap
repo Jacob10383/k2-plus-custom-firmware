@@ -51,7 +51,7 @@ HELIX_ASSET = "helixscreen-k2.zip"
 HELIX_DIR = ROOT / "helixscreen"
 
 
-MOONRAKER_ASVC = "klipper_mcu\nhelixscreen\nustreamer@stockcam\n"
+MOONRAKER_ASVC = "helixscreen\nustreamer@stockcam\n"
 
 TIMELAPSE_URL = "https://raw.githubusercontent.com/mainsail-crew/moonraker-timelapse/main/component/timelapse.py"
 FIRMWARE_BASE_URL = "https://firmware.jacobean.xyz"
@@ -64,7 +64,7 @@ NETWORK_DELAY_SECONDS = 3
 # Older snapshots are zipped; Moonraker is slow with many files under config/.
 CONFIG_BACKUPS_KEPT_UNZIPPED = 2
 
-SERVICES_TO_STOP = ["moonraker", "klipper", "klipper-mcu"]
+SERVICES_TO_STOP = ["moonraker", "klipper"]
 SERVICES_TO_START = ["klipper", "moonraker"]
 MANAGED_PATHS = [
     ROOT / "klipper",

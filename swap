@@ -51,7 +51,7 @@ SERVICE_TARGETS = [
     {"name": "helixscreen", "systemd": ["helixscreen"], "init": []},
     {"name": "moonraker", "systemd": ["moonraker"], "init": ["moonraker"]},
     {"name": "klipper", "systemd": ["klipper"], "init": ["klipper"]},
-    {"name": "klipper-mcu", "systemd": ["klipper-mcu"], "init": ["klipper_mcu"]},
+    {"name": "klipper-mcu", "systemd": [], "init": ["klipper_mcu"]},
     {"name": "webrtc", "systemd": [], "init": ["webrtc"]},
     {"name": "app", "systemd": [], "init": ["app"]},
     {"name": "device_manager", "systemd": [], "init": ["device_manager"]},
