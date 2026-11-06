@@ -481,6 +481,17 @@ class Box:
         # the wastebin" matches the position those moves leave behind.
         self.wastebin_x = round(config.getfloat("wastebin_pos_x", 133.0), 3)
         self.wastebin_y = round(config.getfloat("wastebin_pos_y", 378.0), 3)
+        # Staging point for the climb to the wastebin row; must sit right of
+        # and in front of the bin so the flap is only ever struck in -X.
+        self.wastebin_approach_x = round(
+            config.getfloat("wastebin_approach_x", 160.0), 3)
+        self.wastebin_approach_y = round(
+            config.getfloat("wastebin_approach_y", 350.0), 3)
+        if (self.wastebin_approach_x <= self.wastebin_x
+                or self.wastebin_approach_y >= self.wastebin_y):
+            raise config.error(
+                "wastebin_approach_x must be greater than wastebin_pos_x and "
+                "wastebin_approach_y less than wastebin_pos_y")
         # The pad's back edge is the wastebin row the scraper passes run on.
         self.clean_pad_left_x = config.getfloat("clean_pad_left_x", 154.0)
         self.clean_pad_right_x = config.getfloat("clean_pad_right_x", 166.0)
@@ -2315,16 +2326,16 @@ class Box:
                 % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
                    CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
             # The flapper must be struck in X. It reaches forward to about
-            # Y355 left of about X140, so stage diagonally at +15 X / -28 Y
-            # (clear at any X), climb Y in the clear X column, then make the
-            # X stroke. Already at wastebin Y, only the X stroke is needed.
-            # Like every flapper or pad contact, the stroke uses
+            # Y355 left of about X140, so stage diagonally at the approach
+            # point (clear at any X), climb Y in the clear X column, then
+            # make the X stroke. Already at wastebin Y, only the X stroke is
+            # needed. Like every flapper or pad contact, the stroke uses
             # clean_velocity.
             if abs(position[1] - self.wastebin_y) >= 1.0e-6:
-                approach_x = self.wastebin_x + 15.0
+                approach_x = self.wastebin_approach_x
                 if abs(position[0] - approach_x) >= 1.0e-6:
                     self._service_move(
-                        x=approach_x, y=self.wastebin_y - 28.0,
+                        x=approach_x, y=self.wastebin_approach_y,
                         velocity=self.travel_velocity)
                 self._service_move(
                     y=self.wastebin_y, velocity=self.travel_velocity)
