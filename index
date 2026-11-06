@@ -1,7 +1,7 @@
 {
   "bootstrap": {
-    "sha256": "2faa285f50165a56375f6114ca6bc6ad85e9044e8b586c19c4ce35ffd5f04750",
-    "size": 41800
+    "sha256": "674c1f42fee37c263acb42e412e754b04a720643444722b1271f683fcbbbb6fb",
+    "size": 41173
   },
   "extras": {
     "manifest_sha256": "b08f118a2975745affe0a2638222df7b173328a9807525971a2365a9bbab82b4",
@@ -13,7 +13,7 @@
     "size": 16777216
   },
   "rootfs": {
-    "sha256": "77576b06fb1dbe7f8b4608906372ec8b747c5ad19be7ac9008d20a4126509e0e",
+    "sha256": "3868a34673a9dfac598631891284b97ca2aaf67b6230669e9a9e401f2165ce10",
     "size": 314572800
   },
   "swap": {

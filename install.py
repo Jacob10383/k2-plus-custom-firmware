@@ -16,12 +16,11 @@ import time
 import traceback
 import urllib.request
 import binascii
+import collections
 from contextlib import contextmanager
 
-BASE_URL = "https://firmware.jacobean.xyz"
 FIRMWARE_VERSION = "6.18"
-RELEASE_INDEX_URL = f"{BASE_URL}/{FIRMWARE_VERSION}/index"
-TELEMETRY_URL = f"{BASE_URL}/telemetry/install"
+TELEMETRY_URL = "https://firmware.jacobean.xyz/telemetry/install"
 TELEMETRY_TIMEOUT = 2
 # Stable K2 hardware IDs used only to derive a pseudonymous install hash.
 # The raw eMMC CID and MAC addresses are never included in telemetry payloads.
@@ -31,9 +30,14 @@ TELEMETRY_ID_PATHS = (
     "/sys/class/net/wlan0/address",
 )
 
-ROOTFS_SHA256 = "77576b06fb1dbe7f8b4608906372ec8b747c5ad19be7ac9008d20a4126509e0e"
-KERNEL_SHA256 = "94db97f4d17885c110f392e05345c2a90268925e833d552e23a9b259b1fcf06a"
-SWAP_SHA256 = "a80f6534130fc7bd2bc6e50b5603b23e792c5c5e4d2130798d24a6c72b456c2c"
+RELEASE_REPO = "Jacob10383/k2-plus-custom-firmware"
+RELEASE_API_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
+# Files taken from the published GitHub release, with their install labels.
+RELEASE_FILES = {
+    "rootfs.ext2": "root file system",
+    "kernel.img": "kernel",
+    "swap": "swap utility",
+}
 HELIX_VERSION = "v1.0.3"
 HELIX_ARCHIVE = f"helixscreen-k2-{HELIX_VERSION}.tar.gz"
 HELIX_URL = (
@@ -41,15 +45,7 @@ HELIX_URL = (
     f"{HELIX_VERSION}/{HELIX_ARCHIVE}"
 )
 HELIX_SHA256 = "38d3e297440dce5bcc52c3e2249424c0725e0d4e462c8b8ac5888dad1d3dc4f4"
-
-
-def object_url(digest):
-    return f"{BASE_URL}/{FIRMWARE_VERSION}/o/{digest}"
-
-
-ROOTFS_URL = object_url(ROOTFS_SHA256)
-KERNEL_URL = object_url(KERNEL_SHA256)
-SWAP_URL = object_url(SWAP_SHA256)
+HELIX_SIZE = 64326464
 
 ROOTFS_A = "/dev/mmcblk0p6"
 ROOTFS_B = "/dev/mmcblk0p7"
@@ -84,6 +80,8 @@ CUSTOM_WIFI_HEADER = "ctrl_interface=/run/wpa_supplicant\nupdate_config=1\nap_sc
 # Network settings carried over from Creality firmware, in output order.
 WIFI_NETWORK_KEYS = ("ssid", "scan_ssid", "key_mgmt", "psk", "sae_password", "ieee80211w", "priority")
 WIFI_KEY_MGMT = {"WPA-PSK", "WPA-PSK-SHA256", "SAE", "NONE"}
+SWAP_OUTPUT_LINES = 30
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 NETWORK_ATTEMPTS = 3
 NETWORK_DELAY_SECONDS = 3
 INSTALL_SPACE_MARGIN = 64 * 1024 * 1024
@@ -237,12 +235,12 @@ def success(message):
     print(f"\n  \033[1;32m✓ {message}\033[0m", flush=True)
 
 
-def die(msg):
+def die(msg, **telemetry_fields):
     global _telemetry_failure_done
     if str(msg) == "install cancelled":
         _telemetry_failure_done = True
     else:
-        send_failure_telemetry(error_kind="controlled", message=str(msg))
+        send_failure_telemetry(error_kind="controlled", message=str(msg), **telemetry_fields)
     print(f"\n  \033[1;31mERROR:\033[0m {msg}")
     sys.exit(1)
 
@@ -384,29 +382,53 @@ def prepare_staging_dir():
     os.makedirs(STAGING_DIR, exist_ok=True)
 
 
-def remote_size(url, label):
+def parse_release(release):
+    """Return (tag, {name: {url, sha256, size}}) for RELEASE_FILES in one release."""
+    tag = release.get("tag_name") if isinstance(release, dict) else None
+    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+        die("GitHub release info has no usable tag")
+    assets = {
+        asset.get("name"): asset
+        for asset in release.get("assets") or []
+        if isinstance(asset, dict)
+    }
+    files = {}
+    for name in RELEASE_FILES:
+        asset = assets.get(name)
+        if asset is None:
+            die(f"release {tag} has no {name}")
+        match = re.fullmatch(r"sha256:([0-9a-f]{64})", str(asset.get("digest") or ""))
+        size = asset.get("size")
+        if not match or not isinstance(size, int) or size <= 0:
+            die(f"release {tag} has no SHA-256 or size for {name}")
+        files[name] = {
+            # Built from the tag so every file comes from this one release.
+            "url": f"https://github.com/{RELEASE_REPO}/releases/download/{tag}/{name}",
+            "sha256": match.group(1),
+            "size": size,
+        }
+    return tag, files
+
+
+def fetch_release():
     def attempt():
-        request = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(request) as response:
-            total = int(response.headers.get("Content-Length", "0") or "0")
-            if total <= 0:
-                raise ValueError(f"{label} response did not include Content-Length")
-            return total
+        request = urllib.request.Request(
+            RELEASE_API_URL, headers={"Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
 
     try:
-        return retry_network(f"checking {label} size", attempt)
+        release = retry_network("fetching release info", attempt)
     except Exception as exc:
-        die(f"failed to check {label} size: {exc}")
+        die(f"failed to fetch release info from GitHub: {exc}")
+    return parse_release(release)
 
 
-def check_staging_space(seed_helix):
-    sizes = [
-        remote_size(ROOTFS_URL, "root file system"),
-        remote_size(KERNEL_URL, "kernel"),
-        remote_size(SWAP_URL, "swap utility"),
-    ]
+def check_staging_space(seed_helix, release_files):
+    sizes = [info["size"] for info in release_files.values()]
     if seed_helix:
-        sizes.append(remote_size(HELIX_URL, "HelixScreen"))
+        sizes.append(HELIX_SIZE)
     required = sum(sizes) + INSTALL_SPACE_MARGIN
     free = shutil.disk_usage(UDISK).free
     if free < required:
@@ -481,39 +503,11 @@ def download_sha256(url, dest, label, expected_sha256):
         die(f"failed to download {label}: {exc}")
 
 
-def fetch_json(url, label):
-    def attempt():
-        with urllib.request.urlopen(url) as response:
-            return json.load(response)
-
-    try:
-        return retry_network(f"fetching {label}", attempt)
-    except Exception as exc:
-        die(f"failed to fetch {label}: {exc}")
-
-
-def _validate_index_entry(index, key, expected_sha256):
-    entry = index.get(key)
-    if not isinstance(entry, dict):
-        die(f"release index missing {key!r} entry")
-    digest = entry.get("sha256")
-    if digest != expected_sha256:
-        die(f"release index {key} SHA mismatch: expected {expected_sha256}, got {digest}")
-    size = entry.get("size")
-    if not isinstance(size, int) or size <= 0:
-        die(f"release index {key} has invalid size")
-
-
-def check_release_index():
-    index = fetch_json(RELEASE_INDEX_URL, "release index")
-    if not isinstance(index, dict):
-        die("release index did not contain an object")
-    if index.get("format") != "k2-release-index-v1" or index.get("version") != FIRMWARE_VERSION:
-        die("release index has an unsupported format")
-    _validate_index_entry(index, "rootfs", ROOTFS_SHA256)
-    _validate_index_entry(index, "kernel", KERNEL_SHA256)
-    _validate_index_entry(index, "swap", SWAP_SHA256)
-    return index
+def download_release_file(release_files, name, dest):
+    info = release_files[name]
+    download_sha256(info["url"], dest, RELEASE_FILES[name], info["sha256"])
+    if os.path.getsize(dest) != info["size"]:
+        die(f"{RELEASE_FILES[name]} is {os.path.getsize(dest)} bytes; expected {info['size']}")
 
 
 def flash(image, partition):
@@ -1014,8 +1008,21 @@ def write_custom_env_blob(target_slot, custom_blob):
 
 
 def run_swap():
-    if subprocess.run([SWAP_INSTALL_PATH, "--no-reboot", "--yes", "--nested"]).returncode != 0:
-        die("swap failed; see the error above")
+    # Show swap's output as it runs; keep the end of it for failure telemetry.
+    tail = collections.deque(maxlen=SWAP_OUTPUT_LINES)
+    proc = subprocess.Popen(
+        [SWAP_INSTALL_PATH, "--no-reboot", "--yes", "--nested"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        tail.append(ANSI_ESCAPE.sub("", line).rstrip())
+    if proc.wait() != 0:
+        die("swap failed; see the error above", output="\n".join(tail))
 
 
 def _ask(prompt):
@@ -1095,7 +1102,8 @@ def main():
     check_boot_contract(active_slot)
     _telemetry_context.update({"active_slot": active_slot, "target_slot": target_slot})
     custom_blob = preflight_env(active_slot, target_slot)
-    check_release_index()
+    release_tag, release_files = fetch_release()
+    _telemetry_context["release"] = release_tag
 
     fresh = confirm_install(active_slot, target_slot)
     # Read before the swap moves the custom slot back to the top of UDISK.
@@ -1105,7 +1113,7 @@ def main():
     send_telemetry("install_started")
 
     prepare_staging_dir()
-    check_staging_space(seed_helix)
+    check_staging_space(seed_helix, release_files)
     rootfs_path = os.path.join(STAGING_DIR, "rootfs.ext2")
     kernel_path = os.path.join(STAGING_DIR, "kernel.img")
     swap_path = os.path.join(STAGING_DIR, "swap")
@@ -1113,11 +1121,11 @@ def main():
 
     try:
         with step("Downloading root file system", "Root file system downloaded"):
-            download_sha256(ROOTFS_URL, rootfs_path, "root file system", ROOTFS_SHA256)
+            download_release_file(release_files, "rootfs.ext2", rootfs_path)
         with step("Downloading kernel.img", "Kernel downloaded"):
-            download_sha256(KERNEL_URL, kernel_path, "kernel", KERNEL_SHA256)
+            download_release_file(release_files, "kernel.img", kernel_path)
         with step("Downloading swap utility", "Swap utility downloaded"):
-            download_sha256(SWAP_URL, swap_path, "swap utility", SWAP_SHA256)
+            download_release_file(release_files, "swap", swap_path)
         if seed_helix:
             with step("Downloading HelixScreen", "HelixScreen downloaded"):
                 download_sha256(HELIX_URL, helix_path, "HelixScreen", HELIX_SHA256)

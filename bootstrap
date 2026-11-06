@@ -54,9 +54,7 @@ HELIX_DIR = ROOT / "helixscreen"
 MOONRAKER_ASVC = "helixscreen\nustreamer@stockcam\n"
 
 TIMELAPSE_URL = "https://raw.githubusercontent.com/mainsail-crew/moonraker-timelapse/main/component/timelapse.py"
-FIRMWARE_BASE_URL = "https://firmware.jacobean.xyz"
-FIRMWARE_VERSION = "6.18"
-RELEASE_INDEX_URL = f"{FIRMWARE_BASE_URL}/{FIRMWARE_VERSION}/index"
+FIRMWARE_RELEASE_REPO = "Jacob10383/k2-plus-custom-firmware"
 BOOTSTRAP_INSTALL_PATH = Path("/usr/bin/bootstrap")
 TIMEZONE_URL = "https://ipapi.co/timezone"
 NETWORK_ATTEMPTS = 3
@@ -75,10 +73,6 @@ MANAGED_PATHS = [
     ROOT / "mainsail",
     CONFIG_DIR,
 ]
-
-
-def object_url(digest: str) -> str:
-    return f"{FIRMWARE_BASE_URL}/{FIRMWARE_VERSION}/o/{digest}"
 
 
 def header(message: str) -> None:
@@ -311,7 +305,7 @@ def pip_install_requirements(venv: Path, requirements: list[Path], *extra_packag
     ensure_pip_executable(venv)
 
 
-def latest_release_asset(repo: str, asset_name: str) -> tuple[str, str]:
+def latest_release_asset_info(repo: str, asset_name: str) -> tuple[str, dict]:
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     log(f"fetching latest release metadata for {repo}")
     def attempt():
@@ -326,10 +320,15 @@ def latest_release_asset(repo: str, asset_name: str) -> tuple[str, str]:
 
     for asset in release.get("assets", []):
         if asset.get("name") == asset_name:
-            return release.get("tag_name", "unknown"), asset["browser_download_url"]
+            return release.get("tag_name", "unknown"), asset
 
     assets = ", ".join(asset.get("name", "?") for asset in release.get("assets", []))
     raise SystemExit(f"{repo} latest release has no {asset_name!r} asset; assets: {assets}")
+
+
+def latest_release_asset(repo: str, asset_name: str) -> tuple[str, str]:
+    tag, asset = latest_release_asset_info(repo, asset_name)
+    return tag, asset["browser_download_url"]
 
 
 def download(url: str, dest: Path) -> None:
@@ -348,64 +347,37 @@ def download(url: str, dest: Path) -> None:
         raise SystemExit(f"failed to download {url}: {exc}") from exc
 
 
-def file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def download_sha256(url: str, dest: Path, expected_sha256: str) -> None:
-    download(url, dest)
-    actual = file_sha256(dest)
-    if actual != expected_sha256:
-        dest.unlink(missing_ok=True)
-        raise SystemExit(
-            f"{dest.name} checksum mismatch: expected {expected_sha256}, got {actual}"
-        )
-
-
-def fetch_json(url: str):
+def fetch_bytes(url: str) -> bytes:
     def attempt():
         with urllib.request.urlopen(url, timeout=60) as response:
-            return json.load(response)
+            return response.read()
 
     try:
-        return retry_network(f"fetching {url}", attempt)
+        return retry_network(f"downloading {url}", attempt)
     except Exception as exc:
-        raise SystemExit(f"failed to fetch {url}: {exc}") from exc
-
-
-def fetch_release_index() -> dict:
-    index = fetch_json(RELEASE_INDEX_URL)
-    if not isinstance(index, dict):
-        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain an object")
-    if index.get("format") != "k2-release-index-v1" or index.get("version") != FIRMWARE_VERSION:
-        raise SystemExit(f"{RELEASE_INDEX_URL} has an unsupported release index format")
-    return index
-
-
-def release_index_file_sha256(index: dict, key: str) -> str:
-    entry = index.get(key)
-    if not isinstance(entry, dict):
-        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a {key!r} object")
-    digest = entry.get("sha256")
-    if (
-        not isinstance(digest, str)
-        or len(digest) != 64
-        or any(c not in "0123456789abcdef" for c in digest)
-    ):
-        raise SystemExit(f"{RELEASE_INDEX_URL} did not contain a valid {key} SHA256")
-    return digest
+        raise SystemExit(f"failed to download {url}: {exc}") from exc
 
 
 def install_bootstrap_update() -> bool:
-    index = fetch_release_index()
-    digest = release_index_file_sha256(index, "bootstrap")
-    if BOOTSTRAP_INSTALL_PATH.is_file() and file_sha256(BOOTSTRAP_INSTALL_PATH) == digest:
+    tag, asset = latest_release_asset_info(FIRMWARE_RELEASE_REPO, "bootstrap")
+    match = re.fullmatch(r"sha256:([0-9a-f]{64})", str(asset.get("digest") or ""))
+    size = asset.get("size")
+    if not match or not isinstance(size, int) or size <= 0:
+        raise SystemExit(f"release {tag} lists no SHA-256 or size for bootstrap; keeping this one")
+    new = fetch_bytes(asset["browser_download_url"])
+    actual = hashlib.sha256(new).hexdigest()
+    if len(new) != size or actual != match.group(1):
+        raise SystemExit(
+            f"downloaded bootstrap from {tag} is {len(new)} bytes, sha256 {actual}; "
+            f"release lists {size} bytes, sha256 {match.group(1)}; keeping this one"
+        )
+    if BOOTSTRAP_INSTALL_PATH.is_file() and BOOTSTRAP_INSTALL_PATH.read_bytes() == new:
         log("bootstrap already current")
         return False
+    try:
+        compile(new, str(BOOTSTRAP_INSTALL_PATH), "exec")
+    except (SyntaxError, ValueError) as exc:
+        raise SystemExit(f"bootstrap from {tag} is not valid Python; keeping this one ({exc})") from exc
 
     tmp_path = None
     try:
@@ -413,8 +385,8 @@ def install_bootstrap_update() -> bool:
             prefix=".bootstrap-", dir=str(BOOTSTRAP_INSTALL_PATH.parent), delete=False
         ) as tmp:
             tmp_path = Path(tmp.name)
-        log("updating bootstrap")
-        download_sha256(object_url(digest), tmp_path, digest)
+            tmp.write(new)
+        log(f"updating bootstrap to {tag}")
         tmp_path.chmod(0o755)
         os.replace(tmp_path, BOOTSTRAP_INSTALL_PATH)
         return True
