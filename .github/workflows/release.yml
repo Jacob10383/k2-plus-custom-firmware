@@ -1,0 +1,69 @@
+name: Publish firmware release
+
+# install.py and bootstrap --update download from the latest GitHub release.
+# release.py commits these files to the mirror; pushing them publishes a
+# release named after their content.
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.py
+      - index
+      - swap
+      - bootstrap
+      - .github/release_assets.py
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # No LFS checkout: rootfs and kernel come from R2.
+      - uses: actions/checkout@v6
+
+      - name: Collect and verify release files
+        id: assets
+        run: python3 .github/release_assets.py collect . "$RUNNER_TEMP/assets" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          TAG: ${{ steps.assets.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Only the content main has now becomes latest, so a rerun of an
+          # older commit never rolls installs back.
+          git fetch --depth=1 origin main
+          mkdir "$RUNNER_TEMP/main"
+          git archive FETCH_HEAD install.py index swap bootstrap | tar -x -C "$RUNNER_TEMP/main"
+          main_tag=$(python3 .github/release_assets.py tag "$RUNNER_TEMP/main")
+          latest=false
+          if [ "$main_tag" = "$TAG" ]; then latest=true; fi
+
+          if draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$draft" = "false" ]; then
+              # main went back to content that was already released.
+              if [ "$latest" = "true" ]; then gh release edit "$TAG" --latest=true; fi
+              echo "Release $TAG is already published (latest=$latest)"
+              exit 0
+            fi
+            # Left over from an interrupted run.
+            gh release delete "$TAG" --yes
+          fi
+
+          git log -1 --format=%B > "$RUNNER_TEMP/notes.md"
+          # Upload to a draft first so latest only moves once every file is there.
+          gh release create "$TAG" "$RUNNER_TEMP"/assets/* \
+            --draft --target "$GITHUB_SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --draft=false --latest="$latest"
+          echo "Published $TAG (latest=$latest)"

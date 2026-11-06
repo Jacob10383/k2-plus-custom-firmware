@@ -118,5 +118,5 @@ firmware and its files are not touched.
 To skip the menu, add `--fresh` to the end of the install command:
 
 ```sh
-python3 -c "import urllib.request; exec(urllib.request.urlopen('https://firmware.jacobean.xyz/install.py').read(), {'__name__':'__main__'})" --fresh
+python3 -c "import urllib.request; exec(urllib.request.urlopen('https://github.com/Jacob10383/k2-plus-custom-firmware/releases/latest/download/install.py').read(), {'__name__':'__main__'})" --fresh
 ```

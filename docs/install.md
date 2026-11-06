@@ -5,7 +5,7 @@ Unload any filament from the printhead before starting.
 SSH into the printer and run:
 
 ```sh
-python3 -c "import urllib.request; exec(urllib.request.urlopen('https://firmware.jacobean.xyz/install.py').read(), {'__name__':'__main__'})"
+python3 -c "import urllib.request; exec(urllib.request.urlopen('https://github.com/Jacob10383/k2-plus-custom-firmware/releases/latest/download/install.py').read(), {'__name__':'__main__'})"
 ```
 
 The installer reports whether the install succeeded or where it failed,
