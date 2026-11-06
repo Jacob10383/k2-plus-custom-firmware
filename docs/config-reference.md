@@ -73,6 +73,8 @@ external_feed_velocity: 600.0 # External/manual feedrate, mm/min
 toolchange_z_hop: 2.0       # Z clearance for toolchange travel, mm
 wastebin_pos_x: 133.0       # Wastebin X coordinate
 wastebin_pos_y: 378.0       # Wastebin Y coordinate; also the scraper row and pad back edge
+wastebin_approach_x: 160.0  # Staging X before climbing to the wastebin row; must be right of the flap
+wastebin_approach_y: 350.0  # Staging Y before climbing to the wastebin row; must be in front of the flap
 filament_retry_moves: Y350, X300, Y50, X50 # Moves before retrying a stalled load or blocked unload
 travel_velocity: 18000.0    # XY service-move feedrate, mm/min
 z_velocity: 600.0           # Z service-move feedrate, mm/min
