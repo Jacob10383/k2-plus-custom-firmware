@@ -9,11 +9,11 @@
   },
   "format": "k2-release-index-v1",
   "kernel": {
-    "sha256": "94db97f4d17885c110f392e05345c2a90268925e833d552e23a9b259b1fcf06a",
+    "sha256": "fba3bcaa8f2eea1a94bfa9fa9716191b36bc27637cdb34081586595ebde472c4",
     "size": 16777216
   },
   "rootfs": {
-    "sha256": "3868a34673a9dfac598631891284b97ca2aaf67b6230669e9a9e401f2165ce10",
+    "sha256": "14563399b9633f4b0194a1d53ef0bd12cb74b96bd775c95a24f433fde370055b",
     "size": 314572800
   },
   "swap": {
