@@ -27,7 +27,6 @@ safe_x_max: 225.0
 variable_heat_soak: 0                 # Bed heat-soak time, minutes
 variable_offset_ASA: 0                # Z offset for ASA prints, mm
 variable_offset_DEFAULT: 0.00         # Z offset for other materials, mm
-variable_adaptive_axis_twist_comp: 0  # 1 calibrates twist over the print area (not with PRTouch as the probe)
 variable_prtouch_scrub: 0             # 1 scrubs the nozzle on the plate tab before probing
 gcode:
 ```
