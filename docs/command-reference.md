@@ -21,7 +21,7 @@ Klipper and Cartographer commands remain in their own documentation.
 | `BOX_GO_TO_WASTEBIN` | Parks the printhead at the waste bin. |
 | `NOZZLE_CLEAN` | Runs the configured nozzle-cleaning sequence. |
 | `BOX_LOAD [SLOT=0]` | Loads a physical zero-based CFS slot without the full tool-change policy. |
-| `BOX_UNLOAD [MANUAL=0\|1]` | Fully unloads the active filament. |
+| `BOX_UNLOAD [MANUAL=0\|1]` | Fully unloads the active filament. `MANUAL=1` skips heating and cutting. On filament left over from a spool that ran out, it instead releases the filament for you to pull out by hand. |
 | `BOX_CUT [FORCE=0\|1]` | Runs the cutter directly. |
 | `BOX_BUFFER_RETRACT` | Runs the CFS buffer retract phase. |
 | `BOX_DEBUG [RAW=0\|1]` | Prints complete Box, topology, slot, sensor, and RFID diagnostics. |

@@ -17,6 +17,17 @@ firmware reports CFS status, errors, and troubleshooting information.
     [quick debugging guide](https://github.com/prestonbrown/helixscreen/blob/main/docs/user/TROUBLESHOOTING.md#quick-debugging-guide)
     and report it upstream.
 
+## Runout
+
+When a spool runs out, the print carries on with the filament left in the
+tube. Once that is used up, the printer changes to another slot with the same
+material and color. It pauses if there is none, or if runout swapping is off.
+
+If the print ends first, the leftover stays loaded. The next print uses it if
+it starts on that slot. Otherwise it is purged into the waste bin, which can
+take several minutes. To pull it out by hand instead, run
+`BOX_UNLOAD MANUAL=1`.
+
 ## Spoolman
 
 You can optionally link a Spoolman spool to each CFS slot from Filament Box.
