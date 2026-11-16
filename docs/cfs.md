@@ -22,6 +22,7 @@ firmware reports CFS status, errors, and troubleshooting information.
 When a spool runs out, the print carries on with the filament left in the
 tube. Once that is used up, the printer changes to another slot with the same
 material and color. It pauses if there is none, or if runout swapping is off.
+When it pauses, put in a new spool or pick another slot, then resume.
 
 If the print ends first, the leftover stays loaded. The next print uses it if
 it starts on that slot. Otherwise it is purged into the waste bin, which can
