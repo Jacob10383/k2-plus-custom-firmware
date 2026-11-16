@@ -24,10 +24,29 @@ tube. Once that is used up, the printer changes to another slot with the same
 material and color. It pauses if there is none, or if runout swapping is off.
 When it pauses, put in a new spool or pick another slot, then resume.
 
+While the leftover is printing, Filament Box shows roughly how much of it is
+left. The estimate needs a few loads from that CFS first, and it is not shown
+after Klipper restarts.
+
 If the print ends first, the leftover stays loaded. The next print uses it if
 it starts on that slot. Otherwise it is purged into the waste bin, which can
 take several minutes. To pull it out by hand instead, run
 `BOX_UNLOAD MANUAL=1`.
+
+## External spool
+
+A print that changes between the External spool and a CFS slot pauses at the
+change. Pull the External filament out, or insert it, as the console says,
+then resume.
+
+Outside a print, loading a CFS slot while the External spool is loaded
+releases its filament and stops. Pull it out, then load the slot again.
+
+## Broken filament
+
+After a few loads the printer knows how long each CFS's tube is. If an unload
+pulls back much less than that, the console warns that filament may have
+broken in the tube.
 
 ## Spoolman
 
