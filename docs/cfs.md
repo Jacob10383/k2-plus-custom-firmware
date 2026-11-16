@@ -4,7 +4,9 @@
 
 The CFS is controlled through a custom Fluidd widget called **Filament Box**.
 It shows the CFS and filament-path state, lets you select a slot or unload
-filament, and stores the material details for each slot.
+filament, and stores the material details for each slot. While it loads,
+unloads or changes filament it shows each step and how far along it is. If a
+print pauses there, it says what to do before you resume.
 
 Open the widget settings with the cog to change runout swapping, unloading
 after a print, and RFID reading options. The Fluidd console is where the
