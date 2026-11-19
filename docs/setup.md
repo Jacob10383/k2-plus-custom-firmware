@@ -33,7 +33,8 @@ T[initial_no_support_extruder]
 ;LINE_PURGE
 ```
 
-Remove the semicolon from `;LINE_PURGE` to enable the KAMP purge line.
+Remove the semicolon from `;LINE_PURGE` to draw a purge line next to your
+objects before the print starts.
 
 ### Before Layer Change G-code
 
