@@ -3,6 +3,15 @@
 Commands added or overridden by this firmware are listed here. Standard
 Klipper and Cartographer commands remain in their own documentation.
 
+## Printing
+
+| Command | Behavior |
+| --- | --- |
+| `PRINT_OPTIONS [<ID>=<value> ...]` | Sets [print options](config-reference.md#print-options) for the print started right after it, such as `SOAK=30 KEEP_HEATED=60`. Orca and Fluidd send it when you start a print. With no options, clears them. |
+| `HEAT_SOAK [MINUTES=0]` | Waits `MINUTES`, at most 240, for the printer to heat soak. During a print, a heat soak chosen when it started replaces `MINUTES`. Fluidd can change or skip a running soak. |
+| `PRINT_HEATERS_OFF [KEEP=0\|1]` | Turns off all heaters. `KEEP=1` leaves the bed and chamber on when **Keep bed and chamber heated** was chosen for the print, and turns them off after the chosen time. |
+| `LINE_PURGE` | Draws a purge line next to the objects being printed, using the [line_purge](config-reference.md#line-purge) settings. Without labelled objects it purges at the front-left corner; turn on **Label objects** in the slicer. |
+
 ## Maintenance macros
 
 | Command | Behavior |
@@ -11,7 +20,6 @@ Klipper and Cartographer commands remain in their own documentation.
 | `BELT_TENSION [AXES=XY]` | Automatically tensions X, Y, or both to 140. |
 | `BEDPID` | Calibrates the bed PID at 100°C and saves the result. |
 | `NOZZLE_PID` | Calibrates the nozzle PID at 230°C and saves the result. |
-| `NOZZLE_PID_HIGH` | Calibrates the nozzle PID at 320°C and saves the result. |
 
 ## CFS and tool changes
 
@@ -19,7 +27,7 @@ Klipper and Cartographer commands remain in their own documentation.
 | --- | --- |
 | `T<n> [FLUSH=1]` | Changes to zero-based slot `<n>`. During a print, `<n>` is the file's tool number and changes to the slot chosen for it. `FLUSH=0` skips the purge. |
 | `BOX_GO_TO_WASTEBIN` | Parks the printhead at the waste bin. |
-| `NOZZLE_CLEAN` | Runs the configured nozzle-cleaning sequence. |
+| `NOZZLE_CLEAN [RETURN=0\|1]` | Runs the configured nozzle-cleaning sequence. `RETURN=1` moves back to where it started. |
 | `BOX_LOAD [SLOT=0]` | Loads a physical zero-based CFS slot without the full tool-change policy. |
 | `BOX_UNLOAD [MANUAL=0\|1]` | Fully unloads the active filament. `MANUAL=1` skips heating and cutting. On filament left over from a spool that ran out, it instead releases the filament for you to pull out by hand. |
 | `BOX_CUT [FORCE=0\|1]` | Runs the cutter directly. |
@@ -52,7 +60,7 @@ also accept `SAMPLES=`, `MAX_SAMPLES=`, `MAX_NOISY=`, `SAMPLE_RANGE=`,
 
 | Command | Behavior |
 | --- | --- |
-| `CALIBRATE_CUT_POS` | Homes XY if needed, measures the cutter hit, and saves `cut_pos_x`. |
+| `CALIBRATE_CUT_POS` | Homes XY if needed, measures the cutter hit, and saves `cut_pos_x`. Unload the filament first. |
 | `MOTOR_CALIBRATE AXIS=XYZZ1 [DETAIL=raw]` | Calibrates one or more kinematic motors after a positioning confirmation pass. |
 | `MOTOR_CALIBRATE AXIS=E STAGE=encoder\|offset\|1\|2 [DETAIL=raw]` | Runs the selected extruder calibration stage. |
 | `MOTOR_STATUS [VERBOSE=1]` | Reports motor startup, fault, calibration, and runtime state. |
@@ -60,8 +68,12 @@ also accept `SAMPLES=`, `MAX_SAMPLES=`, `MAX_NOISY=`, `SAMPLE_RANGE=`,
 | `MOTOR_QUERY_FAULTS` | Queries live fault, warning, and status codes for every motor. |
 | `MOTOR_CFG_OVERRIDE_STATUS [AXIS=XYZZ1E] [DETAIL=raw]` | Compares active config overrides with current board values. |
 | `MOTOR_RETRY_STARTUP` | Re-runs motor-control startup. |
+| `MOTOR_CONTROL AXIS=<axis> [OP=query\|disable]` | Debug command: reports whether one motor's drive is on, or switches it off with `OP=disable`. Klipper still treats a switched-off motor as on and its axis as homed: run `M84`, then home, before moving it. |
 | `MOTOR_READ_PARAM PARAM=<config-key>` | Reads a motor parameter's runtime and flash values. |
 | `MOTOR_FLASH_PARAM PARAM=<config-key> [VALUE=] [COMMIT=1]` | Reads or changes a motor parameter; `COMMIT=1` writes motor-board flash. |
+
+On the K2 Pro, `AXIS` takes only X, Y and E: its Z motor is not one of these
+motors, so `MOTOR_CALIBRATE` takes `AXIS=XY`.
 
 ## Belt tension modules
 

@@ -44,11 +44,10 @@ then resume.
 Outside a print, loading a CFS slot while the External spool is loaded
 releases its filament and stops. Pull it out, then load the slot again.
 
-## Broken filament
+## CFS goes offline
 
-After a few loads the printer knows how long each CFS's tube is. If an unload
-pulls back much less than that, the console warns that filament may have
-broken in the tube.
+If the CFS feeding a print disconnects, the print pauses until it reconnects.
+A CFS connected after Klipper started needs a Klipper restart.
 
 ## Spoolman
 
@@ -85,12 +84,11 @@ off by default.
   its RFID tag once to populate its saved filament details. Filament must
   be unloaded.
 - **Read RFID after Klipper starts** — when Klipper starts, read present
-  spools that the CFS internally has no RFID data for. Consequently, a
-  printer power cycle spins every occupied slot. Saved slot details
-  (name, color, material) live in Klipper. RFID remaining % comes from
-  the CFS RFID record and shows on the slot after a successful read.
-  The only reason to enable this is RFID remaining %. Filament must be
-  unloaded.
+  spools the CFS holds no tag record for. The CFS loses its records when it
+  loses power, so a printer power cycle spins every occupied slot. It only
+  runs when no filament is loaded. Saved slot details (name, color,
+  material) live in Klipper and survive a power cycle; RFID remaining % does
+  not, so getting it back is the only reason to enable this.
 
 ### External reader
 

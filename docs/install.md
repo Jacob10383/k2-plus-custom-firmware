@@ -2,6 +2,10 @@
 
 Unload any filament from the printhead before starting.
 
+!!! warning "K2 Pro"
+    K2 Pro support is new and has had far less testing than the K2 Plus.
+    Creality firmware stays installed, so you can `swap` back at any time.
+
 SSH into the printer and run:
 
 ```sh
@@ -16,7 +20,8 @@ telemetry.
 Power cycle the printer when instructed.
 
 If Jacobean's firmware was installed before, the installer asks whether to keep
-your setup or start over. See [Updates & Recovery](updates-recovery.md#update-creality-firmware).
+your setup, reset system files or start over. See
+[Updates & Recovery](updates-recovery.md).
 
 ## First boot
 
@@ -27,7 +32,8 @@ After the printer starts again, connect it to the network:
   same network. Otherwise, use the printer screen only far enough to join the
   network.
 
-Then SSH into the printer as `root` (password `creality_2024`) and run:
+If you use a Cartographer, it should be plugged in. Then SSH into the printer as `root`
+(password `creality_2024`) and run:
 
 ```sh
 bootstrap
@@ -38,8 +44,8 @@ Change the password with `passwd` if you so choose.
 When bootstrap finishes, Fluidd is available on port `4408` and Mainsail on
 port `4409` at the printer's IP address.
 
-The default configuration expects the 5.8 mm Y-endstop spacer and the
-Cartographer mount used by K2 Improvements.
+See [Probe modes](calibration.md#probe-modes) for the mode bootstrap picks
+and the mount and Y-endstop spacer each mode expects.
 
 ## Before your first print
 

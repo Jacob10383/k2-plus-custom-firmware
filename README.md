@@ -1,6 +1,6 @@
-# K2 Plus Custom Firmware
+# K2 Plus and K2 Pro Custom Firmware
 
-A complete alternative firmware stack for the Creality K2 Plus.
+A complete alternative firmware stack for the Creality K2 Plus and K2 Pro.
 
 It replaces the stock software environment with a custom Linux kernel, root
 filesystem, and [Kalico fork](https://github.com/Jacob10383/kalico). The

@@ -2,8 +2,9 @@
 
 This lists the configuration sections and options added by this firmware.
 Standard Klipper and Cartographer configuration remains in their own
-documentation. Values shown are the shipped baseline or the source default
-when the shipped config leaves an option unset.
+documentation. Values shown are the shipped K2 Plus baseline or the source
+default when the shipped config leaves an option unset. Where the K2 Pro ships
+a different value, the comment ends with it.
 
 ## Changing settings
 
@@ -24,7 +25,7 @@ safe_x_max: 225.0
 
 ```ini
 [gcode_macro _START_PRINT_VARS]
-variable_heat_soak: 0                 # Bed heat-soak time, minutes
+variable_heat_soak: 0                 # Heat soak before each print, minutes; the time Orca and Fluidd offer
 variable_offset_ASA: 0                # Z offset for ASA prints, mm
 variable_offset_DEFAULT: 0.00         # Z offset for other materials, mm
 variable_prtouch_scrub: 0             # 1 scrubs the nozzle on the plate tab before probing
@@ -33,6 +34,57 @@ gcode:
 
 Add `variable_offset_<MATERIAL>` for other materials, using the material name
 the slicer sends.
+
+## Print Options
+
+Options Orca and Fluidd show when you start a print.
+
+| Option | What it does |
+| --- | --- |
+| `soak`: Heat soak | Waits this long after the bed reaches temperature, up to 240 minutes. Offered at `heat_soak` from `_START_PRINT_VARS`. |
+| `keep_heated`: Keep bed and chamber heated | Keeps the bed and chamber at their print temperatures after a print finishes, is cancelled or stops on an error, then turns them off after the chosen time. Off unless switched on; 30 minutes offered. Setting either heater to another temperature, or off, stops keeping it. |
+
+To change an option, add a `[print_option <id>]` section to `overrides.cfg`
+with only what differs:
+
+```ini
+[print_option keep_heated]
+default: 60                 # Time offered, minutes
+```
+
+A section with a new id adds an option. Macros read its value for the print
+from `printer.print_control.active.<id>`.
+
+```ini
+[print_option <id>]
+enabled: True               # False removes the option
+label:                      # Name shown when starting a print; required for a new option
+section:                    # Heading the option is grouped under
+hint:                       # Help text
+type:                       # minutes or switch; required for a new option
+default:                    # Value offered; switch: False, minutes: min
+min: 0                      # minutes only; 1 when optional
+max: 240                    # minutes only
+step: 5                     # minutes only
+optional: False             # minutes only; adds a switch that is off unless turned on
+value_label:                # minutes only; shown next to the time once switched on
+requires:                   # Printer object the option needs; hidden without it
+```
+
+## Line Purge
+
+Settings for `LINE_PURGE` (see [Start G-code](setup.md#start-g-code)).
+
+```ini
+[line_purge]
+purge_height: 0.6           # Nozzle Z while purging, mm
+purge_margin: 35            # Gap between the objects and the purge line, mm
+purge_amount: 25            # Line length and filament purged, mm
+flow_rate: 12               # Purge speed; the line moves at flow_rate / 5 mm/s
+tip_distance: 0             # Filament pushed before the line starts, mm
+retract_length: 0.5         # Retract after the line, pushed back on the first printed move, mm
+retract_speed: 35           # Retract and push-back speed, mm/s
+```
 
 ## Serial RS-485 Bus
 
@@ -53,7 +105,9 @@ max_queued_frames: 64       # Max received frames buffered before dropping old o
 ## CFS Box
 
 Main CFS subsystem: address assignment, load/unload and tool changes, runout,
-slot metadata, RFID, cutter motion, and nozzle cleaning.
+slot metadata, RFID, cutter motion, and nozzle cleaning. Wastebin, wiper and
+cutter positions are printer coordinates: skew correction and G-code offsets
+don't move them.
 
 ```ini
 [box]
@@ -70,11 +124,11 @@ retract_length: 30          # Retract before cutting, mm
 retract_velocity: 3000.0    # Retraction/snap/cut-assist feedrate, mm/min
 external_feed_velocity: 600.0 # External/manual feedrate, mm/min
 toolchange_z_hop: 2.0       # Z clearance for toolchange travel, mm
-wastebin_pos_x: 133.0       # Wastebin X coordinate
-wastebin_pos_y: 378.0       # Wastebin Y coordinate; also the scraper row and pad back edge
+wastebin_pos_x: 133.0       # Wastebin X coordinate; K2 Pro: 124.0
+wastebin_pos_y: 378.0       # Wastebin Y coordinate; also the scraper row and pad back edge; K2 Pro: 329.0
 wastebin_approach_x: 160.0  # Staging X before climbing to the wastebin row; must be right of the flap
-wastebin_approach_y: 350.0  # Staging Y before climbing to the wastebin row; must be in front of the flap
-filament_retry_moves: Y350, X300, Y50, X50 # Moves before retrying a stalled load or blocked unload
+wastebin_approach_y: 350.0  # Staging Y before climbing to the wastebin row; must be in front of the flap; K2 Pro: 300.0
+filament_retry_moves: Y350, X300, Y50, X50 # Moves before retrying a stalled load or blocked unload; K2 Pro: Y300, X250, Y50, X50
 travel_velocity: 18000.0    # XY service-move feedrate, mm/min
 z_velocity: 600.0           # Z service-move feedrate, mm/min
 pre_cut_pos_x: 10.0         # X position used before/after the cut stroke
@@ -83,11 +137,11 @@ cut_pos_y: 200.0            # Y position used for the cut sequence
 cut_velocity: 30000.0       # Cut move feedrate, mm/min
 cut_accel: 6000.0           # Toolhead accel for cutter strokes, mm/s2
 pre_cut_cal_pos_x: -5.0     # Starting X position for cut-position calibration
-check_cut_pos_x_max: -5.5   # Highest accepted X hit during cutter check/calibration
-check_cut_pos_x_min: -9.5   # Lowest accepted X hit during cutter check/calibration
-clean_pad_left_x: 154.0     # Silicone pad left X edge
-clean_pad_right_x: 166.0    # Silicone pad right X edge
-clean_pad_front_y: 367.0    # Silicone pad front Y edge
+check_cut_pos_x_max: -5.5   # Highest accepted X hit during cutter check/calibration; K2 Pro: -6.5
+check_cut_pos_x_min: -9.5   # Lowest accepted X hit during cutter check/calibration; K2 Pro: -10
+clean_pad_left_x: 154.0     # Silicone pad left X edge; K2 Pro: 153
+clean_pad_right_x: 166.0    # Silicone pad right X edge; K2 Pro: 163
+clean_pad_front_y: 367.0    # Silicone pad front Y edge; K2 Pro: 320
 clean_pad_passes: 1         # Complete silicone scrub passes
 clean_velocity: 9000.0      # Flap strike, scraper, and pad feedrate, mm/min
 snap_fan_speed: 1.0         # Part-fan speed during flush-clean-snap, 0-1
@@ -123,9 +177,9 @@ K2 load-cell probe and multi-sample Z-home settings.
 ```ini
 [prtouch]
 z_offset: 0                 # Probe offset
-register_as_probe: False    # Keep PRTouch as an alternate prtouch: chip
+register_as_probe: True     # False keeps PRTouch as an alternate prtouch: chip
 speed: 5                    # Probe speed, mm/s
-lift_speed: 40              # Probe lift speed, mm/s
+lift_speed: 40              # Probe lift speed, mm/s; K2 Pro: 10
 samples: 1                  # Standard probe samples
 sample_retract_dist: 2.0    # Retract between samples, mm
 samples_result: median      # Sample aggregation
@@ -133,7 +187,7 @@ samples_tolerance: 0.02     # Allowed sample spread, mm
 samples_tolerance_retries: 3
 no_trigger_retries: 1       # Retry attempts after a clean no-trigger probe
 no_trigger_retry_max_distance: 10.0 # Maximum probe move length eligible for no-trigger retry, mm
-home_xy: 175, 175            # XY point used by PRTOUCH_HOME
+home_xy: 175, 175           # XY point used by PRTOUCH_HOME; K2 Pro: 150, 150
 home_samples: 3
 home_max_samples: 10
 home_max_noisy: 3
@@ -141,10 +195,10 @@ home_sample_range: 0.010    # Maximum accepted home spread, mm
 home_travel_speed: 200      # XY travel speed, mm/s
 home_z_hop: 2               # Lift between home samples, mm
 thermal_expansion: 0.00083  # Nozzle/stack growth, mm/°C
-scrub_x_start: 173          # Rear-tab wipe start X
-scrub_x_end: 223            # Rear-tab wipe end X
-scrub_y_min: 353            # Random wipe Y range, minimum
-scrub_y_max: 356            # Random wipe Y range, maximum
+scrub_x_start: 173          # Rear-tab wipe start X; K2 Pro: 145
+scrub_x_end: 223            # Rear-tab wipe end X; K2 Pro: 195
+scrub_y_min: 353            # Random wipe Y range, minimum; K2 Pro: 304.5
+scrub_y_max: 356            # Random wipe Y range, maximum; K2 Pro: 307.5
 scrub_detect_hold_ratio: 2.5
 scrub_detect_deflection: 0.035
 scrub_tab_depth: 0.15
@@ -172,21 +226,23 @@ parameter overrides, calibration, and motor fault reporting.
 
 ```ini
 [motor_control]
+motor_axes: x, y, z, z1     # Motion axes that have these motors; must include x and y; K2 Pro: x, y
 cut_pos_offset: 0.4         # Added to measured cutter hit when saving cut_pos_x
-mcu_temperature_sensors: x, y, z, z1, e # Motors shown as motor_<axis>_MCU temperature sensors; none disables
+mcu_temperature_sensors: x, y, z, z1, e # Motors shown as motor_<axis>_MCU temperature sensors; none disables; K2 Pro: x, y, e
 
 x_param_stall_pos_err_rad: 0.007
 y_param_stall_pos_err_rad: 0.007
 x_protection_param_prt_track_err_time: 0.1
 y_protection_param_prt_track_err_time: 0.1
-z_protection_param_prt_track_err_time: 0.1
-z1_protection_param_prt_track_err_time: 0.1
+z_protection_param_prt_track_err_time: 0.1   # Not on the K2 Pro
+z1_protection_param_prt_track_err_time: 0.1  # Not on the K2 Pro
 e_protection_param_prt_track_err_time: 0.1
 ```
 
-Motor firmware overrides use `{axis}_{parameter}`, where axis is `e`, `x`,
-`y`, `z`, or `z1`. If an override is omitted, the motor board's stored value
-is used. All five axes accept these parameter names:
+Motor firmware overrides use `{axis}_{parameter}`, where axis is `e` or one
+listed in `motor_axes` (`x`, `y`, `z`, `z1`; `x`, `y` on the K2 Pro). If an
+override is omitted, the motor board's stored value is used. Every axis
+accepts these parameter names:
 
 ??? abstract "Motor firmware parameter names"
 
@@ -250,26 +306,32 @@ is used. All five axes accept these parameter names:
 
 ## Z Align
 
-MCU-assisted dual-Z bottom-switch alignment before final host-side Z homing.
+Lowers the bed onto its bottom switches before Z homing. The K2 Plus has two
+Z motors, each with its own switch, and levels them against each other; the
+K2 Pro has one Z motor and one switch.
 
 ```ini
 [z_align]
-endstop_pin_z: PA15, PA8   # Bottom switch pins, one per Z motor
-zd_up: 0                   # Direction level that moves Z away from switches
+endstop_pin_z: PA15, PA8   # Bottom switch pins, one per Z motor; K2 Pro: PA15
+zd_up: 0                   # Direction level that moves Z away from the switches; K2 Pro: 1
 zes_untrig: 1              # Logic level reported by an untriggered switch
-quick_speed: 30.0          # Fast MCU-side drop speed, mm/s
-slow_speed: 10.0           # Slow settle speed, mm/s
-rising_dist: 5             # Lift between fast and slow MCU passes, mm
-filter_cnt: 10             # Consecutive switch samples required for trigger
-retries: 5                 # MCU retry attempts before aborting
-retry_tolerance: 10        # Allowed left/right mismatch, steps
-rise_distance: 340         # Post-align rise distance, mm
-rise_speed: 50             # Post-align rise speed, mm/s
-temp_rise_max_z_accel: 200 # Temporary accel cap for the post-align rise
-safe_dist: 40              # Max extra one-sided drop after the other switch hits
-timeout: 30                # Seconds allowed for one MCU alignment attempt
-zmax: 350                  # Logical Z after bottom-switch alignment
+quick_speed: 30            # Fast drop onto the switches, mm/s; K2 Pro: 6.2
+slow_speed: 10             # Slow settle onto the switches, mm/s; K2 Pro: 6.2
+rising_dist: 5             # Lift between the fast and slow passes, mm
+filter_cnt: 10             # Consecutive switch samples required for a trigger
+retries: 5                 # Alignment attempts before homing fails
+retry_tolerance: 10        # Allowed mismatch between the two Z motors, in step-pin toggles; K2 Plus only
+rise_distance: 340         # Rise after alignment, mm; K2 Pro: 290
+rise_speed: 50             # Rise speed, mm/s; K2 Pro: 10
+temp_rise_max_z_accel: 200 # Accel cap for that rise, mm/s2
+safe_dist: 40              # Furthest one side drops after the other side's switch triggers, mm; K2 Pro: 25
+timeout: 30                # Seconds allowed for one alignment attempt; K2 Pro: 60
+zmax: 350                  # Z at the bottom switch, the printer's nominal height; K2 Pro: 300
 ```
+
+After Z homes, the bottom switch is measured and Klipper's Z limit moves to
+it, plus the travel `[stepper_z] position_max` allows past `zmax` (at most
+2.5 mm; shipped `position_max` is 352.5, K2 Pro 302.5).
 
 ## Belt Tension Modules
 
@@ -323,10 +385,10 @@ Routes moves safely into the K2 extended Y area before bed-mesh compensation.
 
 ```ini
 [extended_zone_transform]
-standard_y_max: 352.0      # Normal Y envelope
-extended_y_max: 380.0      # Extended Y envelope
-safe_x_min: 132.0          # Minimum X allowed while entering extended Y
-safe_x_max: 230.0          # Maximum X allowed while entering extended Y
+standard_y_max: 352.0      # Normal Y envelope; K2 Pro: 302.0
+extended_y_max: 380.0      # Extended Y envelope; K2 Pro: 331.0
+safe_x_min: 132.0          # Minimum X allowed while entering extended Y; K2 Pro: 123.0
+safe_x_max: 230.0          # Maximum X allowed while entering extended Y; K2 Pro: 210.0
 ```
 
 ## Power-Loss Recovery
@@ -338,12 +400,15 @@ Maintains durable print checkpoints for manual recovery after a power loss.
 state_path: /mnt/UDISK/printer_data/power_loss_recovery # A/B journal directory
 candidate_interval: 0.5     # Minimum seconds between in-memory candidates
 checkpoint_interval: 10.0   # Minimum seconds between durable submissions
-recovery_lift: 5.0          # Clearance above saved print Z, mm
-maximum_recovery_z: 350.0   # Maximum aligned K2 recovery clearance, mm
+recovery_lift: 5.0          # Clearance above the printed part while recovering, mm; at least [z_align] rising_dist + 2 is used
 recovery_travel_speed: 100.0 # XY recovery travel, mm/s
-recovery_z_speed: 15.0      # Z recovery move speed, mm/s
+recovery_z_speed: 15        # Z recovery move speed, mm/s; K2 Pro: 10
 nozzle_standby: 140.0       # Nozzle target during reference recovery
 ```
+
+A print can be recovered only while the part plus that clearance reaches no
+higher than the measured bottom switch. `maximum_recovery_z` from older configs is
+ignored.
 
 ## Chamber Heater Circulation Fan
 

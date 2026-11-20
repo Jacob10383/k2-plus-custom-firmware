@@ -1,6 +1,7 @@
-# Jacobean's K2 Plus firmware
+# Jacobean's K2 Plus and K2 Pro firmware
 
-A complete alternative firmware stack for the Creality K2 Plus.
+A complete alternative firmware stack for the Creality K2 Plus and K2 Pro.
+K2 Pro support is new and has had far less testing than the K2 Plus.
 
 It includes a custom Linux system and
 [my Kalico fork](https://github.com/Jacob10383/kalico), with

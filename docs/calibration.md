@@ -4,13 +4,16 @@
 
 | Mode | What it does |
 | --- | --- |
-| Mixed (default) | Cartographer scans the bed, PRTouch does touch operations (Z offset) |
+| Mixed | Cartographer scans the bed, PRTouch does touch operations (Z offset) |
 | Cartographer | Cartographer does both |
 | PRTouch | PRTouch does both |
 
-The default configuration of Mixed and Cartographer modes expects the K2
-Improvements Cartographer mount and the 5.8 mm Y-endstop spacer. Change it if
-your setup differs.
+On a new install, bootstrap picks Mixed when a Cartographer is plugged in and
+PRTouch otherwise. Updates keep your mode.
+
+Mixed and Cartographer modes expect the K2 Improvements Cartographer mount and
+the 5.8 mm Y-endstop spacer. Change the configuration if your setup differs.
+PRTouch mode expects no spacer; remove it if one is fitted.
 
 Check the current mode:
 
@@ -34,7 +37,7 @@ Bootstrap restarts Klipper after switching.
 
 Run only the commands for your probe mode.
 
-=== "Mixed (default)"
+=== "Mixed"
 
     First, home the printer:
 
@@ -90,7 +93,7 @@ The firmware will tell you when a motor is uncalibrated and needs
 `MOTOR_CALIBRATE`. It is also worth trying when troubleshooting print or motor
 issues.
 
-For X, Y, Z, or Z1:
+For X, Y, Z or Z1 (X or Y on a K2 Pro):
 
 ```gcode
 MOTOR_CALIBRATE AXIS=X
