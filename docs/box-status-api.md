@@ -10,7 +10,7 @@ them. It ships with the firmware as `docs/box-status-api.md`, next to the
 | Field | Changes when |
 |---|---|
 | `api_version` | A change clients must handle: a field removed or its meaning changed while a supported client still reads it. Currently `1`. |
-| `api_revision` | Any additive change. Clients check `api_revision >= N` before using what revision `N` added. |
+| `api_revision` | Any additive change. |
 
 Both cover the whole object, print mapping included.
 
