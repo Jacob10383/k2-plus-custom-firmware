@@ -1496,7 +1496,10 @@ class PowerLossRecovery:
                 "speed": float(move.speed),
                 "speed_factor": float(move.speed_factor),
                 "extrude_factor": float(move.extrude_factor),
-                "max_print_z": float(self.max_print_z),
+                # Recovery clears this, then moves to last_position, which a
+                # travel Z-hop can put above the printed height.
+                "max_print_z": float(max(
+                    self.max_print_z, move.last_position[2])),
             },
             "z_frame": copy.deepcopy(frame),
             "mesh": context_state["mesh"],

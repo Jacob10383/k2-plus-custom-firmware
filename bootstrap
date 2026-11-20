@@ -55,6 +55,8 @@ HELIX_DIR = ROOT / "helixscreen"
 
 MOONRAKER_ASVC = "helixscreen\nustreamer@stockcam\nustreamer@crealitynozzle\n"
 NOZZLE_CAMERA = Path("/dev/v4l/by-path/platform-4200000.usb-usb-0:1.2:1.0-video-index0")
+# Only OS images that stream the nozzle camera ship this.
+NOZZLE_CAMERA_ENV = Path("/etc/ustreamer/crealitynozzle.env")
 
 TIMELAPSE_URL = "https://raw.githubusercontent.com/mainsail-crew/moonraker-timelapse/main/component/timelapse.py"
 FIRMWARE_RELEASE_REPO = "Jacob10383/k2-plus-custom-firmware"
@@ -552,9 +554,13 @@ def install_webcam() -> None:
         log_warn("Moonraker webcam API did not come up in 120s — skipping webcam registration")
         return
     for webcam in WEBCAMS:
-        if webcam["name"] == "Creality Nozzle" and not NOZZLE_CAMERA.exists():
-            log("no Creality nozzle camera found; not adding it to the web UI")
-            continue
+        if webcam["name"] == "Creality Nozzle":
+            if not NOZZLE_CAMERA_ENV.exists():
+                log("this OS image has no Creality nozzle camera stream; not adding it to the web UI")
+                continue
+            if not NOZZLE_CAMERA.exists():
+                log("no Creality nozzle camera found; not adding it to the web UI")
+                continue
         req = urllib.request.Request(
             "http://localhost:7125/server/webcams/item",
             data=json.dumps(webcam).encode(),
