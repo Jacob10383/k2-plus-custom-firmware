@@ -2,6 +2,9 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 """Shared helpers for saving/restoring Klipper motion limits."""
 
+import logging
+from contextlib import contextmanager
+
 _saved_motion_limits = {}
 
 
@@ -61,6 +64,35 @@ def restore_motion_limits(gcode, name, include_gcode=False, move=0, clear=True):
         )
     if clear:
         _saved_motion_limits.pop(name, None)
+
+
+@contextmanager
+def saved_motion(printer, gcode, name):
+    """Restore motion limits and G-code state when the block ends.
+
+    The toolhead stays where the block left it.
+    """
+    save_motion_limits(printer, gcode, name, include_gcode=True)
+    try:
+        yield
+    finally:
+        try:
+            restore_motion_limits(gcode, name, include_gcode=True, move=0)
+        except Exception:
+            # Keep the block's own outcome: its error, or its success.
+            logging.exception("motion_limits: failed restoring %s", name)
+
+
+def set_service_motion(
+        gcode, velocity, accel, minimum_cruise_ratio, square_corner_velocity):
+    """Absolute coordinates and temporary limits; use inside saved_motion()."""
+    gcode.run_script_from_command("G90")
+    gcode.run_script_from_command(
+        "SET_VELOCITY_LIMIT VELOCITY=%g ACCEL=%g "
+        "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%g"
+        % (velocity, accel, minimum_cruise_ratio, square_corner_velocity))
+
+
 class MotionLimits:
     def __init__(self, config):
         self.printer = config.get_printer()

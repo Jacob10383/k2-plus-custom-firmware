@@ -113,44 +113,10 @@ class AutoAddressManager:
                 errors.append("all four CFS addresses are online")
                 break
 
-            if reply.mode:
-                _klog(
-                    'loader mode uid=%s; assign then start app', uniid.hex(),
-                    level=logging.info)
-                self._call(
-                    errors, "assign loader box %s to address %d"
-                    % (uniid.hex(), target),
-                    client.assign, uniid, target)
-                self._call(
-                    errors, "start app for box %s" % uniid.hex(),
-                    client.start_app)
-                if pause is not None:
-                    pause(LOADER_TO_APP_SETTLE)
-
             _klog(
                 'A0 assign uid=%s address=%d source=%s', uniid.hex(), target,
                 "persisted" if preferred else "first-free", level=logging.info)
-            assigned = self._call(
-                errors, "assign box %s to address %d" % (uniid.hex(), target),
-                client.assign, uniid, target)
-            if assigned is None:
-                errors.append(
-                    "assign address %d returned no valid response" % target)
-                errors.append(ADDRESS_WEDGE_WARNING)
-                break
-
-            verified = self._call(
-                errors, "verify address %d" % target, client.query, target)
-            if verified is None:
-                errors.append("address %d verification gave no response" % target)
-                break
-            if verified.uniid != uniid:
-                errors.append(
-                    "address %d verification returned the wrong box identity"
-                    % target)
-                break
-            if verified.mode:
-                errors.append("address %d verification returned loader mode" % target)
+            if not self._assign(client, errors, reply, target, pause):
                 break
 
             _klog(
@@ -171,6 +137,77 @@ class AutoAddressManager:
              for address, uniid in result.known.items()},
             list(result.errors) or "none", level=logging.info)
         return result
+
+    def reclaim(self, client, lost, pause=None):
+        """Give a box that lost power since enumeration its address back.
+
+        lost maps each offline address to the UniID it had. A power-cycled
+        CFS comes back without an address and answers discovery. Only a box
+        in lost gets an address, and only its own; any other box is left for
+        the next enumeration. Returns the reclaimed address or None, and the
+        errors met on the way.
+        """
+        errors = []
+        reply = self._call(errors, "discover", client.discover)
+        if reply is None:
+            return None, errors
+        uniid = reply.uniid
+        address = next(
+            (address for address, saved in sorted(lost.items())
+             if saved == uniid), None)
+        if address is None:
+            errors.append(
+                "box %s answered discovery but was not online at startup"
+                % uniid.hex())
+            return None, errors
+        if not self._assign(client, errors, reply, address, pause):
+            return None, errors
+        _klog('reclaimed uid=%s address=%d', uniid.hex(), address)
+        return address, errors
+
+    def _assign(self, client, errors, discovered, address, pause):
+        """Give a discovered box its address and verify it took.
+
+        A box still in its loader is assigned and started first. Errors go
+        to errors; returns whether the box now answers at address.
+        """
+        uniid = discovered.uniid
+        if discovered.mode:
+            _klog(
+                'loader mode uid=%s; assign then start app', uniid.hex(),
+                level=logging.info)
+            self._call(
+                errors, "assign loader box %s to address %d"
+                % (uniid.hex(), address),
+                client.assign, uniid, address)
+            self._call(
+                errors, "start app for box %s" % uniid.hex(),
+                client.start_app)
+            if pause is not None:
+                pause(LOADER_TO_APP_SETTLE)
+        assigned = self._call(
+            errors, "assign box %s to address %d" % (uniid.hex(), address),
+            client.assign, uniid, address)
+        if assigned is None:
+            errors.append(
+                "assign address %d returned no valid response" % address)
+            errors.append(ADDRESS_WEDGE_WARNING)
+            return False
+        verified = self._call(
+            errors, "verify address %d" % address, client.query, address)
+        if verified is None:
+            errors.append(
+                "address %d verification gave no response" % address)
+        elif verified.uniid != uniid:
+            errors.append(
+                "address %d verification returned the wrong box identity"
+                % address)
+        elif verified.mode:
+            errors.append(
+                "address %d verification returned loader mode" % address)
+        else:
+            return True
+        return False
 
     @staticmethod
     def _known_addresses_by_id(known):

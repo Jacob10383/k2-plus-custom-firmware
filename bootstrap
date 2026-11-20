@@ -15,6 +15,8 @@ failure unless --replace is passed.
 from __future__ import annotations
 
 import argparse
+import configparser
+import glob
 import hashlib
 import json
 import os
@@ -51,7 +53,8 @@ HELIX_ASSET = "helixscreen-k2.zip"
 HELIX_DIR = ROOT / "helixscreen"
 
 
-MOONRAKER_ASVC = "helixscreen\nustreamer@stockcam\n"
+MOONRAKER_ASVC = "helixscreen\nustreamer@stockcam\nustreamer@crealitynozzle\n"
+NOZZLE_CAMERA = Path("/dev/v4l/by-path/platform-4200000.usb-usb-0:1.2:1.0-video-index0")
 
 TIMELAPSE_URL = "https://raw.githubusercontent.com/mainsail-crew/moonraker-timelapse/main/component/timelapse.py"
 FIRMWARE_RELEASE_REPO = "Jacob10383/k2-plus-custom-firmware"
@@ -509,12 +512,8 @@ def wait_for_moonraker(timeout: int = 120) -> bool:
     return False
 
 
-def install_webcam() -> None:
-    log("waiting for Moonraker...")
-    if not wait_for_moonraker():
-        log_warn("Moonraker webcam API did not come up in 120s — skipping webcam registration")
-        return
-    payload = json.dumps({
+WEBCAMS = (
+    {
         "name": "Front",
         "enabled": True,
         "icon": "mdiWebcam",
@@ -528,17 +527,44 @@ def install_webcam() -> None:
         "flip_horizontal": False,
         "flip_vertical": False,
         "rotation": 0,
-    }).encode()
-    req = urllib.request.Request(
-        "http://localhost:7125/server/webcams/item",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        result = json.load(resp)
-    uid = result["result"]["webcam"]["uid"]
-    log(f"registered webcam 'Front' (/camera/stream) uid={uid}")
+    },
+    {
+        "name": "Creality Nozzle",
+        "enabled": True,
+        "icon": "mdiWebcam",
+        "aspect_ratio": "4:3",
+        "target_fps": 5,
+        "target_fps_idle": 5,
+        "location": "nozzle",
+        "service": "mjpegstreamer-adaptive",
+        "stream_url": "/crealitynozzle/stream",
+        "snapshot_url": "/crealitynozzle/snapshot",
+        "flip_horizontal": False,
+        "flip_vertical": False,
+        "rotation": 0,
+    },
+)
+
+
+def install_webcam() -> None:
+    log("waiting for Moonraker...")
+    if not wait_for_moonraker():
+        log_warn("Moonraker webcam API did not come up in 120s — skipping webcam registration")
+        return
+    for webcam in WEBCAMS:
+        if webcam["name"] == "Creality Nozzle" and not NOZZLE_CAMERA.exists():
+            log("no Creality nozzle camera found; not adding it to the web UI")
+            continue
+        req = urllib.request.Request(
+            "http://localhost:7125/server/webcams/item",
+            data=json.dumps(webcam).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.load(resp)
+        uid = result["result"]["webcam"]["uid"]
+        log(f"registered webcam '{webcam['name']}' ({webcam['stream_url']}) uid={uid}")
 
 
 def backup_config_dir() -> Path | None:
@@ -561,8 +587,17 @@ def backup_config_dir() -> Path | None:
         suffix += 1
         dest = dest.with_name(f"{stamp}-{suffix}")
     dest.mkdir(parents=True)
-    for item in items:
-        shutil.move(str(item), dest / item.name)
+    moved = []
+    try:
+        for item in items:
+            shutil.move(str(item), dest / item.name)
+            moved.append(item)
+    except BaseException:
+        # All or nothing: leave the live configs where they were.
+        for item in reversed(moved):
+            shutil.move(str(dest / item.name), item)
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     log(f"backed up {len(items)} item(s) -> {dest}")
     try:
         zip_old_config_backups(dest.parent, dest)
@@ -631,10 +666,79 @@ def zip_old_config_backups(backups_dir: Path, current: Path) -> None:
         log(f"zipped {zipped} older config backup(s) in {backups_dir}")
 
 
-def install_k2_configs() -> None:
-    src = ROOT / "klipper" / "config" / "k2"
+DEVICE_TREE_COMPATIBLE = Path("/proc/device-tree/compatible")
+SERIAL_BY_ID = Path("/dev/serial/by-id")
+# OS images with this rule give a Cartographer a fixed /dev/cartographer.
+CARTOGRAPHER_RULE = Path("/etc/udev/rules.d/99-cartographer.rules")
+CARTOGRAPHER_LINK = "/dev/cartographer"
+CARTOGRAPHER_SHIPPED_SERIAL = "/dev/ttyACM0"
+# model: (label, device-tree compatible, config folder in the Kalico checkout)
+K2_MODELS = {
+    "k2-plus": ("K2 Plus", b"creality,k2plus", "k2"),
+    "k2-pro": ("K2 Pro", b"creality,k2pro", "k2-pro"),
+}
+
+
+def detect_k2_model() -> str:
+    """The board the kernel booted as. Kernels that predate K2 Pro support are Plus-only."""
+    try:
+        compatible = DEVICE_TREE_COMPATIBLE.read_bytes().split(b"\0")
+    except OSError:
+        compatible = []
+    if K2_MODELS["k2-pro"][1] in compatible:
+        return "k2-pro"
+    if K2_MODELS["k2-plus"][1] not in compatible:
+        log_warn(f"no K2 model in {DEVICE_TREE_COMPATIBLE}; using the K2 Plus configs (pass --model to choose)")
+    return "k2-plus"
+
+
+def k2_config_source(model: str | None) -> Path:
+    if model is None:
+        model = detect_k2_model()
+    label, _compatible, folder = K2_MODELS[model]
+    src = ROOT / "klipper" / "config" / folder
     if not src.is_dir():
-        raise SystemExit(f"k2 config dir not found: {src}")
+        raise SystemExit(f"{label} configs not found at {src}; update Kalico first")
+    printer_cfg = src / "printer.cfg"
+    missing = [name for name in ("printer.cfg", *PROBE_CONFIG_FILES) if not (src / name).is_file()]
+    if missing:
+        raise SystemExit(f"{label} configs at {src} are incomplete (no {', '.join(missing)}); update Kalico first")
+    if not _probe_stack_pattern().search(printer_cfg.read_text(encoding="utf-8")):
+        raise SystemExit(f"{printer_cfg} has no {PROBE_STACK_BEGIN} / {PROBE_STACK_END} markers; update Kalico first")
+    _headers, missing, _files = _walk_config(src)
+    if missing:
+        raise SystemExit(f"{label} configs at {src} include missing files ({', '.join(missing)}); update Kalico first")
+    log(f"using the {label} configs from {src}")
+    return src
+
+
+def k2_config_names(src: Path) -> set[str]:
+    """Every file name either model ships, so neither is restored as a user's extra file."""
+    names = {path.name for path in src.iterdir()}
+    for _label, _compatible, folder in K2_MODELS.values():
+        tree = ROOT / "klipper" / "config" / folder
+        if tree.is_dir():
+            names.update(path.name for path in tree.iterdir())
+    return names
+
+
+def restore_config_backup(backup: Path) -> None:
+    """Undo backup_config_dir(): clear what was installed and move the old configs back."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    for item in CONFIG_DIR.iterdir():
+        if item.name == "config_backups":
+            continue
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+    for item in backup.iterdir():
+        shutil.move(str(item), CONFIG_DIR / item.name)
+    backup.rmdir()
+    log_warn(f"put the old configs back from {backup}")
+
+
+def install_k2_configs(src: Path) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, CONFIG_DIR, dirs_exist_ok=True)
     log(f"copied {src} -> {CONFIG_DIR}")
@@ -793,13 +897,50 @@ def _read_printer_cfg() -> tuple[Path, str]:
     return printer_cfg, text
 
 
+def _config_headers(text: str) -> list[str]:
+    """Section headers as Kalico reads them: each line cut at its first '#'
+    (klippy/configfile.py _parse_config)."""
+    headers = []
+    for line in text.split("\n"):
+        match = configparser.RawConfigParser.SECTCRE.match(line.split("#", 1)[0])
+        if match:
+            headers.append(match.group("header"))
+    return headers
+
+
+def _include_specs(text: str) -> list[str]:
+    return [h[len("include "):].strip() for h in _config_headers(text) if h.startswith("include ")]
+
+
 def _include_active(block: str, filename: str) -> bool:
-    target = f"[include {filename}]"
-    for line in block.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("#") and stripped == target:
-            return True
-    return False
+    return filename in _include_specs(block)
+
+
+def _walk_config(folder: Path) -> tuple[list[str], list[str], set[str]]:
+    """Section headers in printer.cfg and everything it includes, include specs
+    that name no file, and every file read, resolving includes the way Kalico does."""
+    headers: list[str] = []
+    missing: list[str] = []
+    pending = [os.path.abspath(folder / "printer.cfg")]
+    seen: set[str] = set()
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            missing.append(path)
+            continue
+        headers += _config_headers(text)
+        for spec in _include_specs(text):
+            pattern = os.path.join(os.path.dirname(path), spec)
+            found = sorted(glob.glob(pattern))
+            if not found and not glob.has_magic(pattern):
+                missing.append(spec)
+            pending.extend(os.path.abspath(name) for name in found)
+    return headers, missing, seen
 
 
 def _get_rap(path: Path) -> bool | None:
@@ -870,6 +1011,21 @@ def _rewrite_probe_stack(mode: str) -> None:
     printer_cfg.write_text(new_text, encoding="utf-8")
 
 
+CARTO_MOUNT_NOTE = (
+    "Cartographer mount: Y homes against the 5.8 mm Y-endstop spacer (cartographer.cfg). "
+    "Fit the spacer, or Y is 5.8 mm off."
+)
+NO_SPACER_NOTE = (
+    "Cartographer not loaded: Y homes without a Y-endstop spacer. Remove the spacer if one "
+    "is fitted, or Y is 5.8 mm off and rear moves can hit the frame."
+)
+
+
+def y_spacer_note(mode: str) -> str:
+    """What Y expects in this mode: set by the Cartographer mount config when it is loaded."""
+    return CARTO_MOUNT_NOTE if "cartographer.cfg" in PROBE_MODES[mode][1] else NO_SPACER_NOTE
+
+
 def report_probe_mode() -> None:
     if not CONFIG_DIR.is_dir():
         raise SystemExit(f"config dir not found: {CONFIG_DIR}")
@@ -877,8 +1033,31 @@ def report_probe_mode() -> None:
     if current is None:
         raise SystemExit("could not determine probe mode from printer.cfg probe stack")
     success(f"Probe mode: {current} — {PROBE_MODES[current][0]}")
+    log(y_spacer_note(current))
     if not _probe_mode_rap_matches(current):
         log_warn("register_as_probe flags do not match this stack; re-run with an explicit mode to fix")
+
+
+def use_cartographer_link() -> bool:
+    """Point cartographer.cfg at /dev/cartographer when this OS has the udev
+    rule that creates it. Older images keep the shipped /dev/ttyACM0."""
+    cfg = CONFIG_DIR / "cartographer.cfg"
+    if not CARTOGRAPHER_RULE.is_file() or not cfg.is_file():
+        return False
+    lines = cfg.read_text(encoding="utf-8").splitlines(keepends=True)
+    section = None
+    for index, line in enumerate(lines):
+        header = re.match(r"\[([^\]]+)\]", line)
+        if header:
+            section = header.group(1).strip()
+            continue
+        option = re.match(r"(serial\s*[:=]\s*)(\S+)(.*)", line, re.DOTALL)
+        if section == "mcu cartographer" and option and option.group(2) == CARTOGRAPHER_SHIPPED_SERIAL:
+            lines[index] = option.group(1) + CARTOGRAPHER_LINK + option.group(3)
+            cfg.write_text("".join(lines), encoding="utf-8")
+            log(f"cartographer.cfg: serial {CARTOGRAPHER_LINK}")
+            return True
+    return False
 
 
 def set_probe_mode(mode: str, *, restart: bool = True, quiet: bool = False) -> bool:
@@ -886,8 +1065,9 @@ def set_probe_mode(mode: str, *, restart: bool = True, quiet: bool = False) -> b
         raise SystemExit(f"invalid probe mode {mode!r}; expected one of {tuple(PROBE_MODES)}")
     if not CONFIG_DIR.is_dir():
         raise SystemExit(f"config dir not found: {CONFIG_DIR}")
+    use_cartographer_link()
 
-    warning = "Default Cartographer config (applies to carto/mix) expects a 5.8mm Y-endstop spacer; PRTouch does not."
+    warning = y_spacer_note(mode)
     if mode == "prtouch":
         warning += "\n  Remove any Cartographer entries from printer.cfg's SAVE_CONFIG block before using PRTouch."
     if not quiet:
@@ -919,10 +1099,48 @@ def set_probe_mode(mode: str, *, restart: bool = True, quiet: bool = False) -> b
     return True
 
 
-def update_k2_configs() -> None:
-    src = ROOT / "klipper" / "config" / "k2"
-    if not src.is_dir():
-        raise SystemExit(f"k2 config dir not found: {src}")
+def legacy_probe_mode(folder: Path) -> str | None:
+    """The probe mode of a printer.cfg from before the probe-stack markers:
+    which probe configs Kalico would load, through any include path."""
+    _headers, _missing, files = _walk_config(folder)
+    active = {
+        filename for filename in PROBE_CONFIG_FILES
+        if os.path.abspath(folder / filename) in files
+    }
+    for mode, (_label, configs) in PROBE_MODES.items():
+        if active == set(configs):
+            return mode
+    return None
+
+
+def cartographer_connected() -> bool:
+    """A USB Cartographer, any model or firmware (usb-Cartographer_..., usb-cartographer_...)."""
+    try:
+        return any("cartographer" in path.name.lower() for path in SERIAL_BY_ID.iterdir())
+    except OSError:
+        return False
+
+
+def choose_probe_mode() -> None:
+    """Configs ship in prtouch mode; a connected Cartographer gets mix.
+    carto alone is only ever set by hand (bootstrap --probe carto)."""
+    if cartographer_connected():
+        set_probe_mode("mix", restart=False, quiet=True)
+        log(f"Cartographer found: probe mode {PROBE_MODES['mix'][0]} (bootstrap --probe changes it)")
+        log_warn(y_spacer_note("mix"))
+    else:
+        set_probe_mode("prtouch", restart=False, quiet=True)
+        log(f"no Cartographer found: probe mode {PROBE_MODES['prtouch'][0]}")
+        log(y_spacer_note("prtouch"))
+
+
+def _has_stepper_z1(folder: Path) -> bool:
+    """A K2 Plus config has two Z motors; a K2 Pro config has one."""
+    headers, _missing, _files = _walk_config(folder)
+    return any(header.strip() == "stepper_z1" for header in headers)
+
+
+def update_k2_configs(src: Path) -> None:
     if not CONFIG_DIR.is_dir():
         raise SystemExit(f"config dir not found: {CONFIG_DIR}")
 
@@ -932,24 +1150,58 @@ def update_k2_configs() -> None:
         probe_mode = get_probe_mode()
     except SystemExit as exc:
         detect_error = str(exc).replace(str(CONFIG_DIR / "printer.cfg"), "printer.cfg")
+    if probe_mode is None and detect_error is not None:
+        probe_mode = legacy_probe_mode(CONFIG_DIR)
+        if probe_mode:
+            log(f"no probe stack markers; keeping probe mode {probe_mode} from printer.cfg's includes")
     if probe_mode is None:
         if detect_error is None:
             detect_error = "printer.cfg probe stack is not carto, mix, or prtouch"
-        log_warn(f"Could not detect current probe mode ({detect_error})")
-        log_warn(f"Probe mode is now set to {PROBE_MODES['mix'][0]}")
+        log_warn(f"Could not detect current probe mode ({detect_error}); choosing it from the hardware")
 
     printer_cfg = CONFIG_DIR / "printer.cfg"
     blob = None
     if printer_cfg.is_file():
         _, blob = split_save_config(printer_cfg.read_text(encoding="utf-8"))
 
+    # Read the old model where its relative includes still resolve.
+    other_model = printer_cfg.is_file() and _has_stepper_z1(CONFIG_DIR) != _has_stepper_z1(src)
+
     service_control("stop", ["moonraker", "klipper"])
-    backup = backup_config_dir()
-    install_k2_configs()
+    backup = None
+    try:
+        backup = backup_config_dir()
+        install_k2_configs(src)
+        _carry_over_configs(src, backup, blob, probe_mode, other_model)
+    except BaseException:
+        # Any failure after the move: put the working configs back and restart.
+        if backup is not None:
+            restore_config_backup(backup)
+        service_control("start", ["klipper", "moonraker"])
+        raise
+    service_control("start", ["klipper", "moonraker"])
+
+
+def _carry_over_configs(
+    src: Path, backup: Path | None, blob: str | None, probe_mode: str | None, other_model: bool
+) -> None:
+    """Bring a user's overrides, extra files, SAVE_CONFIG and probe mode into the new configs."""
+    other_model = other_model and backup is not None
+    if other_model:
+        # Overrides and SAVE_CONFIG values tuned against the other model's
+        # configs (travel limits, pins, Z) are not safe to carry over.
+        blob = None
+        log_warn(
+            f"The old configs (kept in {backup}) were for the other K2 model, so its overrides.cfg "
+            "and SAVE_CONFIG block were not carried over. Copy back only what fits this printer, "
+            "then calibrate again: bed mesh, Z offset and PID."
+        )
 
     if backup is not None:
-        stock_names = {path.name for path in src.iterdir()}
+        stock_names = k2_config_names(src)
         for item in backup.iterdir():
+            if item.name == "overrides.cfg" and other_model:
+                continue
             if item.name != "overrides.cfg" and item.name in stock_names:
                 continue
             dest = CONFIG_DIR / item.name
@@ -986,12 +1238,13 @@ def update_k2_configs() -> None:
                 cfg.write_text(body + (tail or ""), encoding="utf-8")
                 log(f"commented out {count} default option(s) in {name} superseded by SAVE_CONFIG")
 
-    if probe_mode:
+    if probe_mode and not other_model:
         changed = set_probe_mode(probe_mode, restart=False, quiet=True)
         if changed:
             log(f"restored probe mode {PROBE_MODES[probe_mode][0]}")
-
-    service_control("start", ["klipper", "moonraker"])
+    else:
+        # A mode set up for the other model may need hardware this printer lacks.
+        choose_probe_mode()
 
 
 def main() -> None:
@@ -1019,7 +1272,7 @@ def main() -> None:
     mode.add_argument(
         "--add-webcam",
         action="store_true",
-        help="register the Front webcam with Moonraker, then exit",
+        help="register the webcams with Moonraker, then exit",
     )
     mode.add_argument(
         "--probe",
@@ -1028,6 +1281,11 @@ def main() -> None:
         default=None,
         metavar="MODE",
         help="show current probe stack, or set it to carto|mix|prtouch and restart klipper if changed",
+    )
+    parser.add_argument(
+        "--model",
+        choices=sorted(K2_MODELS),
+        help="which configs to install or update (default: the board this kernel booted as)",
     )
     args = parser.parse_args()
 
@@ -1085,7 +1343,7 @@ def main() -> None:
         if update_configs:
             require_root()
             with step("Updating configs"):
-                update_k2_configs()
+                update_k2_configs(k2_config_source(args.model))
 
         notes = []
         if update_bootstrap:
@@ -1099,6 +1357,11 @@ def main() -> None:
     header("K2 UDISK Bootstrap")
     replace_helix = args.replace is not None and "helixscreen" in args.replace
     only_replace_helix = set(args.replace or []) == {"helixscreen"}
+
+    # Replacing configs in an existing Kalico checkout: refuse before anything
+    # stops if that checkout has no configs for this printer.
+    if should_replace("configs") and not should_replace("klipper") and (ROOT / "klipper" / "config").is_dir():
+        k2_config_source(args.model)
 
     if not only_replace_helix:
         with step("Stopping services"):
@@ -1158,10 +1421,22 @@ def main() -> None:
             if CONFIG_DIR.exists() and not should_replace("configs"):
                 log("configs already exist; skipping setup")
             else:
-                if should_replace("configs"):
-                    backup_config_dir()
-                install_moonraker_asvc()
-                install_k2_configs()
+                src = k2_config_source(args.model)
+                had_configs = (CONFIG_DIR / "printer.cfg").is_file()
+                backup = None
+                try:
+                    if should_replace("configs"):
+                        backup = backup_config_dir()
+                    install_moonraker_asvc()
+                    install_k2_configs(src)
+                    choose_probe_mode()
+                except BaseException:
+                    if backup is not None:
+                        restore_config_backup(backup)
+                    if had_configs:
+                        # The printer had working configs: run it on them again.
+                        service_control("start", SERVICES_TO_START)
+                    raise
 
     if replace_helix:
         with step("Installing HelixScreen"):

@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 
 
 PACK_HEAD = 0xF7
@@ -18,7 +19,7 @@ def _klog(msg, *args, level=logging.info):
 class _Serial485Request:
     def __init__(
             self, req_id, request, timeout, attempts, completion,
-            session=None, control=None):
+            session=None, control=None, priority=False):
         self.req_id = req_id
         self.request = request
         self.timeout = timeout
@@ -26,6 +27,7 @@ class _Serial485Request:
         self.completion = completion
         self.session = session
         self.control = control
+        self.priority = priority
         self.response = None
         self.error = None
         self.done = threading.Event()
@@ -201,6 +203,7 @@ class Serial_485_Wrapper:
         self._request_queue = deque()
         self._active_request = None
         self._request_session = None
+        self._priority_callers = {}
         self._request_seq = 0
         self._request_stop_error = None
         self._rx_cond = threading.Condition()
@@ -590,6 +593,39 @@ class Serial_485_Wrapper:
             self._request_seq += 1
             return self._request_seq
 
+    @staticmethod
+    def _caller():
+        import greenlet
+
+        return greenlet.getcurrent()
+
+    @contextmanager
+    def priority_requests(self):
+        """Queue this caller's requests ahead of ordinary traffic.
+
+        Only the queue order changes: the request already on the wire still
+        finishes, and an open session still runs to its end first.
+        """
+        caller = self._caller()
+        self._priority_callers[caller] = self._priority_callers.get(caller, 0) + 1
+        try:
+            yield
+        finally:
+            depth = self._priority_callers.pop(caller) - 1
+            if depth:
+                self._priority_callers[caller] = depth
+
+    def _enqueue(self, pending):
+        queue = self._request_queue
+        if not pending.priority:
+            queue.append(pending)
+            return
+        # Behind earlier priority requests, ahead of everything else.
+        index = 0
+        while index < len(queue) and queue[index].priority:
+            index += 1
+        queue.insert(index, pending)
+
     def _submit_request(
             self, request, timeout, attempts, session=None, control=None):
         if self.printer.is_shutdown():
@@ -597,9 +633,10 @@ class Serial_485_Wrapper:
         self._ensure_request_worker()
         pending = _Serial485Request(
             self._next_request_id(), request, timeout, attempts,
-            self.reactor.completion(), session=session, control=control)
+            self.reactor.completion(), session=session, control=control,
+            priority=self._caller() in self._priority_callers)
         with self._request_cond:
-            self._request_queue.append(pending)
+            self._enqueue(pending)
             self._request_cond.notify()
         return pending
 

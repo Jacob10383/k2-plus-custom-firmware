@@ -15,6 +15,8 @@ from collections import deque
 
 
 TIMER_INTERVAL = 0.25
+# mm a z_align alignment rise must stay clear of the part during a resume.
+ALIGN_RISE_CLEARANCE = 2.0
 FINGERPRINT_BYTES = 64 * 1024
 CHECKPOINT = "checkpoint"
 TOMBSTONE = "tombstone"
@@ -829,8 +831,9 @@ class PowerLossRecovery:
         self.checkpoint_interval = config.getfloat(
             "checkpoint_interval", 10.0, minval=1.0)
         self.recovery_lift = config.getfloat("recovery_lift", 5.0, minval=1.0)
-        self.maximum_recovery_z = config.getfloat(
-            "maximum_recovery_z", 350.0, minval=25.0, maxval=359.0)
+        # Accepted for older configs and ignored: the ceiling is the measured
+        # bottom switch (z_align).
+        config.get("maximum_recovery_z", None)
         self.recovery_travel_speed = config.getfloat(
             "recovery_travel_speed", 100.0, above=0.0)
         self.recovery_z_speed = config.getfloat(
@@ -855,6 +858,7 @@ class PowerLossRecovery:
         self.session = 0
         self.session_id = self.session_file = self.session_identity = None
         self.max_print_z = None
+        self.print_e = None
         self.candidate_due = False
         self.candidates = deque(maxlen=64)
         self.candidate_id = self.submitted_id = 0
@@ -977,7 +981,7 @@ class PowerLossRecovery:
         self.printing = self.started = self.fresh_start = False
         self.recovery_start = self.recovered = self.inhibited = False
         self.session_id = self.session_file = self.session_identity = None
-        self.max_print_z = self.pending_box = None
+        self.max_print_z = self.pending_box = self.print_e = None
         self.candidate_due = False
         self.candidates.clear()
         self.safe_candidate = self.completion = None
@@ -1125,9 +1129,15 @@ class PowerLossRecovery:
         now = self.reactor.monotonic()
         self.last_candidate_time = now
         z = float(self.gcode_move.last_position[2])
-        if self.max_print_z is None or z > self.max_print_z:
+        # Only Z where filament went down counts as printed height. The first
+        # lines run before START_PRINT moves, with the bed still wherever it
+        # was left (END_PRINT parks it near the bottom switch).
+        e = float(self.gcode_move.last_position[3])
+        extruded = self.print_e is not None and e > self.print_e
+        self.print_e = e
+        if extruded and (self.max_print_z is None or z > self.max_print_z):
             self.max_print_z = z
-            if self._clearance(z) is None:
+            if self._clearance(z, self._bottom()) is None:
                 self._inhibit("printed Z exceeds recovery clearance")
                 return
         if self._tuning_active() or self._exclude_active():
@@ -1276,10 +1286,31 @@ class PowerLossRecovery:
         self.store.discard()
         _klog('session inhibited: %s', reason, level=logging.info)
 
-    def _clearance(self, saved_z):
-        limit = min(self.maximum_recovery_z, float(self.z_align.zmax))
-        target = float(saved_z) + self.recovery_lift
-        return target if target <= limit else None
+    def _lift(self):
+        # A resume aligns at the bottom switch before X/Y home, with the
+        # nozzle still over the part, so each alignment rise (rising_dist)
+        # must clear the part too.
+        rise = getattr(self.z_align, "mcu_rising_dist", None)
+        if rise is None:
+            return self.recovery_lift
+        return max(self.recovery_lift, float(rise) + ALIGN_RISE_CLEARANCE)
+
+    def _bottom(self):
+        """The bottom switch in the current homed frame, or zmax before it is measured."""
+        measure = getattr(self.z_align, "measured_bottom_z", None)
+        bottom = measure() if measure is not None else None
+        return float(self.z_align.zmax) if bottom is None else bottom
+
+    @staticmethod
+    def _frame_bottom(frame):
+        """The bottom switch in a saved print's frame (the lowest Z stepper anchor)."""
+        if isinstance(frame, dict):
+            frame = frame.get("positions", {}).values()
+        return min(float(value) for value in frame)
+
+    def _clearance(self, saved_z, bottom):
+        target = float(saved_z) + self._lift()
+        return target if target <= bottom else None
 
     def _homed(self, eventtime):
         axes = self.toolhead.get_kinematics().get_status(eventtime)["homed_axes"]
@@ -1615,7 +1646,8 @@ class PowerLossRecovery:
         self.z_align.validate_reference_frame(snapshot["z_frame"])
         saved_z = float(gstate["last_position"][2])
         max_z = float(gstate["max_print_z"])
-        if saved_z < -3.0 or max_z < saved_z or self._clearance(max_z) is None:
+        bottom = self._frame_bottom(snapshot["z_frame"])
+        if saved_z < -3.0 or max_z < saved_z or self._clearance(max_z, bottom) is None:
             raise ValueError("unsafe saved Z position")
         if float(snapshot["heaters"]["extruder"]) < 150.0:
             raise ValueError("saved nozzle was not printing")
@@ -1643,10 +1675,11 @@ class PowerLossRecovery:
             self._run(command)
         if not self.z_align.start_prepare():
             raise ValueError("Z alignment unexpectedly reported Z homed")
-        prepared = self.z_align.wait_prepare_complete()
+        self.z_align.wait_prepare_complete()
         self._run("G28 X Y")
-        clearance = self._clearance(state["max_print_z"])
-        if clearance > float(prepared.get("prepared_zmax", self.z_align.zmax)):
+        clearance = self._clearance(
+            state["max_print_z"], self._frame_bottom(snapshot["z_frame"]))
+        if clearance is None:
             raise ValueError("recovery clearance exceeds Z reference")
         self.z_align.perform_blocking_rise(
             target_z=clearance, rise_speed=self.recovery_z_speed,

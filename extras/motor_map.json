@@ -3,8 +3,8 @@
     "_addr": "0x85",
     "_firmware": {
       "identifier": "mot2_002_081",
-      "file": "mot2_023_C30-mot2_002_081.bin",
-      "sha256": "92ff31301827406519ccad899125aa7895eeaefef240713b5543011bb7675826",
+      "file": "mot2_022_C30-mot2_002_081.bin",
+      "sha256": "67b364a627c1609727a8add8237ed8e602326997af1866b34f88c7412198b3f7",
       "registered_count": 77,
       "maximum_id": 227,
       "constructor_scope": "Root constructor including derived apply; before flash restore, calibration, and host overrides."
@@ -12,15 +12,15 @@
     "controller_cur_filter_param_en": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0,
+      "value": 1,
       "value_id": 128,
       "value_type": "uint16_t",
       "firmware_name": "iaib_filter.en",
       "firmware_flag": 0,
       "width": 2,
       "default_kind": "constructor",
-      "constructor_default": 0,
-      "constructor_bytes": "0000"
+      "constructor_default": 1,
+      "constructor_bytes": "0100"
     },
     "controller_cur_filter_param_fc": {
       "configurable": true,
@@ -38,15 +38,15 @@
     "controller_cur_loop_pid_fal_param_a": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 1.2999999523162842,
+      "value": 1.2000000476837158,
       "value_id": 111,
       "value_type": "float",
       "firmware_name": "cur.fal.a",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 1.2999999523162842,
-      "constructor_bytes": "6666a63f"
+      "constructor_default": 1.2000000476837158,
+      "constructor_bytes": "9a99993f"
     },
     "controller_cur_loop_pid_fal_param_en": {
       "configurable": true,
@@ -77,15 +77,15 @@
     "controller_cur_loop_pid_param_kc": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.5,
+      "value": 0.30000001192092896,
       "value_id": 105,
       "value_type": "float",
       "firmware_name": "cur.kc",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.5,
-      "constructor_bytes": "0000003f"
+      "constructor_default": 0.30000001192092896,
+      "constructor_bytes": "9a99993e"
     },
     "controller_cur_loop_pid_param_ki": {
       "configurable": true,
@@ -103,67 +103,67 @@
     "controller_cur_loop_pid_param_kp": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 2.5,
+      "value": 0.6000000238418579,
       "value_id": 102,
       "value_type": "float",
       "firmware_name": "cur.kp",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 2.5,
-      "constructor_bytes": "00002040"
+      "constructor_default": 0.6000000238418579,
+      "constructor_bytes": "9a99193f"
     },
     "controller_fwc_param_I_max": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 5.5,
+      "value": 2.5,
       "value_id": 123,
       "value_type": "float",
       "firmware_name": "fwc.I_max",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 5.5,
-      "constructor_bytes": "0000b040"
+      "constructor_default": 2.5,
+      "constructor_bytes": "00002040"
     },
     "controller_fwc_param_en": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 1,
+      "value": 0,
       "value_id": 122,
       "value_type": "uint16_t",
       "firmware_name": "fwc.en",
       "firmware_flag": 0,
       "width": 2,
       "default_kind": "constructor",
-      "constructor_default": 1,
-      "constructor_bytes": "0100"
+      "constructor_default": 0,
+      "constructor_bytes": "0000"
     },
     "controller_fwc_param_phi_e": {
       "configurable": false,
       "tolerance": 1e-06,
-      "value": 0.0019735211972147226,
+      "value": 0.0009260000078938901,
       "value_id": 125,
       "value_type": "float",
       "firmware_name": "fwc.phi_e",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "derived_after_apply",
-      "constructor_default": 0.0019735211972147226,
-      "constructor_bytes": "3156013b"
+      "constructor_default": 0.0009260000078938901,
+      "constructor_bytes": "cfbe723a"
     },
     "controller_fwc_param_wm_base": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 120.0,
+      "value": 100.0,
       "value_id": 127,
       "value_type": "float",
       "firmware_name": "fwc.wm_base",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 120.0,
-      "constructor_bytes": "0000f042"
+      "constructor_default": 100.0,
+      "constructor_bytes": "0000c842"
     },
     "controller_leso_param_b0": {
       "configurable": false,
@@ -272,41 +272,41 @@
     "controller_pos_loop_pid_param_kp": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 300.0,
+      "value": 150.0,
       "value_id": 70,
       "value_type": "float",
       "firmware_name": "pos.kp",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 300.0,
-      "constructor_bytes": "00009643"
+      "constructor_default": 150.0,
+      "constructor_bytes": "00001643"
     },
     "controller_spd_loop_pid_fal_param_a": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 1.0,
+      "value": 0.800000011920929,
       "value_id": 95,
       "value_type": "float",
       "firmware_name": "spd.fal.a",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 1.0,
-      "constructor_bytes": "0000803f"
+      "constructor_default": 0.800000011920929,
+      "constructor_bytes": "cdcc4c3f"
     },
     "controller_spd_loop_pid_fal_param_en": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0,
+      "value": 1,
       "value_id": 94,
       "value_type": "uint16_t",
       "firmware_name": "spd.fal.en",
       "firmware_flag": 0,
       "width": 2,
       "default_kind": "constructor",
-      "constructor_default": 0,
-      "constructor_bytes": "0000"
+      "constructor_default": 1,
+      "constructor_bytes": "0100"
     },
     "controller_spd_loop_pid_fal_param_zoom": {
       "configurable": true,
@@ -324,54 +324,54 @@
     "controller_spd_loop_pid_param_kc": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.5,
+      "value": 0.30000001192092896,
       "value_id": 89,
       "value_type": "float",
       "firmware_name": "spd.kc",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.5,
-      "constructor_bytes": "0000003f"
+      "constructor_default": 0.30000001192092896,
+      "constructor_bytes": "9a99993e"
     },
     "controller_spd_loop_pid_param_ki": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 6.0,
+      "value": 35.0,
       "value_id": 87,
       "value_type": "float",
       "firmware_name": "spd.ki",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 6.0,
-      "constructor_bytes": "0000c040"
+      "constructor_default": 35.0,
+      "constructor_bytes": "00000c42"
     },
     "controller_spd_loop_pid_param_kp": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.02800000086426735,
+      "value": 0.15000000596046448,
       "value_id": 86,
       "value_type": "float",
       "firmware_name": "spd.kp",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.02800000086426735,
-      "constructor_bytes": "4260e53c"
+      "constructor_default": 0.15000000596046448,
+      "constructor_bytes": "9a99193e"
     },
     "driver_board_param_R_of_current_sample_ohm": {
       "configurable": false,
       "tolerance": 1e-06,
-      "value": 0.05000000074505806,
+      "value": 0.019999999552965164,
       "value_id": 30,
       "value_type": "float",
       "firmware_name": "driver_board_R_of_current_sample_ohm",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.05000000074505806,
-      "constructor_bytes": "cdcc4c3d"
+      "constructor_default": 0.019999999552965164,
+      "constructor_bytes": "0ad7a33c"
     },
     "driver_board_param_amp_gain": {
       "configurable": false,
@@ -441,41 +441,41 @@
     "motor_param_Ke": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.09867605566978455,
+      "value": 0.046300001442432404,
       "value_id": 43,
       "value_type": "float",
       "firmware_name": "motor_Ke",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.09867605566978455,
-      "constructor_bytes": "ac16ca3d"
+      "constructor_default": 0.046300001442432404,
+      "constructor_bytes": "12a53d3d"
     },
     "motor_param_L": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.00139999995008111,
+      "value": 0.0012000000569969416,
       "value_id": 42,
       "value_type": "float",
       "firmware_name": "motor_L",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.00139999995008111,
-      "constructor_bytes": "3480b73a"
+      "constructor_default": 0.0012000000569969416,
+      "constructor_bytes": "52499d3a"
     },
     "motor_param_R": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.7799999713897705,
+      "value": 2.0,
       "value_id": 41,
       "value_type": "float",
       "firmware_name": "motor_R",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.7799999713897705,
-      "constructor_bytes": "14ae473f"
+      "constructor_default": 2.0,
+      "constructor_bytes": "00000040"
     },
     "param_boot_key": {
       "configurable": false,
@@ -545,15 +545,15 @@
     "param_encoder_calibtate_official_ud_cal_set": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.15000000596046448,
+      "value": 0.05999999865889549,
       "value_id": 23,
       "value_type": "float",
       "firmware_name": "encoder_calibtate_official_ud_cal_set",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.15000000596046448,
-      "constructor_bytes": "9a99193e"
+      "constructor_default": 0.05999999865889549,
+      "constructor_bytes": "8fc2753d"
     },
     "param_flash_checksum": {
       "configurable": false,
@@ -631,8 +631,8 @@
       "firmware_flag": 0,
       "width": 2,
       "default_kind": "calibration_state",
-      "constructor_default": 0,
-      "constructor_bytes": "0000"
+      "constructor_default": 1,
+      "constructor_bytes": "0100"
     },
     "param_pwm_period_s": {
       "configurable": false,
@@ -689,15 +689,15 @@
     "param_stall_pos_err_rad": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.012000000104308128,
+      "value": 0.014999999664723873,
       "value_id": 14,
       "value_type": "float",
       "firmware_name": "stall_pos_err_rad",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.012000000104308128,
-      "constructor_bytes": "a69b443c"
+      "constructor_default": 0.014999999664723873,
+      "constructor_bytes": "8fc2753c"
     },
     "param_system_startup_delay_ms": {
       "configurable": false,
@@ -728,15 +728,15 @@
     "param_ud_cal_set": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.15000000596046448,
+      "value": 0.05999999865889549,
       "value_id": 20,
       "value_type": "float",
       "firmware_name": "ud_cal_set",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.15000000596046448,
-      "constructor_bytes": "9a99193e"
+      "constructor_default": 0.05999999865889549,
+      "constructor_bytes": "8fc2753d"
     },
     "param_use_default_param": {
       "configurable": false,
@@ -819,41 +819,41 @@
     "protection_param_prt_continuous_cur_A": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 4.0,
+      "value": 2.5,
       "value_id": 180,
       "value_type": "float",
       "firmware_name": "protect_continuous_overcurrent_A",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 4.0,
-      "constructor_bytes": "00008040"
+      "constructor_default": 2.5,
+      "constructor_bytes": "00002040"
     },
     "protection_param_prt_continuous_time_s": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 1.0,
+      "value": 6.0,
       "value_id": 181,
       "value_type": "float",
       "firmware_name": "protect_continuous_overcurrent_time_s",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 1.0,
-      "constructor_bytes": "0000803f"
+      "constructor_default": 6.0,
+      "constructor_bytes": "0000c040"
     },
     "protection_param_prt_over_speed_rad_s": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 314.1592712402344,
+      "value": 104.71975708007812,
       "value_id": 182,
       "value_type": "float",
       "firmware_name": "protect_speed_over_limit_rad_s",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 314.1592712402344,
-      "constructor_bytes": "63149d43"
+      "constructor_default": 104.71975708007812,
+      "constructor_bytes": "8470d142"
     },
     "protection_param_prt_over_speed_time_s": {
       "configurable": true,
@@ -884,28 +884,28 @@
     "protection_param_prt_track_err_time": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.009999999776482582,
+      "value": 1.0,
       "value_id": 188,
       "value_type": "float",
       "firmware_name": "protect_pos_tracking_error_time_s",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.009999999776482582,
-      "constructor_bytes": "0ad7233c"
+      "constructor_default": 1.0,
+      "constructor_bytes": "0000803f"
     },
     "protection_param_prt_track_max_err": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.30000001192092896,
+      "value": 999.0,
       "value_id": 187,
       "value_type": "float",
       "firmware_name": "protect_pos_tracking_error_maximum_rad",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.30000001192092896,
-      "constructor_bytes": "9a99993e"
+      "constructor_default": 999.0,
+      "constructor_bytes": "00c07944"
     },
     "protection_warning_code_backup": {
       "configurable": false,
@@ -975,28 +975,28 @@
     "zazen_param_zazen_gain_spd_ki": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 1.0,
+      "value": 0.5,
       "value_id": 221,
       "value_type": "float",
       "firmware_name": "zazen_gain_spd_ki",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 1.0,
-      "constructor_bytes": "0000803f"
+      "constructor_default": 0.5,
+      "constructor_bytes": "0000003f"
     },
     "zazen_param_zazen_gain_spd_kp": {
       "configurable": true,
       "tolerance": 1e-06,
-      "value": 0.699999988079071,
+      "value": 0.5,
       "value_id": 220,
       "value_type": "float",
       "firmware_name": "zazen_gain_spd_kp",
       "firmware_flag": 0,
       "width": 4,
       "default_kind": "constructor",
-      "constructor_default": 0.699999988079071,
-      "constructor_bytes": "3333333f"
+      "constructor_default": 0.5,
+      "constructor_bytes": "0000003f"
     },
     "zazen_param_zazen_trigger_time_s": {
       "configurable": true,

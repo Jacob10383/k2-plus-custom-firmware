@@ -75,6 +75,11 @@ BOOTSTRAP_MANAGED_PATHS = (
     os.path.join("printer_data", "config"),
 )
 STOCK_WIFI_CONF = "/etc/wifi/wpa_supplicant/wpa_supplicant.conf"
+STOCK_MODEL_SCRIPT = "/usr/bin/get_sn_mac.sh"
+# Creality model codes from the stock keybox (get_sn_mac.sh model).
+STOCK_MODELS = {"F008": "K2 Plus", "F028": "K2 Plus", "F012": "K2 Pro", "F021": "K2"}
+# The kernel boots the K2 Pro hardware description only for this panel ID.
+PRO_LCM_ID = "st7701_9bit_mipi_tjc_480_800"
 CUSTOM_WIFI_CONF = os.path.join(CUSTOM_OVERLAY_DIR, "upper", "etc", "wpa_supplicant.conf")
 CUSTOM_WIFI_HEADER = "ctrl_interface=/run/wpa_supplicant\nupdate_config=1\nap_scan=1\n"
 # Network settings carried over from Creality firmware, in output order.
@@ -360,6 +365,55 @@ def _boot_contract_error(cmdline, active_slot, boot_partition, root_partition):
             f"got {boot_partition or '?'}/{root_partition or '?'}"
         )
     return None
+
+
+def kernel_board(cmdline):
+    """The board the custom kernel will boot as, by its own rule (k2_fdt.c).
+
+    cmdline is /proc/cmdline as bytes. K2 Pro only when the bootloader passes
+    exactly one lcm_id token naming the Pro panel, no quotes or NULs, and at
+    most 1023 bytes; anything else boots as a K2 Plus.
+    """
+    if cmdline.endswith(b"\n"):
+        cmdline = cmdline[:-1]  # /proc adds it
+    if len(cmdline) >= 1024 or any(c in cmdline for c in (b"\0", b'"', b"'")):
+        return "K2 Plus"
+    tokens = [t for t in re.split(rb"[ \t\r\n]+", cmdline) if t]
+    if b"lcm_id" in tokens:
+        return "K2 Plus"
+    ids = [t for t in tokens if t.startswith(b"lcm_id=")]
+    return "K2 Pro" if ids == [b"lcm_id=" + PRO_LCM_ID.encode()] else "K2 Plus"
+
+
+def stock_model():
+    """Return (code, name) from the stock keybox; name is None when unknown."""
+    try:
+        code = subprocess.run(
+            [STOCK_MODEL_SCRIPT, "model"], capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        code = ""
+    return code, STOCK_MODELS.get(code)
+
+
+def check_model():
+    """Show the printer model and the board the kernel will boot as; confirm a mismatch."""
+    with open("/proc/cmdline", "rb") as f:
+        board = kernel_board(f.read())
+    code, name = stock_model()
+    print()
+    log_status("Printer", f"{name} ({code})" if name else f"unknown model {code or '(not reported)'}")
+    log_status("Runs as", board)
+    if name == board:
+        return
+    print()
+    if name is None:
+        log_warn(f"Could not tell which K2 this is. Jacobean's firmware will run it as a {board}.")
+    else:
+        log_warn(f"This is a {name}, but Jacobean's firmware would run it as a {board}.")
+        log_warn(f"Its {board} hardware settings would be wrong for this printer.")
+    if _ask("Install anyway? [y/N]: ") not in {"y", "yes"}:
+        die("install cancelled")
 
 
 def check_boot_contract(active_slot):
@@ -824,8 +878,8 @@ def stale_helix_units():
     return [path for path in (os.path.join(unit_dir, name) for name in names) if os.path.lexists(path)]
 
 
-def wipe_previous_install():
-    for path in (CUSTOM_SLOT_DIR, CUSTOM_OVERLAY_DIR):
+def _wipe(paths):
+    for path in paths:
         if not os.path.lexists(path):
             continue
         log(f"removing {path}")
@@ -834,6 +888,15 @@ def wipe_previous_install():
         except OSError as exc:
             die(f"could not remove {path}: {exc}. Rerun the installer to try again.")
     subprocess.run(["sync"], check=True)
+
+
+def wipe_previous_install():
+    _wipe((CUSTOM_SLOT_DIR, CUSTOM_OVERLAY_DIR))
+
+
+def reset_system_files():
+    """Drop every change made to the root file system; UDISK files stay."""
+    _wipe((CUSTOM_OVERLAY_DIR,))
 
 
 # ---------------------------------------------------------------------------
@@ -1033,25 +1096,43 @@ def _ask(prompt):
         return None
 
 
+MODE_INSTALL = "install"
+MODE_KEEP = "keep"
+MODE_RESET = "reset"
+MODE_FRESH = "fresh"
+MENU = (
+    ("1", "Reinstall, keep my setup", MODE_KEEP),
+    ("2", "Reinstall, reset system files", MODE_RESET),
+    ("3", "Fresh install", MODE_FRESH),
+    ("4", "Cancel", None),
+)
+
+
 def show_menu():
     print()
     log("Jacobean's firmware is already installed.")
     print()
-    for number, label in (("1", "Reinstall, keep my setup"), ("2", "Fresh install"), ("3", "Cancel")):
+    for number, label, _ in MENU:
         log(f"  \033[1;36m{number}\033[0m  {label}")
 
 
-def choose_fresh_install():
-    """Return True when the user picks a fresh install over keeping their setup."""
+def choose_reinstall_mode():
+    choices = {number: mode for number, _, mode in MENU}
     while True:
-        answer = _ask("Choose 1-3: ")
-        if answer == "1":
-            return False
-        if answer == "2":
-            return True
-        if answer in {"3", None}:
+        answer = _ask(f"Choose 1-{len(MENU)}: ")
+        if answer is None or (answer in choices and choices[answer] is None):
             die("install cancelled")
-        log_warn("Enter 1, 2 or 3.")
+        if answer in choices:
+            return choices[answer]
+        log_warn(f"Enter a number from 1 to {len(MENU)}.")
+
+
+def confirm_reset_system_files():
+    print()
+    log("\033[1;31mThis deletes every change made to the system files of Jacobean's firmware.\033[0m")
+    log("Kalico, Moonraker, your printer config and print files are kept.")
+    if _ask("Reset system files? [y/N]: ") not in {"y", "yes"}:
+        die("install cancelled")
 
 
 def confirm_fresh_install():
@@ -1062,7 +1143,7 @@ def confirm_fresh_install():
 
 
 def confirm_install(active_slot, target_slot):
-    """Confirm the install and return True for a fresh install."""
+    """Confirm the install and return the MODE_* to install with."""
     print()
     firmware_version = read_fw_env("version") or "unknown"
     log_status("Creality", f"{firmware_version} on slot {active_slot}, stays installed")
@@ -1070,20 +1151,24 @@ def confirm_install(active_slot, target_slot):
 
     found = previous_install_found()
     fresh_flag = "--fresh" in sys.argv[1:]
-    if found and not fresh_flag:
-        show_menu()
-    elif fresh_flag and not found:
-        print()
-        log("No earlier install found; --fresh has nothing to erase.")
+    if not found:
+        if fresh_flag:
+            print()
+            log("No earlier install found; --fresh has nothing to erase.")
+        if _ask("Install Jacobean's firmware? [y/N]: ") not in {"y", "yes"}:
+            die("install cancelled")
+        return MODE_INSTALL
 
-    if found:
-        if fresh_flag or choose_fresh_install():
-            confirm_fresh_install()
-            return True
-        return False
-    if _ask("Install Jacobean's firmware? [y/N]: ") not in {"y", "yes"}:
-        die("install cancelled")
-    return False
+    if fresh_flag:
+        mode = MODE_FRESH
+    else:
+        show_menu()
+        mode = choose_reinstall_mode()
+    if mode == MODE_FRESH:
+        confirm_fresh_install()
+    elif mode == MODE_RESET:
+        confirm_reset_system_files()
+    return mode
 
 
 def shutdown_device():
@@ -1100,12 +1185,14 @@ def main():
     check_udisk()
     active_slot, target_slot, target_rootfs, target_boot = get_partitions()
     check_boot_contract(active_slot)
+    check_model()
     _telemetry_context.update({"active_slot": active_slot, "target_slot": target_slot})
     custom_blob = preflight_env(active_slot, target_slot)
     release_tag, release_files = fetch_release()
     _telemetry_context["release"] = release_tag
 
-    fresh = confirm_install(active_slot, target_slot)
+    mode = confirm_install(active_slot, target_slot)
+    fresh = mode == MODE_FRESH
     # Read before the swap moves the custom slot back to the top of UDISK.
     kept_setup = [] if fresh else previous_bootstrap_paths()
     installed_helix = None if fresh else installed_helix_version()
@@ -1154,6 +1241,11 @@ def main():
             flash(rootfs_path, target_rootfs)
         with step("Flashing kernel", "Kernel flashed"):
             flash(kernel_path, target_boot)
+
+        # After both flashes, so a failed flash does not also lose the system changes.
+        if mode == MODE_RESET:
+            with step("Resetting system files", "System files reset"):
+                reset_system_files()
 
         with step("Installing swap utility", "Swap utility installed"):
             install_swap(swap_path)

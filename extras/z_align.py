@@ -14,6 +14,8 @@
 # slow_speed: 10  # mm/s for the MCU-side slow settle pass.
 # rising_dist: 10  # mm lift between the fast and slow MCU passes.
 # safe_dist: 40  # mm max extra one-sided drop after the other switch triggers.
+#   These four are real bed mm and mm/s, whether or not the Z driver steps on
+#   both edges (z_align converts to pin toggles per driver).
 # filter_cnt: 10  # Consecutive switch samples required before accepting a trigger.
 # timeout: 30  # Seconds allowed for a single MCU z_align attempt.
 # retries: 5  # Max MCU retry attempts before aborting.
@@ -24,7 +26,13 @@
 # rise_distance: 340  # mm rise after switch alignment before final Z home.
 # rise_speed: 50  # mm/s for that long post-align rise.
 # temp_rise_max_z_accel: 200  # Temporary accel cap for the post-align rise.
-# zmax: 350  # Logical Z coordinate after MCU bottom-switch alignment.
+# zmax: 350  # Logical Z coordinate after MCU bottom-switch alignment: the
+#   printer's nominal height, at or above which every unit's switch sits.
+#
+# Once the nozzle has homed Z, z_align measures where the bottom switch is and
+# moves Klipper's Z limit by the same amount: [stepper_z] position_max +
+# (measured switch - zmax). position_max is therefore set as zmax plus the
+# travel allowed past the switch (at most MAX_PAST_SWITCH).
 #
 import json
 import logging
@@ -46,6 +54,10 @@ TEMP_RISE_MAX_Z_ACCEL = 200.0
 STARTUP_RISE_PRIME_MAX_DIST = 0.1
 STARTUP_RISE_PRIME_SPEED = 10.0
 TILT_BIAS_FILE = '/mnt/UDISK/printer_data/z_align_tilt_bias.json'
+# A measured bottom switch further than this from zmax is a bad measurement.
+MAX_BOTTOM_FROM_ZMAX = 15.0
+# Most Z travel allowed past the measured switch, whatever position_max says.
+MAX_PAST_SWITCH = 2.5
 MAX_TILT_BIAS = 1.0
 
 
@@ -112,6 +124,7 @@ class ZAlign:
         self._tilt_bias = 0.0
         self._learn_delta = None
         self._bottom_anchor = None
+        self._toggles_per_step = 2
         self.endstop_pin_status = [0] * min(len(self.endstop_pin_z), 8)
         self.pin_len = min(len(self.endstop_pin_z), 8)
         self._timer = self.reactor.register_timer(
@@ -126,6 +139,9 @@ class ZAlign:
             'stepper_enable:motor_off', self._handle_motor_off)
         self.printer.register_event_handler(
             'gcode:request_restart', self._handle_request_restart)
+        # Homing (G28, PRTOUCH_HOME) resets the Z limit to the rail range.
+        self.printer.register_event_handler(
+            'toolhead:set_position', self.apply_measured_z_limit)
 
     def _build_config(self):
         config_z_align = "config_z_align oid=%d" % (self._oidz,)
@@ -183,7 +199,25 @@ class ZAlign:
         self._step_distance = stepper_z.get_step_dist()
         self._reset_runtime()
 
+    def _read_toggles_per_step(self):
+        # The MCU z_align routine toggles each step pin itself. A driver that
+        # steps on both edges moves one step per toggle; otherwise it takes
+        # two toggles (a full pulse) per step.
+        modes = {
+            stepper.get_name(): bool(stepper.get_pulse_duration()[1])
+            for stepper in self._z_steppers()}
+        if len(set(modes.values())) > 1:
+            raise self.printer.config_error(
+                'z_align needs every Z stepper in the same step mode: %s'
+                % (modes,))
+        both_edges = all(modes.values())
+        _klog('Z steppers step on %s (%s)',
+              'both edges' if both_edges else 'one edge',
+              ', '.join(sorted(modes)))
+        return 1 if both_edges else 2
+
     def _handle_ready(self):
+        self._toggles_per_step = self._read_toggles_per_step()
         try:
             self._install_tilt_learning()
         except Exception:
@@ -375,11 +409,17 @@ class ZAlign:
                    for axis in ('z', 'z1'))
 
     def _calc_speed_ticks(self, speed):
+        # Ticks between step-pin toggles.
         mcu_freq = self._main_mcu._serial.msgparser.get_constant_float('CLOCK_FREQ')
-        return max(1, int((self._step_distance / speed) * mcu_freq / 2.0))
+        return max(1, int((self._step_distance / speed) * mcu_freq
+                          / self._toggles_per_step))
 
     def _calc_distance_steps(self, distance):
-        return max(1, int(distance / self._step_distance) * 2)
+        # Step-pin toggles for a distance (the MCU counts toggles).
+        return max(1, int(distance / self._step_distance) * self._toggles_per_step)
+
+    def _toggles_to_mm(self, toggles):
+        return toggles * (self._step_distance or 0.0) / self._toggles_per_step
 
     def _enable_z_align_steppers(self):
         # Returns the reactor time at which the enable pins take effect.
@@ -466,10 +506,10 @@ class ZAlign:
             self._state = 'mcu_start'
             return self.reactor.NOW
         delta_steps = int(status.get('deltaError1', 0) or 0)
-        delta_mm = delta_steps * (self._step_distance or 0.0)
+        delta_mm = self._toggles_to_mm(delta_steps)
         self._last_retry_delta_steps = delta_steps
         self._last_retry_delta_mm = delta_mm
-        tolerance_mm = self.retry_tolerance * (self._step_distance or 0.0)
+        tolerance_mm = self._toggles_to_mm(self.retry_tolerance)
         if abs(delta_steps) <= self.retry_tolerance:
             self._say(
                 'MCU z-align attempt %d/%d: delta %.4fmm'
@@ -606,6 +646,7 @@ class ZAlign:
             values = [float(value) for value in frame]
             steppers = self._z_steppers()
             z_min, z_max = self._toolhead.get_kinematics().rails[2].get_range()
+            z_max = max(z_max, self.zmax + MAX_BOTTOM_FROM_ZMAX)
             if not values or len(values) != len(steppers):
                 raise ValueError('expected one position per Z stepper')
             if not all(math.isfinite(value) for value in values):
@@ -627,6 +668,38 @@ class ZAlign:
         except Exception:
             self._bottom_anchor = None
             _klog('unable to capture PLR Z anchor', level=logging.exception)
+
+    def measured_bottom_z(self):
+        """Where the bottom switch is in the homed Z frame (the lower of the
+        Z steppers' anchors), or None before Z is homed against it."""
+        if not self._is_toolhead_z_homed():
+            return None
+        frame = self.capture_reference_frame()
+        return min(frame) if frame else None
+
+    def apply_measured_z_limit(self):
+        """Move Klipper's Z limit to this unit's switch: position_max +
+        (measured switch - zmax), with at most MAX_PAST_SWITCH past it. Runs
+        on every toolhead set_position, so it follows homing and frame
+        restores; unhoming Z clears it."""
+        bottom = self.measured_bottom_z()
+        if bottom is None:
+            return None
+        if abs(bottom - self.zmax) > MAX_BOTTOM_FROM_ZMAX:
+            _klog('measured bottom switch at Z %.3f is more than %.0f mm from '
+                  'zmax %.3f; keeping the configured Z limit',
+                  bottom, MAX_BOTTOM_FROM_ZMAX, self.zmax, level=logging.warning)
+            return None
+        kin = self._toolhead.get_kinematics()
+        z_min, z_max = kin.rails[2].get_range()
+        lo, hi = kin.limits[2]
+        if lo > hi:
+            return None
+        limit = bottom + min(z_max - self.zmax, MAX_PAST_SWITCH)
+        if abs(hi - limit) > 1.0e-9:
+            kin.limits[2] = (lo, limit)
+            _klog('bottom switch at Z %.3f; Z limit %.3f', bottom, limit)
+        return limit
 
     def capture_reference_frame(self):
         if self._bottom_anchor is None or not self._logical_z_applied:
@@ -689,10 +762,13 @@ class ZAlign:
         margin = (
             max(frame) - min(frame) if frame is not None
             else abs(self._tilt_bias) if self._z_tilt is not None else 0.0)
+        # Rising from the bottom: the target must be above it. A restored frame
+        # puts the bottom at its measured switch, which may sit past zmax.
+        ceiling = reference_z if frame is not None else zmax
         if (not math.isfinite(target_z) or not math.isfinite(move_speed)
                 or move_speed <= 0.0
                 or target_z < z_min
-                or target_z > min(zmax, z_limit - margin)):
+                or target_z > min(ceiling, z_limit - margin)):
             raise self.printer.command_error('Invalid targeted Z rise')
         run_startup_prime = self._consume_startup_rise_prime()
         z_limit_snapshot = None
@@ -718,6 +794,11 @@ class ZAlign:
                 prime_start = list(pos)
                 prime_start[2] = reference_z - prime_dist
                 self._toolhead.set_position(prime_start, homing_axes="z")
+                # A restored frame's switch can sit past position_max; the
+                # next set_position puts the normal limit back.
+                kin = self._toolhead.get_kinematics()
+                kin.limits[2] = (kin.limits[2][0],
+                                 max(kin.limits[2][1], reference_z))
                 prime_target = list(prime_start)
                 prime_target[2] = reference_z
                 _klog(
@@ -760,6 +841,9 @@ class ZAlign:
             if adjusted and monitored and self._z_protection_active():
                 raise self.printer.command_error(
                     'Z prep refusing to finish after Z reference adjustment')
+            if frame is not None:
+                # A restored frame (power-loss resume) is the homed frame.
+                self.apply_measured_z_limit()
             self._state = 'idle'
             return True
         except Exception:
@@ -800,7 +884,15 @@ class ZAlign:
         return True
 
     def get_status(self, _eventtime):
+        bottom_z = None
+        z_limit = None
+        if self._toolhead is not None and self._is_toolhead_z_homed():
+            bottom_z = self.measured_bottom_z()
+            z_limit = self._toolhead.get_kinematics().limits[2][1]
         return {
+            'bottom_z': bottom_z,
+            'z_limit': z_limit,
+            'rising_dist': self.mcu_rising_dist,
             'endstop_pin_status': list(self.endstop_pin_status),
             'state': self._state,
             'target_z': self._target_z,

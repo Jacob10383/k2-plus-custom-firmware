@@ -68,12 +68,9 @@ class MotorCutCalibrationHelper:
         cfg = box.get_cut_calibration_config()
         self._require_no_filament(box)
         toolhead = self.printer.lookup_object("toolhead")
+        zone = self.printer.lookup_object("extended_zone_transform")
         configfile = self.printer.lookup_object("configfile")
-        orig_position_min = toolhead.kin.rails[0].position_min
-        orig_kin_limit_x = toolhead.kin.limits[0]
-        orig_axes_min = toolhead.kin.axes_min
         probe_min_x = min(float(cfg["check_cut_pos_x_min"]), CUT_CAL_POSITION_MIN_X)
-        saved_limits = False
         sensor_seen = False
         warned_stall_without_sensor = False
         first_hit_x = None
@@ -81,128 +78,114 @@ class MotorCutCalibrationHelper:
         original_mode = None
         cut_mode_active = False
         cut_check_active = False
-        try:
-            self._respond("Cut calibration: homing XY if needed")
-            self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
-            motion_limits.save_motion_limits(
-                self.printer, self.gcode, CUT_CAL_STATE_NAME,
-                include_gcode=True)
-            saved_limits = True
-            self._set_cut_x_limit(
-                toolhead,
-                min(orig_position_min,
-                    float(self.replacement.position_min_cut_x),
-                    probe_min_x),
-            )
 
-            self.gcode.run_script_from_command("G90")
-            self._move_xy(
-                CUT_CAL_PARK_X, cfg["cut_pos_y"], CUT_CAL_PARK_FEED_F, toolhead)
+        def move(feed_f, **target):
+            zone.service_move(velocity=feed_f, **target)
+            toolhead.wait_moves()
 
-            original_mode = self._get_cut_mode_raw()
-            self._set_cut_mode_raw(CUT_CAL_MODE)
-            cut_mode_active = True
-            self.replacement.start_cut_position_check()
-            cut_check_active = True
+        self._respond("Cut calibration: homing XY if needed")
+        self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
+        with motion_limits.saved_motion(
+                self.printer, self.gcode, CUT_CAL_STATE_NAME), \
+                zone.widened_x_min(min(
+                    float(self.replacement.position_min_cut_x), probe_min_x)):
+            try:
+                self.gcode.run_script_from_command("G90")
+                move(CUT_CAL_PARK_FEED_F, x=CUT_CAL_PARK_X, y=cfg["cut_pos_y"])
 
-            current_x = float(cfg["pre_cut_cal_pos_x"])
-            while current_x >= (probe_min_x - CUT_CAL_EPSILON):
-                self._respond("Cut calibration: probing X=%.4f" % (current_x,))
-                self._move_x(current_x, CUT_CAL_STEP_FEED_F, toolhead)
+                original_mode = self._get_cut_mode_raw()
+                self._set_cut_mode_raw(CUT_CAL_MODE)
+                cut_mode_active = True
+                self.replacement.start_cut_position_check()
+                cut_check_active = True
 
-                if box.get_cut_sensor_state() is False:
-                    sensor_seen = True
+                current_x = float(cfg["pre_cut_cal_pos_x"])
+                while current_x >= (probe_min_x - CUT_CAL_EPSILON):
+                    self._respond(
+                        "Cut calibration: probing X=%.4f" % (current_x,))
+                    move(CUT_CAL_STEP_FEED_F, x=current_x)
 
-                self._move_x(CUT_CAL_PARK_X, CUT_CAL_PARK_FEED_F, toolhead)
+                    if box.get_cut_sensor_state() is False:
+                        sensor_seen = True
 
-                if current_x <= (cfg["check_cut_pos_x_max"] + CUT_CAL_EPSILON):
-                    latch = self.replacement.consume_cut_position_latch()
-                    if latch["latched"]:
-                        if not sensor_seen and not warned_stall_without_sensor:
-                            self._respond(
-                                "Cut calibration warning: motor stall detected before cut sensor trigger")
-                            warned_stall_without_sensor = True
-                        if first_hit_x is None:
-                            first_hit_x = current_x
-                            self._respond(
-                                "Cut calibration: first protection hit at X=%.4f"
-                                % (first_hit_x,),
-                            )
-                        else:
-                            second_hit_x = current_x
-                            self._respond(
-                                "Cut calibration: second protection hit at X=%.4f"
-                                % (second_hit_x,),
-                            )
-                            break
+                    move(CUT_CAL_PARK_FEED_F, x=CUT_CAL_PARK_X)
 
-                current_x = round(current_x - CUT_CAL_STEP_DELTA_X, 4)
+                    if current_x <= (cfg["check_cut_pos_x_max"] + CUT_CAL_EPSILON):
+                        latch = self.replacement.consume_cut_position_latch()
+                        if latch["latched"]:
+                            if not sensor_seen and not warned_stall_without_sensor:
+                                self._respond(
+                                    "Cut calibration warning: motor stall detected before cut sensor trigger")
+                                warned_stall_without_sensor = True
+                            if first_hit_x is None:
+                                first_hit_x = current_x
+                                self._respond(
+                                    "Cut calibration: first protection hit at X=%.4f"
+                                    % (first_hit_x,),
+                                )
+                            else:
+                                second_hit_x = current_x
+                                self._respond(
+                                    "Cut calibration: second protection hit at X=%.4f"
+                                    % (second_hit_x,),
+                                )
+                                break
 
-            if second_hit_x is None:
-                raise RuntimeError(
-                    "cut-position calibration failed before X reached %.4f"
-                    % (probe_min_x,))
+                    current_x = round(current_x - CUT_CAL_STEP_DELTA_X, 4)
 
-            saved_cut_pos_x = float(second_hit_x) + float(self.replacement.cut_pos_offset)
+                if second_hit_x is None:
+                    raise RuntimeError(
+                        "cut-position calibration failed before X reached %.4f"
+                        % (probe_min_x,))
 
-            if cut_mode_active:
-                self._set_cut_mode_raw(original_mode)
-                cut_mode_active = False
-            if cut_check_active:
-                self.replacement.stop_cut_position_check()
-                cut_check_active = False
+                saved_cut_pos_x = float(second_hit_x) + float(self.replacement.cut_pos_offset)
 
-            self._move_xy(
-                CUT_CAL_EXIT_X, cfg["cut_pos_y"], CUT_CAL_PARK_FEED_F, toolhead)
-
-            configfile.set("box", "cut_pos_x", "%.4f" % (saved_cut_pos_x,))
-            self.gcode.run_script_from_command("SAVE_CONFIG RESTART=0")
-            box.set_cut_position(saved_cut_pos_x)
-
-            self._respond(
-                "Cut calibration complete: first_hit_x=%.4f second_hit_x=%.4f cut_pos_offset=%.4f saved_cut_pos_x=%.4f"
-                % (
-                    first_hit_x,
-                    second_hit_x,
-                    float(self.replacement.cut_pos_offset),
-                    saved_cut_pos_x,
-                ),
-            )
-            return {
-                "first_hit_x": first_hit_x,
-                "second_hit_x": second_hit_x,
-                "saved_cut_pos_x": saved_cut_pos_x,
-                "cut_pos_offset": float(self.replacement.cut_pos_offset),
-                "sensor_seen": sensor_seen,
-                "original_mode": original_mode,
-                "cut_mode": CUT_CAL_MODE,
-            }
-        finally:
-            self._restore_cut_x_limit(
-                toolhead, orig_position_min, orig_kin_limit_x, orig_axes_min)
-            if cut_mode_active:
-                try:
+                if cut_mode_active:
                     self._set_cut_mode_raw(original_mode)
-                except Exception:
-                    _klog(
-                        "failed restoring cut calibration stall mode",
-                        level=logging.exception)
-            if cut_check_active:
-                try:
+                    cut_mode_active = False
+                if cut_check_active:
                     self.replacement.stop_cut_position_check()
-                except Exception:
-                    _klog(
-                        "failed stopping cut calibration latch mode",
-                        level=logging.exception)
-            if saved_limits:
-                try:
-                    motion_limits.restore_motion_limits(
-                        self.gcode, CUT_CAL_STATE_NAME,
-                        include_gcode=True, move=0)
-                except Exception:
-                    _klog(
-                        "failed restoring cut calibration state",
-                        level=logging.exception)
+                    cut_check_active = False
+
+                move(CUT_CAL_PARK_FEED_F, x=CUT_CAL_EXIT_X, y=cfg["cut_pos_y"])
+
+                configfile.set("box", "cut_pos_x", "%.4f" % (saved_cut_pos_x,))
+                self.gcode.run_script_from_command("SAVE_CONFIG RESTART=0")
+                box.set_cut_position(saved_cut_pos_x)
+
+                self._respond(
+                    "Cut calibration complete: first_hit_x=%.4f second_hit_x=%.4f cut_pos_offset=%.4f saved_cut_pos_x=%.4f"
+                    % (
+                        first_hit_x,
+                        second_hit_x,
+                        float(self.replacement.cut_pos_offset),
+                        saved_cut_pos_x,
+                    ),
+                )
+                return {
+                    "first_hit_x": first_hit_x,
+                    "second_hit_x": second_hit_x,
+                    "saved_cut_pos_x": saved_cut_pos_x,
+                    "cut_pos_offset": float(self.replacement.cut_pos_offset),
+                    "sensor_seen": sensor_seen,
+                    "original_mode": original_mode,
+                    "cut_mode": CUT_CAL_MODE,
+                }
+            finally:
+                if cut_mode_active:
+                    try:
+                        self._set_cut_mode_raw(original_mode)
+                    except Exception:
+                        _klog(
+                            "failed restoring cut calibration stall mode",
+                            level=logging.exception)
+                if cut_check_active:
+                    try:
+                        self.replacement.stop_cut_position_check()
+                    except Exception:
+                        _klog(
+                            "failed stopping cut calibration latch mode",
+                            level=logging.exception)
 
     def _require_no_filament(self, box):
         detected, error = box.get_filament_sensor_state()
@@ -215,33 +198,6 @@ class MotorCutCalibrationHelper:
 
     def _respond(self, message: str):
         self.gcode.respond_info(message)
-
-    def _move_xy(self, x: float, y: float, feed_f: float, toolhead):
-        self.gcode.run_script_from_command(
-            "G0 X%.3f Y%.3f F%.3f" % (x, y, feed_f))
-        toolhead.wait_moves()
-
-    def _move_x(self, x: float, feed_f: float, toolhead):
-        self.gcode.run_script_from_command("G0 X%.3f F%.3f" % (x, feed_f))
-        toolhead.wait_moves()
-
-    def _set_cut_x_limit(self, toolhead, position_min):
-        kin = toolhead.kin
-        kin.rails[0].position_min = position_min
-        _, current_max = kin.limits[0]
-        kin.limits[0] = (position_min, current_max)
-        kin.axes_min = toolhead.Coord(
-            position_min,
-            kin.axes_min.y,
-            kin.axes_min.z,
-            kin.axes_min.e,
-        )
-
-    def _restore_cut_x_limit(self, toolhead, position_min, kin_limits, axes_min):
-        kin = toolhead.kin
-        kin.rails[0].position_min = position_min
-        kin.limits[0] = kin_limits
-        kin.axes_min = axes_min
 
     def _get_cut_mode_raw(self) -> int:
         result = self.replacement.get_axis_stall_mode_raw(CUT_CAL_AXIS)
@@ -704,12 +660,17 @@ nozzle-MCU transparent tunnel.
 
 FUNC_ENCODER_CALIBRATE = 0x03
 FUNC_ELEC_OFFSET_CALIBRATE = 0x04
+FUNC_CONTROL = 0x05
 FUNC_SYS_PARAM = 0x06
 FUNC_FLASH_PARAM = 0x07
 FUNC_GET = 0x08
 FUNC_PROTECTION = 0x0C
 FUNC_READ_ADDR = 0x0E
 FUNC_STALL_MODE = 0x11
+# control (func 0x05) ops. Disable sends no reply; query answers
+# [enable pin level, controller enabled, driver enabled].
+CONTROL_OP_DISABLE = 0x01
+CONTROL_OP_QUERY = 0x04
 
 DATA_CLEAR_ERR_WARN = 0x05
 
@@ -1067,6 +1028,31 @@ class MotorFirmwareClient:
         return self._no_ack_command(
             addr, FUNC_PROTECTION, bytes([DATA_CLEAR_ERR_WARN]),
             timeout=timeout)
+
+    def control_disable(
+            self, addr: int,
+            timeout: float = MOTOR_NO_ACK_TIMEOUT) -> dict:
+        return self._no_ack_command(
+            addr, FUNC_CONTROL, bytes([CONTROL_OP_DISABLE]), timeout=timeout)
+
+    def control_query(
+            self, addr: int,
+            timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
+        result, frame = self._acked_command(
+            addr, FUNC_CONTROL, bytes([CONTROL_OP_QUERY]),
+            timeout=timeout, label="control_query")
+        frame, public = self._validated_frame_result(
+            result, frame, "control_query")
+        payload = frame["payload"]
+        if len(payload) < 3:
+            raise RuntimeError(
+                "short control_query payload: %s" % (payload.hex(),))
+        return {
+            **public,
+            "enable_pin": payload[0],
+            "controller_enabled": bool(payload[1]),
+            "driver_enabled": bool(payload[2]),
+        }
 
     def read_addr(
             self, addr: int,
@@ -1527,6 +1513,28 @@ class MotorControlDebugSurfaceMixin:
         self._begin_startup(force=True, allow_auto_retry=False)
         gcmd.respond_info("motor control startup retry scheduled")
 
+    def cmd_MOTOR_CONTROL(self, gcmd):
+        try:
+            axes = self._parse_managed_axis_spec(gcmd.get("AXIS"))
+            if len(axes) != 1:
+                raise RuntimeError("MOTOR_CONTROL takes one AXIS")
+            op = (gcmd.get("OP", "query") or "query").strip().lower()
+            if op not in ("query", "disable"):
+                raise RuntimeError("OP must be query or disable")
+            target = self.axes.target(axes[0])
+            if op == "disable":
+                # No reply comes back; the query below confirms it.
+                target.control_disable()
+            state = target.control_query(timeout=MOTOR_COMMAND_TIMEOUT)
+            gcmd.respond_info(
+                "%s: enable_pin=%d controller=%s driver=%s"
+                % (self._format_axis_label(axes[0]), state["enable_pin"],
+                   "on" if state["controller_enabled"] else "off",
+                   "on" if state["driver_enabled"] else "off"))
+            return state
+        except Exception as exc:
+            raise gcmd.error(str(exc))
+
     def cmd_MOTOR_QUERY_FAULTS(self, gcmd):
         try:
             start_time = self.reactor.monotonic()
@@ -1886,6 +1894,10 @@ class Serial485TransportAdapter:
     def from_printer(cls, printer):
         return cls(printer.lookup_object("serial_485 serial485"))
 
+    def priority(self):
+        """Send requests made inside this block ahead of queued bus traffic."""
+        return self.serial485.priority_requests()
+
     def is_configured(self) -> bool:
         return bool(self.serial485._status_fields()["connected"])
 
@@ -2007,6 +2019,16 @@ class MotorAxisTarget:
             self, timeout: float = MOTOR_NO_ACK_TIMEOUT) -> dict:
         result = self.client.protection_clear(self.addr, timeout=timeout)
         return self._with_axis(result, data=DATA_CLEAR_ERR_WARN)
+
+    def control_disable(
+            self, timeout: float = MOTOR_NO_ACK_TIMEOUT) -> dict:
+        return self._with_axis(
+            self.client.control_disable(self.addr, timeout=timeout))
+
+    def control_query(
+            self, timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
+        return self._with_axis(
+            self.client.control_query(self.addr, timeout=timeout))
 
     def set_stall_mode(
             self, mode: int, timeout: float = MOTOR_COMMAND_TIMEOUT) -> dict:
@@ -2623,6 +2645,12 @@ PROTECTION_QUERY_DATA = 11
 STALL_EVENT_MIN_INTERVAL = 0.100
 FAULT_CLEANUP_RETRY_DELAY = 0.100
 PROTECTION_POLL_INTERVAL = 60.0
+# Saved shunt (ID 30) and motor R (ID 41) on an extruder that still holds the
+# bus motor build's settings, and the IDs that get the extruder build's values.
+EXTRUDER_BUS_SIGNATURE = ((30, 0.05), (41, 0.78))
+EXTRUDER_BUILD_PARAM_IDS = (
+    14, 20, 23, 30, 41, 42, 43, 70, 86, 87, 89, 94, 95,
+    102, 105, 111, 122, 123, 127, 128, 180, 181, 182, 220, 221)
 CALIBRATION_STAGE_ENCODER = "encoder"
 CALIBRATION_STAGE_OFFSET = "offset"
 # Stage 1 completes only after firmware observes 0xC0 and returns 0x0C.
@@ -2634,6 +2662,7 @@ CALIBRATION_STAGE_ALIAS_MAP = {
     CALIBRATION_STAGE_OFFSET: CALIBRATION_STAGE_OFFSET,
 }
 STARTUP_STEP_ACTIONS = {
+    "extruder_build_defaults": "updating the extruder motor settings",
     "stall_mode": "configuring motor stall modes",
     "protect_check": "checking motor protection status",
     "protect_clear": "clearing motor protection faults",
@@ -2657,6 +2686,10 @@ STARTUP_SERIAL_AXIS_BY_ADDR = {
 STARTUP_PROTOCOL_ERROR_RE = re.compile(
     r"^(no response|empty response) for addr=0x([0-9a-fA-F]{2}) "
     r"func=0x([0-9a-fA-F]{2})$")
+
+
+class _ExtruderSettingsUnknown(RuntimeError):
+    pass
 
 
 class MotorControl(MotorControlDebugSurfaceMixin):
@@ -2795,6 +2828,10 @@ class MotorControl(MotorControlDebugSurfaceMixin):
              % (self._format_axis_labels(self.managed_axes),)),
             ("MOTOR_RETRY_STARTUP", self.cmd_MOTOR_RETRY_STARTUP,
              "MOTOR_RETRY_STARTUP Restart motor-control startup"),
+            ("MOTOR_CONTROL", self.cmd_MOTOR_CONTROL,
+             "MOTOR_CONTROL AXIS=%s [OP=query|disable] Report whether a "
+             "motor's drive is enabled, or switch it off"
+             % (self._format_axis_labels(self.managed_axes),)),
         ))
 
     def _axis_from_num(self, num: int) -> str:
@@ -3291,6 +3328,9 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         return (
             ("serial_target_discovery", self._startup_discover_serial_targets),
             ("extruder_target_discovery", self._startup_discover_extruder_target),
+            # Before anything writes live values: the save stores them all.
+            ("extruder_build_defaults",
+             self._startup_fix_extruder_build_defaults),
             ("stall_mode", self.axes.set_normal_stall_mode),
             ("protect_check", partial(
                 self._startup_check_axis_protection,
@@ -3341,6 +3381,81 @@ class MotorControl(MotorControlDebugSurfaceMixin):
     def _startup_discover_extruder_target(self):
         target = self.axes.read_extruder_addr(timeout=MOTOR_COMMAND_TIMEOUT)
         return {"target": target}
+
+    def _startup_fix_extruder_build_defaults(self):
+        # An extruder flashed with the bus motor build keeps that build's
+        # settings; write the extruder build's values once, motor off.
+        try:
+            message = self._fix_extruder_build_defaults()
+        except _ExtruderSettingsUnknown:
+            raise
+        except Exception as exc:
+            message = "failed: %r" % (exc,)
+        if message is not None:
+            _klog("extruder motor settings: %s", message)
+        return message
+
+    def _fix_extruder_build_defaults(self):
+        target = self.axes.target(EXTRUDER_AXIS)
+        timeout = MOTOR_COMMAND_TIMEOUT
+
+        def param(pid):
+            return self.registry.get_by_id(EXTRUDER_AXIS, pid)
+
+        def saved(p):
+            return target.flash_param_read(
+                p.param_id, p, timeout=timeout)["value"]
+
+        if not all(param_values_match(saved(param(pid)), value, param(pid))
+                   for pid, value in EXTRUDER_BUS_SIGNATURE):
+            return None
+        if target.control_query(timeout=timeout)["enable_pin"] != 1:
+            return "skipped, extruder enabled"
+        target.control_disable()
+        state = target.control_query(timeout=timeout)
+        if state["controller_enabled"] or state["driver_enabled"]:
+            return "skipped, motor did not switch off"
+        params = [param(pid) for pid in EXTRUDER_BUILD_PARAM_IDS]
+        original = [saved(p) for p in params]
+        if any(v is None for v in original + [p.value for p in params]):
+            return "skipped, incomplete settings read"
+
+        def write(p, value):
+            target.sys_param_write(p, value, timeout=timeout)
+            live = target.sys_param_read(p, timeout=timeout)["value"]
+            if not param_values_match(live, value, p):
+                raise RuntimeError("ID %d read back %r, expected %r" % (
+                    p.param_id, live, value))
+
+        try:
+            for p in params:
+                write(p, p.value)
+        except Exception as exc:
+            # Nothing is saved yet; put all the saved values back live, which
+            # also covers writes left by an earlier attempt.
+            try:
+                for p, value in zip(params, original):
+                    write(p, value)
+            except Exception as undo_exc:
+                # Stop startup: its retry starts this over from the saved
+                # page, and a power cycle reloads it.
+                raise _ExtruderSettingsUnknown(
+                    "extruder motor settings left half written: %r"
+                    % (undo_exc,)) from exc
+            return "failed, nothing saved: %r" % (exc,)
+
+        try:
+            target.flash_param_save(timeout=MOTOR_FLASH_COMMIT_TIMEOUT)
+            save_error = ""
+        except Exception as exc:
+            # The reply can be lost after the page is written; check it.
+            save_error = " (save reply: %r)" % (exc,)
+        wrong = [p.param_id for p in params
+                 if not param_values_match(saved(p), p.value, p)]
+        if wrong:
+            return "save did not take for IDs %s%s" % (wrong, save_error)
+        return "updated %d to the extruder build's values%s" % (
+            len(params), save_error)
 
     def _startup_check_axis_protection(self, label: str, axes, *,
                                        timeout: float):
@@ -4470,10 +4585,13 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         source = f"stall_pin:{active}"
         during_homing = was_homing or self._is_homing_context_active()
         try:
-            singleton = self.check_protection_code(
-                axis=axis, data=PROTECTION_QUERY_DATA,
-                timeout=MOTOR_STALL_EVENT_VERIFY_TIMEOUT,
-                source=source)
+            # The one query that needs an answer now: ahead of queued
+            # bus traffic, never behind it.
+            with self.transport.priority():
+                singleton = self.check_protection_code(
+                    axis=axis, data=PROTECTION_QUERY_DATA,
+                    timeout=MOTOR_STALL_EVENT_VERIFY_TIMEOUT,
+                    source=source)
             _klog(
                 "stall singleton query axis=%s active=%s "
                 "was_homing=%s detail=%s",

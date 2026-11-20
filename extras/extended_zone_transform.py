@@ -9,9 +9,19 @@ compensation to each routed segment.
 
 import logging
 import math
+from contextlib import contextmanager
 
 
 _COORD_EPSILON = 1.0e-9
+# Compensated service-move words are rounded to 9 decimals, so the toolhead
+# lands within 1e-9 of its target. Targets on a travel limit are stepped this
+# far inside it. Callers compare positions to 1e-6.
+_SERVICE_MARGIN = 1.0e-8
+
+
+def _fixed(value):
+    # Fixed-point: %g's exponent form ("Y1e-05") parses as Y1 E-5.
+    return ("%.9f" % value).rstrip("0").rstrip(".")
 
 
 def _klog(msg, *args, level=logging.info):
@@ -237,6 +247,26 @@ class ExtendedZoneTransform:
         self._apply_y_envelope(desired_y_max)
         return segments
 
+    def _active_skew(self):
+        skew = self.printer.lookup_object("skew_correction", None)
+        if skew is None or not (
+                skew.xy_factor or skew.xz_factor or skew.yz_factor):
+            return None
+        return skew
+
+    def _route_gcode(self, current, target):
+        """Route a G-code move, which skew correction shifts on its way down.
+
+        The zone is part of the frame, so plan where the toolhead will
+        really go and map the waypoints back.
+        """
+        skew = self._active_skew()
+        if skew is None:
+            return self._route(current, target)
+        segments = self._route(
+            skew.calc_skew(current), skew.calc_skew(target))
+        return [skew.calc_unskew(point) for point in segments[:-1]] + [target]
+
     def move(self, newpos, speed):
         if self.next_transform is None:
             self._install_transform_chain()
@@ -246,7 +276,7 @@ class ExtendedZoneTransform:
         target = list(newpos)
         current = list(self.last_position)
 
-        segments = self._route(current, target)
+        segments = self._route_gcode(current, target)
         for idx, segment in enumerate(segments):
             try:
                 self.next_transform.move(segment, speed)
@@ -263,9 +293,7 @@ class ExtendedZoneTransform:
         switching that G0/G1 moves get. Bed mesh compensation is still
         skipped, as it is for any toolhead-space move.
         """
-        if self.toolhead is None:
-            self.toolhead = self.printer.lookup_object("toolhead")
-        toolhead = self.toolhead
+        toolhead = self._get_toolhead()
 
         current = list(toolhead.get_position())
         target = list(current)
@@ -280,6 +308,110 @@ class ExtendedZoneTransform:
             except self.printer.command_error:
                 self._log_move_failure_context(current, target, segments, idx)
                 raise
+
+    def _get_toolhead(self):
+        if self.toolhead is None:
+            self.toolhead = self.printer.lookup_object("toolhead")
+        return self.toolhead
+
+    # Service moves: travel to fixed points on the frame (cutter, wastebin,
+    # wiper), given in machine XY.
+
+    def service_position(self):
+        """Where the toolhead is in machine space, as [x, y, z, e]."""
+        return list(self._get_toolhead().get_position())
+
+    def service_move(self, x=None, y=None, velocity=None):
+        """Travel to a machine XY point at a G-code feedrate (mm/min).
+
+        Callers must have G90 active. With Z homed this is a G0, which keeps
+        bed mesh compensation so travel holds the hop above the bed and
+        print. G-code offsets and skew correction place the print, not the
+        frame, so the G0 is aimed where they will land it on the target.
+        With Z unhomed the mesh has no Z reference and would fail the move
+        (G28 Z cleans before homing Z), so move in toolhead space.
+        """
+        toolhead = self._get_toolhead()
+        homed = toolhead.get_status(
+            self.reactor.monotonic()).get("homed_axes", "")
+        status = self.printer.lookup_object("gcode_move").get_status(
+            self.reactor.monotonic())
+        if "z" not in homed:
+            # M220 scales a G0's feedrate, so scale this the same.
+            self.manual_move(
+                [x, y], velocity / 60.0 * status["speed_factor"])
+            return
+        offsets = [
+            position - gcode_position for position, gcode_position in zip(
+                status["position"][:2], status["gcode_position"][:2])]
+        target = [x, y]
+        skew = self._active_skew()
+        if skew is not None:
+            # Skew couples the axes, so an axis left out still needs a word
+            # to hold its machine position. Skew will see this G0's Z.
+            point = list(toolhead.get_position())
+            point[2] = status["position"][2]
+            for axis, value in enumerate(target):
+                if value is not None:
+                    point[axis] = value
+            point[:2] = [
+                self._inside_travel(axis, value)
+                for axis, value in enumerate(point[:2])]
+            target = skew.calc_unskew(point)[:2]
+        elif any(offsets):
+            target = [
+                value if value is None else self._inside_travel(axis, value)
+                for axis, value in enumerate(target)]
+        words = "".join(
+            " %s%s" % (name, _fixed(value - offset))
+            for name, value, offset in zip("XY", target, offsets)
+            if value is not None)
+        self.gcode.run_script_from_command("G0%s F%.0f" % (words, velocity))
+
+    def _inside_travel(self, axis, value):
+        """Step a machine target that sits on a travel limit just inside it.
+
+        A compensated move lands a rounding error away from its target, and
+        on a limit that can be the wrong side.
+        """
+        low, high = self._get_toolhead().kin.limits[axis]
+        if low > high:
+            return value
+        if axis == 1:
+            high = (self.extended_y_max if self._is_extended_y(value)
+                    else self.standard_y_max)
+        if abs(value - high) < _SERVICE_MARGIN:
+            return high - _SERVICE_MARGIN
+        if abs(value - low) < _SERVICE_MARGIN:
+            return low + _SERVICE_MARGIN
+        return value
+
+    @contextmanager
+    def widened_x_min(self, minimum):
+        """Let X travel down to `minimum` inside the block.
+
+        The cutter lever sits left of the print area. Never narrows travel.
+        """
+        toolhead = self._get_toolhead()
+        kin = toolhead.kin
+        rail = kin.rails[0]
+        saved_min, saved_axes_min = rail.position_min, kin.axes_min
+        minimum = min(saved_min, minimum)
+
+        def set_minimum(value, axes_min):
+            rail.position_min = value
+            kin.axes_min = axes_min
+            low, high = kin.limits[0]
+            # An unhomed axis (low > high) must stay unhomed.
+            if low <= high:
+                kin.limits[0] = (value, high)
+
+        set_minimum(minimum, toolhead.Coord(
+            minimum, kin.axes_min.y, kin.axes_min.z, kin.axes_min.e))
+        try:
+            yield
+        finally:
+            set_minimum(saved_min, saved_axes_min)
 
     def _log_move_failure_context(self, current, target, segments, failed_idx):
         """Dump gcode_move offset/mode state and zone config when a downstream

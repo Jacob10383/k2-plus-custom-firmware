@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import random
 import threading
 import urllib.request
 from contextlib import contextmanager
@@ -17,10 +18,11 @@ from dataclasses import dataclass, replace
 
 from extras import box_protocol
 from extras.box_addr import ADDRESS_WEDGE_WARNING, MAX_ADDRESSES, AutoAddressManager
-from extras.box_change import BoxChangeEngine
+from extras.box_change import (
+    UNLOAD_ESTIMATE_CAP, UNLOAD_ESTIMATE_RATE, BoxChangeEngine)
 from extras.box_gcode import read_metadata
 from extras.box_catalog import resolve_material
-from extras.motion_limits import restore_motion_limits, save_motion_limits
+from extras.motion_limits import saved_motion, set_service_motion
 
 
 SLOTS_PER_BOX = box_protocol.SLOTS_PER_BOX
@@ -29,7 +31,7 @@ EXTERNAL_PROFILE_KEY = "external"
 # docs/box-status-api.md in the firmware repo). API_VERSION changes only on a
 # break clients must handle; API_REVISION on every additive schema change.
 API_VERSION = 1
-API_REVISION = 4
+API_REVISION = 6
 # A BOX_PRINT_MAP map is dropped if no print file loads within this time.
 NEXT_PRINT_MAP_TIMEOUT = 600.0
 SAFE_WIDGET_COMMANDS = frozenset((
@@ -58,6 +60,19 @@ ERROR_BACKOFF = 10.0
 # Consecutive missed state reads before a CFS reports offline; one dropped
 # RS-485 frame must not flicker a box offline or hide its slots.
 OFFLINE_POLLS = 3
+# How often a box that was online at startup and lost power is looked for.
+# Each try is one discovery broadcast, up to a second of bus time when
+# nothing answers.
+RECONNECT_INTERVAL = 15.0
+# Host-side fault for filament that snapped between a slot and the hub. It
+# has no CFS status code.
+SNAPPED_STATUS = "FILAMENT_SNAPPED"
+# Host-side fault for filament at more than one hub lane. The loaded slot is
+# unknown until it clears, so loads and unloads are refused.
+PATH_CONFLICT_STATUS = "PATH_CONFLICT"
+PATH_CONFLICT_TITLE = "Filament in more than one hub lane"
+# A CFS reply the poll could not use, though the box answered.
+_DRAINING = object()
 STATE_TIMEOUT = 5.0
 STATE_POLL = 0.1
 STATE_EVENT_DRAIN = 4
@@ -75,6 +90,20 @@ ENCODER_CLEAR_MM = 20.0
 # The CFS refills the buffer in ~25-30mm chunks, so any single refill moves
 # the encoder past this and proves filament is flowing.
 CLOG_ENCODER_RESET_MM = 18.0
+
+# A spool that runs out leaves a tail between the CFS and the printhead. Its
+# end has left the CFS, so only the extruder can move it. The saved setting
+# names its slot until the printhead sensor clears.
+TAIL_SETTING = "tail"
+# The CFS stops a feed at 3000 mm, so no load path or tail is longer.
+TAIL_MAX_MM = 3000.0
+# What each CFS fed on its recent clean loads, in mm: the length of its load
+# path. A full unload that pulls back much less left filament in the tube.
+PATH_SETTING = "path_lengths"
+PATH_SAMPLES = 5
+PATH_MIN_SAMPLES = 3
+PATH_MIN_MM = 300.0
+PATH_SHORT_MM = 300.0
 
 CFS_COMMAND_FATAL_STATUSES = frozenset((
     box_protocol.STATUS_STAGE0_SENSOR_TIMEOUT,
@@ -100,6 +129,9 @@ CFS_LOG_ONLY_STATUSES = frozenset((
     box_protocol.STATUS_BUSY,
     box_protocol.STATUS_STAGE7_NO_MOTION,
 ))
+# An unused box's status is not announced again sooner than this, so an
+# error that returns after each clear cannot flood the console.
+ADVISORY_REPEAT = 60.0
 # One corrupted frame is noise; repeated ones point at the cable.
 CRC_FAULT_COUNT = 3
 CRC_FAULT_WINDOW = 60.0
@@ -201,6 +233,13 @@ def _fetch_spoolman_spool(spool_id):
         return None
 
 
+def _join_and(items):
+    """'1', '1 and 2', '1, 2 and 3'."""
+    if len(items) < 2:
+        return "".join(items)
+    return "%s and %s" % (", ".join(items[:-1]), items[-1])
+
+
 class BoxError(RuntimeError):
     pass
 
@@ -227,6 +266,9 @@ class BoxSnapshot:
     # humidity_pct, and the relay fallback beyond the buffer.
     relay_status_code: object = None
     relay_state_code: object = None
+    # Why the loaded path is unknown (filament at more than one hub lane), or
+    # None. Operations refuse while it is set.
+    conflict: object = None
 
 
 @dataclass(frozen=True)
@@ -350,7 +392,9 @@ class BoxStore:
         return key
 
     def profile(self, key):
-        value = self.data["slots"].get(str(key), {})
+        value = self.data["slots"].get(str(key))
+        if not isinstance(value, dict):
+            value = {}
         return {
             "material": str(value.get("material", "")).strip().upper(),
             "color": str(value.get("color", "")).strip().upper(),
@@ -477,8 +521,9 @@ class Box:
         self.store = BoxStore(config.get(
             "state_path", "/mnt/UDISK/printer_data/filament_box.json"))
 
-        # Service moves are written with 3 decimals; round so "already at
-        # the wastebin" matches the position those moves leave behind.
+        # Positions are kept to 3 decimals. Service moves land within 1e-9
+        # of their target, well inside the 1e-6 "already at the wastebin"
+        # test.
         self.wastebin_x = round(config.getfloat("wastebin_pos_x", 133.0), 3)
         self.wastebin_y = round(config.getfloat("wastebin_pos_y", 378.0), 3)
         # Staging point for the climb to the wastebin row; must sit right of
@@ -546,6 +591,8 @@ class Box:
         self.tracking_epoch = 0
         self.tracking_owner = None
         self.path_owner = None
+        self.tail_baseline = None
+        self.tail_travel = None  # extruder mm since the tail's spool ran out
         self._clear_runout_state()
         self.runout_defer_active = False
         self._kalico_runout_taken = False
@@ -553,6 +600,13 @@ class Box:
         self.fault_generation = 0
         self.last_fatal_reason = None
         self.fault_episodes = {}
+        self.advised = {}  # address -> (status, time) reported as unused
+        self.snapped = None  # loaded slot whose filament snapped in the box
+        self.last_reconnect = 0.0
+        self.reconnect_noted = set()  # errors already reported once
+        self.offline_handled = set()  # boxes whose outage paused a print
+        # (print start time,) of the print the current conflict paused.
+        self.conflict_paused = None
         self.crc_errors = {}
         self.crc_warned = set()
         self.rfid_percent = {}
@@ -561,10 +615,14 @@ class Box:
         self.rfid_pending = set()
         self.rfid_snapshot = {}
         self.rfid_seen_invalid = set()
-        self.rfid_live_slots = set()
         self.box_replies = None  # until the first poll; then address -> reply
         self.box_last = {}
         self.box_misses = {}
+        # Filament at more than one hub lane: (addresses, message) or None.
+        self.path_conflict = None
+        # Failing poll steps: key -> the error last logged for it.
+        self.contained_errors = {}
+        self.last_status = None
         self.last_rfid_refresh = 0.0
         self.last_topology_refresh = 0.0
         self.spoolman_generation = 0
@@ -611,6 +669,13 @@ class Box:
         # After reset_print_recovery, which clears the previous job's map.
         self.printer.register_event_handler(
             "virtual_sdcard:load_file", self._apply_next_print_map)
+        self.printer.register_event_handler(
+            "print_stats:complete_printing",
+            lambda *args: self._report_tail_after_print(True))
+        for event in ("print_stats:error_printing",
+                      "print_stats:cancelled_printing"):
+            self.printer.register_event_handler(
+                event, lambda *args: self._report_tail_after_print(False))
 
     # ------------------------------------------------------------------
     # Lifecycle and public status
@@ -623,7 +688,7 @@ class Box:
             ("BOX_PRINT_MAP", self.cmd_print_map,
              "Set the tool map for the next print start"),
             ("BOX_SELECT_SLOT", self.cmd_select_slot,
-             "Switch to SLOT (unload, load, purge), ignoring the print's tool map"),
+             "Switch to SLOT (unload, load, purge), whatever the print's tool map says"),
             ("BOX_LOAD", self.cmd_load,
              "Feed SLOT to the printhead only; no unload, heating, or purge"),
             ("BOX_UNLOAD", self.cmd_unload, "Fully unload the active filament"),
@@ -631,7 +696,8 @@ class Box:
             ("BOX_BUFFER_RETRACT", self.cmd_buffer_retract,
              "Run the CFS buffer retract phase"),
             ("BOX_CUT", self.cmd_cut, "Cut the active filament"),
-            ("NOZZLE_CLEAN", self.cmd_nozzle_clean, "Clean the nozzle"),
+            ("NOZZLE_CLEAN", self.cmd_nozzle_clean,
+             "Clean the nozzle; RETURN=1 comes back afterwards"),
             ("BOX_GO_TO_WASTEBIN", self.cmd_wastebin, "Move to the wastebin"),
             ("PARSE_FLUSH_VOLUMES", self.change_engine.parse_flush_volumes,
              "Parse slicer flush metadata"),
@@ -746,6 +812,18 @@ class Box:
                     return original_handler(eventtime)
 
             helper._runout_event_handler = handler
+        original_note = getattr(helper, "note_filament_present", None)
+        if original_note is not None:
+            def note(eventtime, *args, **kwargs):
+                was_present = helper.filament_present
+                original_note(eventtime, *args, **kwargs)
+                if was_present and not helper.filament_present:
+                    try:
+                        self._printhead_cleared()
+                    except Exception:
+                        _klog('tail clear failed', level=logging.exception)
+
+            helper.note_filament_present = note
         sd = self.printer.lookup_object("virtual_sdcard", None)
         if sd is None or isinstance(sd.gcode, _VirtualSDGCodeObserver):
             return
@@ -761,11 +839,8 @@ class Box:
             self._kalico_runout_taken = False
             if armed:
                 self.runout_defer_active = True
-            self._info(
-                self.gcode,
-                "Filament sensor runout event received; %s" % (
-                    "watching for infill" if armed
-                    else "infill watch not armed"))
+            _klog("filament sensor runout event; %s",
+                  "watching for infill" if armed else "infill watch not armed")
         except Exception:
             _klog('runout defer arm failed', level=logging.exception)
 
@@ -809,10 +884,75 @@ class Box:
         self.box_replies = {}
         self.box_last.clear()
         self.box_misses = {address: OFFLINE_POLLS for address in self.drivers}
+        self.snapped = None
+        self.path_conflict = None
+        self.conflict_paused = None
         self.reactor.update_timer(self.poll_timer, self.reactor.NEVER)
 
     def get_status(self, eventtime):
-        """printer.box. Keep docs/status-api.md in step with every change."""
+        """printer.box. Keep docs/status-api.md in step with every change.
+
+        Klipper's status timer serves every object, so this never raises: a
+        failure serves the last good status, marked not ready.
+        """
+        try:
+            status = self._status(eventtime)
+        except Exception as exc:
+            # Served several times a second: log once until it recovers.
+            self._log_contained("status", exc, repeat=False)
+            if self.last_status is not None:
+                return dict(self.last_status, data_ready=False)
+            return self._empty_status()
+        self._clear_contained("status")
+        self.last_status = status
+        return status
+
+    def _empty_status(self):
+        """Every field clients read unconditionally, nothing to show.
+
+        Fluidd reads slots and load_path even when data_ready is false.
+        """
+        return {
+            "api_version": API_VERSION,
+            "api_revision": API_REVISION,
+            "print_mapping_version": 1,
+            "print_info": None,
+            "print_mapping": {"filename": None, "map": {},
+                              "active_tool": None, "active_slot": None},
+            "data_ready": False,
+            "temp_c": None,
+            "humidity_pct": None,
+            "status": box_protocol.status_name(None),
+            "status_code": None,
+            "state": box_protocol.state_name(None),
+            "state_code": None,
+            "loaded_slot": None,
+            "slots": [],
+            "boxes": [],
+            "materials": {},
+            "runout": None,
+            "runout_swap_enabled": False,
+            "unload_after_print_enabled": False,
+            "rfid_insert_reading_enabled": False,
+            "rfid_startup_reading_enabled": False,
+            "filament_detected": None,
+            "filament_sensor_error": None,
+            "load_path": {
+                "source_slot": None,
+                "box_addr": None,
+                "tracking_active": False,
+                "encoder": {"position_mm": None, "active": False},
+                "buffer": {"state": None, "state_code": None},
+                "printhead_sensor": {"detected": None, "error": None},
+                "clog_detection": None,
+            },
+            "recovery": {"blocked": False, "automatic": False,
+                         "target": None, "step": None, "reason": None},
+            "operation": None,
+            "driver_ready": self.drivers_ready,
+        }
+
+    def _status(self, eventtime):
         snap = self.snapshot
         physical = self._slot_statuses(snap)
         slots = physical + [self._external_status(snap)]
@@ -844,6 +984,7 @@ class Box:
             "filament_sensor_error": snap.filament_sensor_error,
             "load_path": self._load_path_status(snap),
             "recovery": self.change_engine.recovery_status(),
+            "operation": self.change_engine.operation_status(eventtime),
             "driver_ready": self.drivers_ready,
         }
 
@@ -876,6 +1017,25 @@ class Box:
         return boxes
 
     def _fault_status(self, address):
+        snapped = self.snapped
+        if snapped is not None and self._address_slot(snapped)[0] == address:
+            title, message = self._snapped_text(snapped)
+            return {
+                "category": "fatal",
+                "status": SNAPPED_STATUS,
+                "status_code": None,
+                "title": title,
+                "message": message,
+            }
+        conflict = self.path_conflict
+        if conflict is not None and address in conflict[0]:
+            return {
+                "category": "fatal",
+                "status": PATH_CONFLICT_STATUS,
+                "status_code": None,
+                "title": PATH_CONFLICT_TITLE,
+                "message": conflict[1],
+            }
         episode = self.fault_episodes.get(address)
         if episode is not None:
             status_code, category = episode[0], episode[-1]
@@ -1125,6 +1285,30 @@ class Box:
         self.gcode.run_script_from_command(
             "SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0")
 
+    @contextmanager
+    def printhead_sensor_off(self, after="on"):
+        """The printhead sensor off while filament moves, so no move reads
+        as a runout. Afterwards it is on ("on"), as the moves left it
+        ("leave"), or as it was ("restore"); after a failure, always as it
+        was."""
+        previous = self.filament_sensor_enabled()
+        self.disable_filament_sensor()
+
+        def restore():
+            if previous:
+                self.enable_filament_sensor()
+            else:
+                self.disable_filament_sensor()
+        try:
+            yield
+        except BaseException:
+            restore()
+            raise
+        if after == "on":
+            self.enable_filament_sensor()
+        elif after == "restore":
+            restore()
+
     def get_cut_calibration_config(self):
         return {
             "pre_cut_pos_x": self.pre_cut_x,
@@ -1157,7 +1341,8 @@ class Box:
                 if item["index"] != source and item["present"]
                 and item["material"] == material and item["color"] == color
             ]
-        return {"loaded_slot": source, "chain": chain}
+        return {"loaded_slot": source, "chain": chain,
+                "leftover_mm": self.tail_remaining()}
 
     def runout_recovery(self):
         snap = self.read_live_state()
@@ -1172,18 +1357,21 @@ class Box:
         runout = self._runout_status(physical, snap)
         if not self.runout_active:
             return {
-                "recoverable": False, "reason": "no active CFS runout",
+                "recoverable": False,
+                "reason": "Filament ran out at the printhead",
                 "loaded_slot": snap.loaded_slot, "target_slot": None,
             }
         if not runout:
             return {
-                "recoverable": False, "reason": "no loaded CFS slot",
+                "recoverable": False,
+                "reason": "Filament ran out at the printhead",
                 "loaded_slot": snap.loaded_slot, "target_slot": None,
             }
         if not runout["chain"]:
             return {
                 "recoverable": False,
-                "reason": "no matching present replacement slot",
+                "reason": "%s ran out and no other slot has the same filament"
+                          % self.slot_label(runout["loaded_slot"]),
                 "loaded_slot": runout["loaded_slot"], "target_slot": None,
             }
         return {
@@ -1391,7 +1579,7 @@ class Box:
             raise error("[BOX]: Unable to start %s: %s" % (filename, exc))
 
     def cmd_select_slot(self, gcmd):
-        self.change_engine.change(
+        self.change_engine.select_slot(
             gcmd, gcmd.get_int("SLOT", minval=0),
             bool(gcmd.get_int("FLUSH", 1)))
 
@@ -1421,6 +1609,10 @@ class Box:
         try:
             with self._operation():
                 live = self.read_live_state(include_topology=False)
+                if self.tail_loaded(live):
+                    raise BoxError(
+                        "%s ran out; the CFS holds none of its filament"
+                        % self.slot_label(live.loaded_slot))
                 if self.is_physical_slot(live.loaded_slot):
                     driver, address, _local = self._driver_for_slot(live.loaded_slot)
                 else:
@@ -1445,7 +1637,15 @@ class Box:
             raise gcmd.error("[BOX]: BOX_CUT failed: %s" % exc)
 
     def cmd_nozzle_clean(self, gcmd):
+        # RETURN=1 ends at the exact toolhead position the clean started
+        # from, as a probe's nozzle_scrubber_gcode must.
+        come_back = gcmd.get_int("RETURN", 0, minval=0, maxval=1)
+        toolhead = self.printer.lookup_object("toolhead")
+        start = toolhead.get_position()[:3]
         self.nozzle_clean()
+        if come_back:
+            self._zone().manual_move(start, self.travel_velocity / 60.0)
+            toolhead.wait_moves()
 
     def cmd_wastebin(self, gcmd):
         self.move_to_wastebin()
@@ -1599,42 +1799,80 @@ class Box:
     # ------------------------------------------------------------------
 
     def _initialize_rfid(self):
-        """Apply persisted reader policy and establish presence baselines."""
+        """Apply persisted reader policy and establish presence baselines.
+
+        With startup reading on, unread spools are then read, but only when
+        no box's hub and not the printhead hold filament: a read spins
+        filament out toward the shared path, and CFS boxes don't know about
+        each other, so it could hit what another box or the External spool
+        has loaded.
+        """
+        reading = self.rfid_startup_reading_enabled
+        unread = {}
+        clear = True
         for address, driver in sorted(self.drivers.items()):
             try:
-                reply = driver.set_rfid_insert_reading(
-                    self.rfid_insert_reading_enabled, timeout=1.0)
-                self._require_reply(reply, "box %d RFID insertion policy" % address)
-                slots = self._require_reply(
-                    driver.query_slot_mask(timeout=0.5),
-                    "box %d RFID presence baseline" % address)
-                local_mask = slots.value & 0x0F
-                self.rfid_presence[address] = local_mask
-                if self.rfid_startup_reading_enabled and local_mask:
-                    cached = self._require_reply(
-                        driver.query_rfid_records(
-                            local_mask, timeout=0.5),
-                        "box %d cached RFID query" % address)
-                    unread = 0
-                    for local, name in enumerate(
-                            box_protocol.RFID_SLOT_NAMES):
-                        bit = 1 << local
-                        if not local_mask & bit:
-                            continue
-                        record = cached.records.get(
-                            name, "").strip("\x00")
-                        if (record.lower() != "busy"
-                                and (len(record) != 40
-                                     or not cached.fields.get(name))):
-                            unread |= bit
-                    if unread:
-                        self._force_rfid_results(
-                            address, driver, unread, "startup")
+                local_mask = self._initialize_box_rfid(address, driver)
+                if reading:
+                    hub = self._require_reply(
+                        driver.query_hub_mask(timeout=0.5),
+                        "box %d hub query" % address)
+                    clear = clear and not hub.value & 0x0F
+                    if local_mask:
+                        unread[address] = self._unread_rfid(
+                            address, driver, local_mask)
+            except Exception as exc:
+                clear = False
+                self._warn("RFID initialization failed on box %d: %s" % (
+                    address, exc))
+        unread = {address: mask for address, mask in unread.items() if mask}
+        if unread:
+            detected, error = self.get_filament_sensor_state()
+            if not clear or detected is not False or error:
+                _klog("startup RFID reads skipped: filament may be in the "
+                      "path (hubs clear=%s printhead=%s %s)",
+                      clear, detected, error or "", level=logging.info)
+                unread = {}
+        for address, mask in sorted(unread.items()):
+            try:
+                self._force_rfid_results(
+                    address, self.drivers[address], mask, "startup")
             except Exception as exc:
                 self._warn("RFID initialization failed on box %d: %s" % (
                     address, exc))
         self.snapshot = replace(
             self.snapshot, slot_mask=self._presence_mask())
+
+    def _initialize_box_rfid(self, address, driver):
+        """Send the reader policy and take the presence baseline.
+
+        At startup and when a box reconnects. Returns the inlet mask.
+        """
+        reply = driver.set_rfid_insert_reading(
+            self.rfid_insert_reading_enabled, timeout=1.0)
+        self._require_reply(reply, "box %d RFID insertion policy" % address)
+        slots = self._require_reply(
+            driver.query_slot_mask(timeout=0.5),
+            "box %d RFID presence baseline" % address)
+        local_mask = slots.value & 0x0F
+        self.rfid_presence[address] = local_mask
+        return local_mask
+
+    def _unread_rfid(self, address, driver, local_mask):
+        """Present slots the CFS holds no RFID record for."""
+        cached = self._require_reply(
+            driver.query_rfid_records(local_mask, timeout=0.5),
+            "box %d cached RFID query" % address)
+        unread = 0
+        for local, name in enumerate(box_protocol.RFID_SLOT_NAMES):
+            bit = 1 << local
+            if not local_mask & bit:
+                continue
+            record = cached.records.get(name, "").strip("\x00")
+            if (record.lower() != "busy" and not self._rfid_record_ready(
+                    (record, cached.fields.get(name)))):
+                unread |= bit
+        return unread
 
     def _presence_mask(self):
         mask = 0
@@ -1660,7 +1898,6 @@ class Box:
             self.rfid_seen_invalid.add(slot)
 
     def _rfid_inserted(self, slot):
-        self.rfid_live_slots.discard(slot)
         self.rfid_percent.pop(slot, None)
         self._invalidate_spoolman(slot)
         self.rfid_snapshot.pop(slot, None)
@@ -1671,7 +1908,6 @@ class Box:
 
     def _rfid_removed(self, slot):
         self._clear_rfid_watch(slot)
-        self.rfid_live_slots.discard(slot)
         self.rfid_percent.pop(slot, None)
         self._invalidate_spoolman(slot)
 
@@ -1763,21 +1999,32 @@ class Box:
             self._read_rfid_result(slot)
 
     def _query_box_snapshot(self, address, driver, include_topology):
+        """The box's state reply, None when it did not answer, or _DRAINING.
+
+        Presence and RFID work is contained: its failure never discards a
+        reply the box sent, which would count the box as missed.
+        """
         if include_topology:
-            self._query_presence(address, driver)
+            self._contained("box %d presence" % address, self._query_presence,
+                            address, driver)
         for _attempt in range(STATE_EVENT_DRAIN):
-            self._watch_pending_rfid(address, driver)
+            self._contained("box %d rfid watch" % address,
+                            self._watch_pending_rfid, address, driver)
             reply = driver.query_box_state(timeout=0.5)
             if reply is None:
                 return None
             if reply.slot_events is None:
-                self._finish_pending_rfid(address, reply)
+                self._contained("box %d rfid result" % address,
+                                self._finish_pending_rfid, address, reply)
                 return reply
-            self._query_presence(address, driver)
-            self._handle_slot_events(address, reply.slot_events)
+            self._contained("box %d presence" % address, self._query_presence,
+                            address, driver)
+            self._contained("box %d slot events" % address,
+                            self._handle_slot_events, address,
+                            reply.slot_events)
         _klog("box %d slot events did not drain after %d reads",
              address, STATE_EVENT_DRAIN, level=logging.warning)
-        return None
+        return _DRAINING
 
     @staticmethod
     def _clean_rfid(value):
@@ -1855,14 +2102,25 @@ class Box:
             "rfid_reserve": reserve,
         }, code, raw_code, target, resolved is not None)
 
+    @staticmethod
+    def _profile_summary(profile):
+        title = " ".join(
+            part for part in (profile.get("brand"), profile.get("name")) if part)
+        details = ", ".join(
+            part for part in (profile.get("material"), profile.get("color")) if part)
+        if title and details:
+            return "%s (%s)" % (title, details)
+        return title or details
+
     def _apply_rfid_profile(self, slot, fields):
+        """Save the profile the tag's code maps to; returns it, or None."""
         profile, _code, _raw_code, target, resolved = self._rfid_profile(fields)
         if not resolved:
-            return False
+            return None
         self._ensure_material(profile["material"], target)
         self.unknown_rfid.pop(self._runtime_slot_key(slot), None)
         self.set_profile(slot, profile)
-        return True
+        return profile
 
     def _invalidate_spoolman(self, slot):
         slot_key = self._runtime_slot_key(slot)
@@ -1874,12 +2132,6 @@ class Box:
         if len(record) != 40 or not record.strip():
             return False
         display_slot = self._runtime_slot(slot)
-        code = self._clean_rfid(fields.get("mat_id")) or "unknown"
-        reserve = self._clean_rfid(fields.get("reserve")) or "none"
-        self._info(
-            self.gcode,
-            "RFID tag read for %s: code=%s reserve=%s"
-            % (self.slot_label(display_slot), code, reserve))
         requested_id = _spool_id_from_reserve(fields.get("reserve"))
         if requested_id is not None:
             self._request_spoolman_profile(
@@ -1892,9 +2144,11 @@ class Box:
             self._record_unknown_rfid(
                 slot, normalized, raw_code, record, fields)
             return True
-        if self._apply_rfid_profile(slot, fields):
-            self._info(
-                self.gcode, "%s: RFID profile applied" % self.slot_label(display_slot))
+        profile = self._apply_rfid_profile(slot, fields)
+        if profile is not None:
+            self._info(self.gcode, "%s: RFID %s applied, code %s" % (
+                self.slot_label(display_slot), self._profile_summary(profile),
+                self._clean_rfid(fields.get("mat_id"))))
         return True
 
     def _apply_new_mapping(self, code):
@@ -1910,18 +2164,6 @@ class Box:
                 continue
             self._invalidate_spoolman(slot)
             self._apply_rfid_profile(slot, fields)
-
-    def _read_rfid_remaining(self, slot):
-        address, local = self._address_slot(slot)
-        driver = self.drivers.get(address)
-        if driver is None or slot not in self.rfid_live_slots:
-            return
-        reply = driver.query_rfid_remaining(1 << local, timeout=0.5)
-        if reply is None or reply.status != box_protocol.STATUS_OK:
-            return
-        value = reply.values.get(box_protocol.RFID_SLOT_NAMES[local])
-        if isinstance(value, int) and 0 <= value <= 100:
-            self.rfid_percent[slot] = value
 
     def _query_rfid_sample(self, slot):
         address, local = self._address_slot(slot)
@@ -1950,18 +2192,16 @@ class Box:
             return "none"
         if not self._rfid_record_ready(sample):
             self.rfid_seen_invalid.add(slot)
-            self.rfid_live_slots.discard(slot)
             self.rfid_percent.pop(slot, None)
             return record.lower() or "unknown"
         if not self._rfid_should_apply(slot, sample):
             return "stale"
         self._clear_rfid_watch(slot)
         if not self._apply_rfid_record(slot, record, fields):
-            self.rfid_live_slots.discard(slot)
             self.rfid_percent.pop(slot, None)
             return "invalid"
-        self.rfid_live_slots.add(slot)
-        self._read_rfid_remaining(slot)
+        address, local = self._address_slot(slot)
+        self._mirror_rfid_remaining(address, self.drivers[address], 1 << local)
         return "record"
 
     def _force_rfid_results(self, address, driver, mask, reason):
@@ -1982,42 +2222,74 @@ class Box:
             name = box_protocol.RFID_SLOT_NAMES[local]
             record = after.records.get(name, "").strip("\x00")
             fields = after.fields.get(name)
-            if len(record) != 40 or not fields:
+            if not self._rfid_record_ready((record, fields)):
                 _klog("%s forced RFID result was invalid", self.slot_label(slot))
                 continue
             if self._apply_rfid_record(slot, record, fields):
                 applied.add(slot)
-                self.rfid_live_slots.add(slot)
-                self._read_rfid_remaining(slot)
             self._clear_rfid_watch(slot)
+        if applied:
+            self._mirror_rfid_remaining(address, driver, sum(
+                1 << self._address_slot(slot)[1] for slot in applied))
         return applied
 
-    def _refresh_rfid_remaining(self):
+    def _refresh_rfid_remaining(self, addresses=None):
+        """Mirror each present slot's RFID remaining % from its CFS.
+
+        A slot has a % only while the CFS holds its record. Without one the
+        CFS still answers the remaining query, with a placeholder 100, so
+        the record is checked first. A busy slot or a failed reply keeps
+        the last value.
+        """
         if self.operation_depth:
             return
-        by_address = {}
-        for slot in self.rfid_live_slots:
-            if self.snapshot.slot_mask & (1 << slot):
-                address, local = self._address_slot(slot)
-                by_address[address] = by_address.get(address, 0) | (1 << local)
-        for address, mask in sorted(by_address.items()):
-            driver = self.drivers.get(address)
-            if driver is None:
+        for address, driver in sorted(self.drivers.items()):
+            if addresses is not None and address not in addresses:
                 continue
+            if not self._box_online(address):
+                continue
+            present = self.rfid_presence.get(address, 0) & 0x0F
+            for local in range(SLOTS_PER_BOX):
+                if not present & (1 << local):
+                    self.rfid_percent.pop(
+                        self._global_slot(address, local), None)
             try:
-                reply = driver.query_rfid_remaining(mask, timeout=0.5)
+                self._mirror_rfid_remaining(address, driver, present)
             except Exception as exc:
                 _klog("RFID remaining query failed on box %d: %s", address, exc)
+
+    def _mirror_rfid_remaining(self, address, driver, present):
+        """The % of the slots in the local mask present, from the CFS."""
+        names = box_protocol.RFID_SLOT_NAMES
+        if not present:
+            return
+        records = driver.query_rfid_records(present, timeout=0.5)
+        if records is None or records.status != box_protocol.STATUS_OK:
+            return
+        held = 0
+        for local in range(SLOTS_PER_BOX):
+            bit = 1 << local
+            if not present & bit or names[local] not in records.records:
                 continue
-            if reply is None or reply.status != box_protocol.STATUS_OK:
+            record = records.records[names[local]].strip("\x00")
+            if len(record) == 40:
+                held |= bit
+            elif record.lower() != "busy":
+                self.rfid_percent.pop(self._global_slot(address, local), None)
+        if not held:
+            return
+        reply = driver.query_rfid_remaining(held, timeout=0.5)
+        if reply is None or reply.status != box_protocol.STATUS_OK:
+            return
+        for local in range(SLOTS_PER_BOX):
+            if not held & (1 << local):
                 continue
-            for local, name in enumerate(box_protocol.RFID_SLOT_NAMES):
-                slot = self._global_slot(address, local)
-                if slot not in self.rfid_live_slots:
-                    continue
-                value = reply.values.get(name)
-                if isinstance(value, int) and 0 <= value <= 100:
-                    self.rfid_percent[slot] = value
+            slot = self._global_slot(address, local)
+            value = reply.values.get(names[local])
+            if isinstance(value, int) and 0 <= value <= 100:
+                self.rfid_percent[slot] = value
+            else:
+                self.rfid_percent.pop(slot, None)
 
     def _external_rfid_record(self, event):
         self._apply_rfid_record(
@@ -2030,7 +2302,7 @@ class Box:
         self.spoolman_tokens[slot_key] = token
         generation = self.spoolman_generation
         self._info(
-            self.gcode, "%s: fetching Spoolman ID %d"
+            self.gcode, "%s: RFID spool ID %d, fetching from Spoolman"
             % (self.slot_label(display_slot), requested_id))
 
         def worker():
@@ -2058,7 +2330,7 @@ class Box:
                 color = self._normal_color(filament.get("color_hex"))
                 if spool_id != requested_id or not material or color is None:
                     applied = self._apply_rfid_profile(slot_key, fields)
-                    if not applied:
+                    if applied is None:
                         raw_code = self._clean_rfid(
                             fields.get("mat_id")).upper()
                         code, _resolved = self._resolve_rfid(raw_code)
@@ -2067,8 +2339,9 @@ class Box:
                     self._info(
                         self.gcode,
                         "%s: Spoolman ID %d unavailable or incomplete; %s"
-                        % (self.slot_label(display_slot), requested_id, "RFID profile applied"
-                           if applied else "RFID mapping required"))
+                        % (self.slot_label(display_slot), requested_id,
+                           "RFID %s applied" % self._profile_summary(applied)
+                           if applied is not None else "RFID mapping required"))
                     return
                 vendor = filament.get("vendor")
                 vendor = vendor if isinstance(vendor, dict) else {}
@@ -2086,12 +2359,13 @@ class Box:
                 self.set_profile(slot_key, profile)
                 raw_code = self._clean_rfid(fields.get("mat_id")).upper()
                 code, resolved = self._resolve_rfid(raw_code)
+                summary = self._profile_summary(profile)
                 if resolved:
-                    message = "Spoolman ID %d profile applied" % spool_id
+                    message = "Spoolman ID %d %s applied" % (spool_id, summary)
                 else:
                     message = (
-                        "unknown RFID code %s resolved via Spoolman ID %d"
-                        % (code, spool_id))
+                        "unknown RFID code %s resolved via Spoolman ID %d: %s"
+                        % (code, spool_id, summary))
                 self._info(self.gcode, "%s: %s" % (
                     self.slot_label(display_slot), message))
                 if self.snapshot.loaded_slot == display_slot:
@@ -2113,14 +2387,17 @@ class Box:
             sorted(self.drivers), sorted(self.store.known_addresses),
             list(self.address_errors) or "none"))
         self._info(
-            gcmd, "operation_depth=%d tracking=%s path=%s runout=%s origin=%s faults=%d" % (
+            gcmd, "operation_depth=%d tracking=%s path=%s runout=%s origin=%s tail=%s faults=%d" % (
                 self.operation_depth, self.tracking_owner, self.path_owner,
-                self.runout_active, self.runout_origin,
+                self.runout_active, self.runout_origin, self.tail_slot,
                 self.fault_generation))
         try:
-            live = self.read_live_state(include_topology=True)
+            live = self.read_live_state(include_topology=True, strict=False)
             self._info(gcmd, "live loaded=%s present=0x%04x tracking=%s" % (
                 live.loaded_slot, live.slot_mask, live.tracking))
+            if live.conflict:
+                self._info(gcmd, "conflict lanes=0x%04x: %s" % (
+                    live.loaded_mask, live.conflict))
             self._info(gcmd, "sensor=%s sensor_error=%s cut_sensor=%s" % (
                 live.filament_detected, live.filament_sensor_error,
                 self.get_cut_sensor_state()))
@@ -2192,7 +2469,8 @@ class Box:
         responder.respond_info(self.CONSOLE_PREFIX + str(message))
 
     def _warn(self, message):
-        self.gcode.respond_raw("!! " + self.CONSOLE_PREFIX + str(message))
+        for line in str(message).splitlines():
+            self.gcode.respond_raw("!! " + self.CONSOLE_PREFIX + line)
 
     # ------------------------------------------------------------------
     # Box-owned cutter, cleaning, and wastebin motion
@@ -2213,41 +2491,28 @@ class Box:
         finally:
             setter(max(0.0, min(float(restore), 1.0)))
 
-    def _z_homed(self):
-        toolhead = self.printer.lookup_object("toolhead")
-        return "z" in toolhead.get_status(
-            self.reactor.monotonic()).get("homed_axes", "")
+    def _zone(self):
+        return self.printer.lookup_object("extended_zone_transform")
 
-    def _service_move(self, x=None, y=None, velocity=None):
-        """Move XY for service travel; callers must have G90 active.
+    @contextmanager
+    def _clean_motion(self, name):
+        with saved_motion(self.printer, self.gcode, name):
+            set_service_motion(
+                self.gcode, CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
+                CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV)
+            yield
 
-        With Z homed, G0 keeps bed mesh compensation so travel holds the
-        hop above the bed and print. With Z unhomed the mesh has no Z
-        reference and would fail the move (G28 Z cleans before homing Z),
-        so move in toolhead space. extended_zone_transform routes both.
-        """
-        if not self._z_homed():
-            self.printer.lookup_object("extended_zone_transform").manual_move(
-                [x, y], velocity / 60.0)
-            return
-        # Fixed-point: %g's exponent form ("Y1e-05") parses as Y1 E-5.
-        words = "".join(
-            " %s%s" % (axis, ("%.3f" % value).rstrip("0").rstrip("."))
-            for axis, value in (("X", x), ("Y", y)) if value is not None)
-        self.gcode.run_script_from_command("G0%s F%.0f" % (words, velocity))
+    @staticmethod
+    def _wipe_phase():
+        """Random zig-zag phase, so the turnarounds don't land on the same
+        spots of the pad every clean."""
+        return random.uniform(0.0, 2.0 * math.pi)
 
     def nozzle_clean(self):
         toolhead = self.printer.lookup_object("toolhead")
-        save_motion_limits(
-            self.printer, self.gcode, "_box_clean_limits", include_gcode=True)
-        try:
+        zone = self._zone()
+        with self._clean_motion("_box_clean_limits"):
             self.move_to_wastebin()
-            self.gcode.run_script_from_command("G90")
-            self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
-                "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
-                % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
-                   CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
             left = self.clean_pad_left_x
             right = self.clean_pad_right_x
             front = self.clean_pad_front_y
@@ -2257,29 +2522,31 @@ class Box:
             center_x = (left + right) / 2.0
             amplitude_x = (right - left) / 2.0
             segments = y_steps * 8
-            self._service_move(y=back, velocity=self.travel_velocity)
-            self._service_move(x=left, velocity=self.clean_velocity)
+            zone.service_move(y=back, velocity=self.travel_velocity)
+            zone.service_move(x=left, velocity=self.clean_velocity)
             for _index in range(CLEAN_SCRAPER_PASSES):
-                self._service_move(
+                zone.service_move(
                     x=self.wastebin_x, velocity=self.clean_velocity)
-                self._service_move(x=left, velocity=self.clean_velocity)
-            self._service_move(x=right, velocity=self.clean_velocity)
+                zone.service_move(x=left, velocity=self.clean_velocity)
+            # The scraper leaves the nozzle at the left edge; slide along the
+            # back row to wherever this clean's zig-zag starts.
+            phase = self._wipe_phase()
+            zone.service_move(
+                x=center_x + amplitude_x * math.cos(phase),
+                velocity=self.clean_velocity)
             for pass_index in range(self.clean_pad_passes):
                 direction = -1.0 if (pass_index * y_steps) % 2 else 1.0
                 for index in range(1, segments + 1):
                     progress = index / float(segments)
                     x = center_x + direction * amplitude_x * math.cos(
-                        math.pi * y_steps * progress)
+                        math.pi * y_steps * progress + phase)
                     y = back + (front - back) * progress
-                    self._service_move(
+                    zone.service_move(
                         x=x, y=y, velocity=self.clean_velocity)
-                self._service_move(x=center_x, velocity=self.clean_velocity)
-                self._service_move(y=back, velocity=self.clean_velocity)
+                zone.service_move(x=center_x, velocity=self.clean_velocity)
+                zone.service_move(y=back, velocity=self.clean_velocity)
             self.move_to_wastebin()
             toolhead.wait_moves()
-        finally:
-            restore_motion_limits(
-                self.gcode, "_box_clean_limits", include_gcode=True, move=0)
 
     def flush_clean_snap(self, fan_after=None):
         toolhead = self.printer.lookup_object("toolhead")
@@ -2307,24 +2574,12 @@ class Box:
         # Cleaning may run inside HOME_IF_NEEDED during Z homing.
         if "x" not in homed or "y" not in homed:
             self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
-        # Compare in the coordinate space _service_move will use.
-        if self._z_homed():
-            position = self.printer.lookup_object("gcode_move").get_status(
-                self.reactor.monotonic())["gcode_position"]
-        else:
-            position = toolhead.get_position()
+        zone = self._zone()
+        position = zone.service_position()
         if (abs(position[0] - self.wastebin_x) < 1.0e-6
                 and abs(position[1] - self.wastebin_y) < 1.0e-6):
             return
-        save_motion_limits(
-            self.printer, self.gcode, "_box_wastebin_limits", include_gcode=True)
-        try:
-            self.gcode.run_script_from_command("G90")
-            self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
-                "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
-                % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
-                   CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
+        with self._clean_motion("_box_wastebin_limits"):
             # The flapper must be struck in X. It reaches forward to about
             # Y355 left of about X140, so stage diagonally at the approach
             # point (clear at any X), climb Y in the clear X column, then
@@ -2334,15 +2589,12 @@ class Box:
             if abs(position[1] - self.wastebin_y) >= 1.0e-6:
                 approach_x = self.wastebin_approach_x
                 if abs(position[0] - approach_x) >= 1.0e-6:
-                    self._service_move(
+                    zone.service_move(
                         x=approach_x, y=self.wastebin_approach_y,
                         velocity=self.travel_velocity)
-                self._service_move(
+                zone.service_move(
                     y=self.wastebin_y, velocity=self.travel_velocity)
-            self._service_move(x=self.wastebin_x, velocity=self.clean_velocity)
-        finally:
-            restore_motion_limits(
-                self.gcode, "_box_wastebin_limits", include_gcode=True, move=0)
+            zone.service_move(x=self.wastebin_x, velocity=self.clean_velocity)
 
     def filament_retry_motion(self, message):
         toolhead = self.printer.lookup_object("toolhead")
@@ -2351,25 +2603,13 @@ class Box:
         if "x" not in homed or "y" not in homed:
             return False
         self._info(self.gcode, message)
-        save_motion_limits(
-            self.printer, self.gcode, "_box_filament_retry",
-            include_gcode=True)
-        try:
+        zone = self._zone()
+        with self._clean_motion("_box_filament_retry"):
             self.move_to_wastebin()
-            self.gcode.run_script_from_command("G90")
-            self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%d "
-                "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
-                % (CLEAN_LIMIT_VELOCITY, CLEAN_LIMIT_ACCEL,
-                   CLEAN_MINIMUM_CRUISE_RATIO, CLEAN_LIMIT_SCV))
             for move in self.filament_retry_moves:
-                self._service_move(velocity=self.travel_velocity, **move)
+                zone.service_move(velocity=self.travel_velocity, **move)
             self.move_to_wastebin()
             toolhead.wait_moves()
-        finally:
-            restore_motion_limits(
-                self.gcode, "_box_filament_retry",
-                include_gcode=True, move=0)
         return True
 
     def cut_filament(self, force=False):
@@ -2381,79 +2621,59 @@ class Box:
             raise BoxError("cut_pos_x is not defined in [box]")
 
         toolhead = self.printer.lookup_object("toolhead")
-        rail = toolhead.kin.rails[0]
-        old_position_min = rail.position_min
-        old_limit = toolhead.kin.limits[0]
-        old_axes_min = toolhead.kin.axes_min
-        lifted_z = None
-        limits_saved = False
-        try:
-            save_motion_limits(
-                self.printer, self.gcode, "_box_cut_limits", include_gcode=True)
-            limits_saved = True
+        zone = self._zone()
+        with saved_motion(self.printer, self.gcode, "_box_cut_limits"):
             lifted_z = self._lift_for_cut(toolhead)
-            self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
-            self._set_cut_x_limit(toolhead, min(old_position_min, self.cut_x - 5.0))
-            self.gcode.run_script_from_command("G90")
-            self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT VELOCITY=%d ACCEL=%g "
-                "MINIMUM_CRUISE_RATIO=%g SQUARE_CORNER_VELOCITY=%d"
-                % (CUT_LIMIT_VELOCITY, self.cut_accel,
-                   CUT_LIMIT_CRUISE, CUT_LIMIT_SCV))
-            self._service_move(
-                x=self.pre_cut_x, y=self.cut_y, velocity=self.travel_velocity)
+            try:
+                self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XY")
+                with zone.widened_x_min(self.cut_x - 5.0):
+                    set_service_motion(
+                        self.gcode, CUT_LIMIT_VELOCITY, self.cut_accel,
+                        CUT_LIMIT_CRUISE, CUT_LIMIT_SCV)
+                    self._cut_strokes(toolhead, zone)
+            finally:
+                if lifted_z is not None:
+                    try:
+                        self.gcode.run_script_from_command("G90")
+                        self.gcode.run_script_from_command(
+                            "G0 Z%.3f F%.0f" % (lifted_z, self.z_velocity))
+                        toolhead.wait_moves()
+                    except Exception:
+                        _klog("failed restoring cut Z", level=logging.exception)
+
+    def _cut_strokes(self, toolhead, zone):
+        zone.service_move(
+            x=self.pre_cut_x, y=self.cut_y, velocity=self.travel_velocity)
+        toolhead.wait_moves()
+        if not self.get_cut_sensor_state():
+            raise BoxError("Cut sensor is not in standby")
+
+        self._info(self.gcode, "Cutting filament")
+        returned = False
+        for attempt in range(3):
+            if attempt:
+                self._info(self.gcode, "Cut retry %d/3" % (attempt + 1))
+            zone.service_move(x=self.cut_x, velocity=self.cut_velocity)
             toolhead.wait_moves()
-            if not self.get_cut_sensor_state():
-                raise BoxError("Cut sensor is not in standby")
-
-            self._info(self.gcode, "Cutting filament")
-            returned = False
-            for attempt in range(3):
-                if attempt:
-                    self._info(self.gcode, "Cut retry %d/3" % (attempt + 1))
-                self._service_move(x=self.cut_x, velocity=self.cut_velocity)
-                toolhead.wait_moves()
-                self._service_move(
-                    x=self.pre_cut_x, velocity=self.travel_velocity)
-                toolhead.wait_moves()
-                if self._wait_cut_return(1.0):
-                    returned = True
+            zone.service_move(x=self.pre_cut_x, velocity=self.travel_velocity)
+            toolhead.wait_moves()
+            if self._wait_cut_return(1.0):
+                returned = True
+            self._cut_extruder_jog(
+                toolhead, -CUT_POST_RETRACT_MM, self.retract_velocity)
+            if self._wait_cut_return(CUT_RETURN_WAIT):
+                returned = True
+                break
+            if attempt < 2:
                 self._cut_extruder_jog(
-                    toolhead, -CUT_POST_RETRACT_MM, self.retract_velocity)
-                if self._wait_cut_return(CUT_RETURN_WAIT):
-                    returned = True
-                    break
-                if attempt < 2:
-                    self._cut_extruder_jog(
-                        toolhead, CUT_POST_RETRACT_MM, self.retract_velocity)
-                    self.reactor.pause(
-                        self.reactor.monotonic() + CUT_RETRY_SETTLE)
+                    toolhead, CUT_POST_RETRACT_MM, self.retract_velocity)
+                self.reactor.pause(
+                    self.reactor.monotonic() + CUT_RETRY_SETTLE)
 
-            if returned:
-                return
-
-            warning = (
-                "Cut attempts exhausted and the cutter sensor did not return to "
-                "standby; proceeding as configured")
-            self._warn(warning)
-        finally:
-            rail.position_min = old_position_min
-            toolhead.kin.limits[0] = old_limit
-            toolhead.kin.axes_min = old_axes_min
-            if lifted_z is not None:
-                try:
-                    self.gcode.run_script_from_command("G90")
-                    self.gcode.run_script_from_command(
-                        "G0 Z%.3f F%.0f" % (lifted_z, self.z_velocity))
-                    toolhead.wait_moves()
-                except Exception:
-                    _klog("failed restoring cut Z", level=logging.exception)
-            if limits_saved:
-                try:
-                    restore_motion_limits(
-                        self.gcode, "_box_cut_limits", include_gcode=True, move=0)
-                except Exception:
-                    _klog("failed restoring cut motion limits", level=logging.exception)
+        if not returned:
+            self._warn(
+                "Cut attempts exhausted and the cutter sensor did not return "
+                "to standby; proceeding as configured")
 
     def _lift_for_cut(self, toolhead):
         status = toolhead.get_status(self.reactor.monotonic())
@@ -2467,14 +2687,6 @@ class Box:
             "G0 Z%.3f F%.0f" % (CUT_SAFE_Z, self.z_velocity))
         toolhead.wait_moves()
         return current
-
-    @staticmethod
-    def _set_cut_x_limit(toolhead, minimum):
-        kin = toolhead.kin
-        kin.rails[0].position_min = minimum
-        kin.limits[0] = (minimum, kin.limits[0][1])
-        kin.axes_min = toolhead.Coord(
-            minimum, kin.axes_min.y, kin.axes_min.z, kin.axes_min.e)
 
     def _wait_cut_return(self, timeout):
         deadline = self.reactor.monotonic() + timeout
@@ -2495,7 +2707,8 @@ class Box:
         toolhead.wait_moves()
         return True
 
-    def pause_print(self, synchronous=False, skip_retract_wipe=False):
+    def pause_print(self, synchronous=False, skip_retract_wipe=False,
+                    release_extruder=False):
         if synchronous:
             if not self.pause_resume.is_paused:
                 command = (
@@ -2507,14 +2720,271 @@ class Box:
                 or self.pause_resume.pause_command_sent):
             return False
         self.pause_resume.send_pause_command()
+        script = "PAUSE"
+        if release_extruder:
+            # The nozzle is empty and the user pulls the filament out by
+            # hand, so nothing is retracted and the gears are let go.
+            script = ("PAUSE SKIP_RETRACT_WIPE=1\n"
+                      "SET_STEPPER_ENABLE STEPPER=extruder ENABLE=0")
         self.reactor.register_async_callback(
-            lambda _eventtime: self.gcode.run_script("PAUSE"))
+            lambda _eventtime: self.gcode.run_script(script))
         return True
 
     def _clear_runout_state(self):
         self.runout_active = False
         self.runout_origin = None
         self.runout_key = None
+
+    # ------------------------------------------------------------------
+    # Runout tail (see TAIL_SETTING)
+    # ------------------------------------------------------------------
+
+    @property
+    def tail_slot(self):
+        key = self.store.setting(TAIL_SETTING)
+        if key is None:
+            return None
+        for slot in self.physical_slots:
+            if self._profile_key(slot) == key:
+                return slot
+        return None
+
+    def _note_tail(self, slot, ran_out_now=False):
+        key = self._profile_key(slot)
+        saved = self.store.setting(TAIL_SETTING)
+        if saved != key:
+            self.store.set_setting(TAIL_SETTING, key)
+            self.tail_baseline = None
+            # Only a runout seen as it happened starts with a full tail; a
+            # tail saved under another key is an older one renamed.
+            self.tail_travel = 0.0 if ran_out_now and saved is None else None
+
+    def _forget_tail(self):
+        self.store.clear_settings(TAIL_SETTING)
+        self.tail_baseline = None
+        self.tail_travel = None
+
+    def _printhead_cleared(self):
+        """The printhead sensor's own edge, so no poll can miss it."""
+        tail = self.tail_slot
+        self._forget_tail()
+        if tail is not None and self.path_owner == tail:
+            self.path_owner = None
+        self.change_engine.printhead_cleared()
+
+    def _restore_tail(self, detected, loaded):
+        if self.store.setting(TAIL_SETTING) is None:
+            return
+        if detected is False:
+            self._forget_tail()
+            return
+        tail = self.tail_slot
+        if tail is None or not detected:
+            return
+        if self.path_owner is None and loaded < 0:
+            # After a restart the CFS reports nothing loaded for a tail.
+            self.path_owner = tail
+        if self.path_owner == tail and not self.runout_active:
+            self.runout_active = True
+            self.runout_origin = tail
+            self.runout_key = (self._address_slot(tail)[0], self.tracking_epoch)
+
+    def snapped_slot(self, live):
+        """The loaded slot when only a broken-off piece is left of it.
+
+        The CFS still sees filament in the slot's hub lane, but the slot's
+        inlet and the printhead sensor see none. The CFS refuses to pull that
+        piece back and the extruder cannot reach it.
+        """
+        if live.filament_detected is not False:
+            return None
+        return self._inlet_dark(live)
+
+    def _inlet_dark(self, live):
+        """The loaded slot when its own inlet reads empty, else None.
+
+        Only a box that answers and has a presence reading counts.
+        """
+        slot = live.loaded_slot
+        if not self.is_physical_slot(slot) or live.slot_mask & (1 << slot):
+            return None
+        address, _local = self._address_slot(slot)
+        if not self._box_online(address) or address not in self.rfid_presence:
+            return None
+        return slot
+
+    def _snapped_text(self, slot):
+        _address, local = self._address_slot(slot)
+        return ("Filament snapped",
+                "A piece of slot %d's filament is stuck between the slot and "
+                "the hub. Pull it out by hand." % (local + 1))
+
+    def _snapped_detail(self, slot):
+        return "%s. %s" % self._snapped_text(slot)
+
+    def _watch_snapped(self, live):
+        current = self.snapped
+        if current is not None:
+            address = self._address_slot(current)[0]
+            if (self._box_online(address)
+                    and address not in (self.box_replies or {})):
+                return  # One missed reply says nothing about the piece.
+        slot = self.snapped_slot(live)
+        if slot is not None and slot != self.snapped:
+            self._warn("Box %d: %s" % (
+                self._address_slot(slot)[0], self._snapped_detail(slot)))
+        self.snapped = slot
+
+    def _snapped_in_retract(self, address, driver, local):
+        """After a retract that never cleared the hub: did the filament snap?
+
+        The inlet is dark but the slot's hub lane still sees filament.
+        """
+        bit = 1 << local
+        try:
+            inlet = self._query_presence(address, driver)
+            hub = driver.query_hub_mask(timeout=0.5)
+        except Exception as exc:
+            _klog("box %d snap check failed: %s", address, exc,
+                  level=logging.warning)
+            return False
+        ok = box_protocol.STATUS_OK
+        return bool(
+            inlet is not None and inlet.status == ok
+            and hub is not None and hub.status == ok
+            and not (inlet.value or 0) & bit and (hub.value or 0) & bit)
+
+    def tail_loaded(self, live, note=True):
+        """True when the loaded filament is a tail.
+
+        A loaded slot with an empty inlet is one as well: the CFS refuses to
+        pull that back. note=False only asks, saving nothing.
+        """
+        slot = live.loaded_slot
+        if not self.is_physical_slot(slot):
+            return False
+        if self.tail_slot == slot:
+            return True
+        if not live.filament_detected or self._inlet_dark(live) is None:
+            return False
+        if note:
+            self._note_tail(slot)
+        return True
+
+    def tail_budget(self):
+        """Extruder travel left before a tail must have run out.
+
+        Counted from when this session first saw the tail. At zero the
+        loaded filament cannot be that tail, so it is dropped.
+        """
+        tail = self.tail_slot
+        if tail is None:
+            return 0.0
+        mcu = self.printer.lookup_object("mcu")
+        extruder = self.printer.lookup_object("toolhead").get_extruder()
+        position = extruder.find_past_position(
+            mcu.estimated_print_time(self.reactor.monotonic()))
+        if self.tail_baseline is None:
+            self.tail_baseline = position
+        travel = position - self.tail_baseline
+        if self.tail_travel is not None:
+            self.tail_travel = travel
+        remaining = TAIL_MAX_MM - travel
+        if remaining > 0.0:
+            return remaining
+        self.drop_tail()
+        return 0.0
+
+    def tail_remaining(self):
+        """Roughly how much tail is still to come, in mm, or None.
+
+        Known only for a runout this session saw happen, on a box whose load
+        path length is known.
+        """
+        tail = self.tail_slot
+        if tail is None or self.tail_travel is None:
+            return None
+        length = self.path_length(self._address_slot(tail)[0])
+        if length is None:
+            return None
+        return int(round(max(0.0, length - self.tail_travel)))
+
+    def drop_tail(self):
+        """Stop treating the loaded filament as a tail; it reads as External."""
+        tail = self.tail_slot
+        if tail is None:
+            return
+        self._forget_tail()
+        if self.path_owner == tail:
+            self.path_owner = None
+        self._release_box(self._address_slot(tail)[0])
+        self._clear_runout_state()
+        self.clear_active_spool(tail)
+        self.last_loaded_slot = self.external_slot
+        self._info(
+            self.gcode,
+            "%s leftover filament did not run out within %.0f m; treating "
+            "the loaded filament as the external spool"
+            % (self.slot_label(tail), TAIL_MAX_MM / 1000.0))
+
+    def release_tail(self, slot):
+        """Idle the tail's box so its hub feeds nothing in behind the tail."""
+        with self._operation():
+            self._release_box(self._address_slot(slot)[0])
+
+    def finish_tail(self, slot):
+        """The tail has left the printhead; its path is empty."""
+        with self._operation():
+            self._release_box(self._address_slot(slot)[0])
+            live = self.read_live_state(include_topology=False)
+            if live.filament_detected is not False:
+                raise BoxError(
+                    "The printhead sensor still detects filament")
+            self._clear_runout_state()
+            self.clear_hotend_feed_pending(slot)
+
+    def _release_box(self, address):
+        """Return a CFS that feeds nothing to idle, clearing its error.
+
+        The host stops tracking it either way. A busy box is prefeeding and
+        the poll releases it later.
+        """
+        self._clear_tracking_owner(address)
+        driver = self.drivers.get(address)
+        if driver is None:
+            return False
+        try:
+            reply = driver.set_tracking(None, timeout=1.0)
+        except Exception as exc:
+            _klog("box %d release failed: %s", address, exc,
+                  level=logging.warning)
+            return False
+        return reply is not None and reply.status == box_protocol.STATUS_OK
+
+    def _release_unused_boxes(self):
+        """Idle every box left in an error or print state off the path.
+
+        In either state a CFS starts no prefeed or RFID read for a spool
+        that is inserted, and shows its error until something clears it.
+        """
+        path_address = (
+            None if self.path_owner is None
+            else self._address_slot(self.path_owner)[0])
+        for address, reply in sorted((self.box_replies or {}).items()):
+            if (address != path_address and reply.box_state in (
+                    box_protocol.BOX_STATE_PRINT,
+                    box_protocol.BOX_STATE_ERROR)):
+                self._release_box(address)
+
+    def _report_tail_after_print(self, completed):
+        tail = self.tail_slot
+        if tail is None or (completed and self.unload_after_print_enabled):
+            return
+        self._info(
+            self.gcode,
+            "%s ran out and its leftover filament is still loaded. The next "
+            "print will use it or purge it. To pull it out by hand, run "
+            "BOX_UNLOAD MANUAL=1" % self.slot_label(tail))
 
     def _set_tracking_owner(self, address, slot, renew=False):
         owner = self.tracking_owner
@@ -2561,6 +3031,7 @@ class Box:
             self.fault_episodes.clear()
         self._clear_tracking_owner(clear_runout=True)
         self.path_owner = None
+        self._forget_tail()
 
     def _reconcile_tracking_owner(self, replies):
         candidates = []
@@ -2590,9 +3061,11 @@ class Box:
             return
         address, slot = candidates[0]
         if owner is not None and (owner.address, owner.slot) != (address, slot):
-            raise BoxError(
-                "CFS tracking owner %s conflicts with loaded path %s"
-                % (self.slot_label(owner.slot), self.slot_label(slot)))
+            # The CFS's own loaded path is what it feeds and reports faults
+            # for; tracking a slot it isn't feeding would misattribute both.
+            self._warn("The CFS is feeding %s, not %s as expected. "
+                       "Box follows the CFS."
+                       % (self.slot_label(slot), self.slot_label(owner.slot)))
         self._set_tracking_owner(address, slot)
 
     def _fault_key(self, status, category):
@@ -2606,14 +3079,14 @@ class Box:
             and episode[-1] == "fatal"
             and (status is None or episode[0] == status))
 
-    def _latch_fatal_fault(self, address, status, reason):
+    def _latch_fatal_fault(self, address, status, reason, detail=None):
         key = self._fault_key(status, "fatal")
         if self.fault_episodes.get(address) == key:
             return False
         self.fault_episodes[address] = key
         self.fault_generation += 1
         # Operations prefix their own label: "<slot> load failed (CODE): ..."
-        self.last_fatal_reason = box_protocol.status_detail(status)
+        self.last_fatal_reason = detail or box_protocol.status_detail(status)
         stats = self.printer.lookup_object("print_stats")
         if stats.state in ("printing", "paused"):
             pending = self.change_engine.pending
@@ -2626,13 +3099,14 @@ class Box:
             self.pause_print()
         return True
 
-    def _record_command_fault(self, reply, context):
+    def _record_command_fault(self, reply, context, detail=None):
         if reply is None or reply.status not in CFS_COMMAND_FATAL_STATUSES:
             return False
-        reason = box_protocol.status_line(
-            reply.address, reply.status, fault=True)
+        reason = (
+            "Box %d: %s" % (reply.address, detail) if detail
+            else box_protocol.status_line(reply.address, reply.status))
         latched = self._latch_fatal_fault(
-            reply.address, reply.status, reason)
+            reply.address, reply.status, reason, detail)
         if latched:
             _klog(
                 "CFS command fault address=%d command=0x%02x status=%s "
@@ -2689,12 +3163,19 @@ class Box:
     def _address_slot(global_slot):
         return global_slot // SLOTS_PER_BOX + 1, global_slot % SLOTS_PER_BOX
 
-    def read_live_state(self, include_topology=True):
-        """Read one coherent safety snapshot; callers never mix cache epochs."""
+    def read_live_state(self, include_topology=True, strict=True):
+        """Read one coherent safety snapshot; callers never mix cache epochs.
+
+        The snapshot is always published. With filament at more than one hub
+        lane the loaded slot is unknown: strict callers, the operations, then
+        get a BoxError; the poll passes strict=False and carries on.
+        """
         detected, sensor_error = self.get_filament_sensor_state()
         loaded = -1
         loaded_mask = 0
         replies = {}
+        responded = set()
+        lanes = {}
         for address, driver in sorted(self.drivers.items()):
             try:
                 reply = self._query_box_snapshot(
@@ -2705,41 +3186,58 @@ class Box:
                 continue
             if reply is None:
                 continue
+            responded.add(address)
+            if reply is _DRAINING:
+                continue
             replies[address] = reply
-            local = self._local_from_mask(reply.downstream_mask or 0)
-            if local >= 0:
-                candidate = self._global_slot(address, local)
-                if loaded >= 0:
-                    raise BoxError(
-                        "Multiple CFS boxes report loaded paths: %s and %s"
-                        % (self.slot_label(loaded), self.slot_label(candidate)))
-                loaded = candidate
-                loaded_mask |= 1 << candidate
+            mask = (reply.downstream_mask or 0) & 0x0F
+            if mask:
+                lanes[address] = mask
         self.box_replies = replies
         for address in self.drivers:
-            if address in replies:
+            if address in responded:
                 self.box_misses[address] = 0
-                self.box_last[address] = replies[address]
+                self.offline_handled.discard(address)
+                if address in replies:
+                    self.box_last[address] = replies[address]
             else:
                 self.box_misses[address] = self.box_misses.get(address, 0) + 1
-        if loaded >= 0:
-            self.path_owner = loaded
-        elif detected is False:
-            self.path_owner = None
-        self._reconcile_tracking_owner(replies)
-        for address, reply in replies.items():
-            self._observe_fault(address, reply)
+                if self.box_misses[address] == OFFLINE_POLLS:
+                    self._warn("Box %d disconnected" % address)
+        conflict = self._update_path_conflict(lanes, replies)
+        if conflict is not None:
+            # Nothing is inferred from an ambiguous path: ownership, tail
+            # and tracking keep what they had until it clears.
+            for address, mask in lanes.items():
+                loaded_mask |= mask << ((address - 1) * SLOTS_PER_BOX)
+            for address, reply in replies.items():
+                self._observe_fault(address, reply)
+        else:
+            for address, mask in lanes.items():
+                loaded = self._global_slot(address, mask.bit_length() - 1)
+                loaded_mask = 1 << loaded
+            if loaded >= 0:
+                self.path_owner = loaded
+            elif detected is False:
+                self.path_owner = None
+            self._restore_tail(detected, loaded)
+            self._reconcile_tracking_owner(replies)
+            for address, reply in replies.items():
+                self._observe_fault(address, reply)
+            if (detected and self.runout_active
+                    and self.path_owner is not None
+                    and self.path_owner == self.runout_origin):
+                self._note_tail(self.path_owner, ran_out_now=True)
 
-        path_owner = self.path_owner
-        owner_reply_missing = False
-        if loaded < 0 and detected is not False and self.is_physical_slot(path_owner):
-            path_address, _local = self._address_slot(path_owner)
-            loaded = path_owner
-            loaded_mask = 1 << path_owner
-            owner_reply_missing = path_address not in replies
+            path_owner = self.path_owner
+            if (loaded < 0 and detected is not False
+                    and self.is_physical_slot(path_owner)):
+                # The box feeding the path missed this reply: keep its slot.
+                loaded = path_owner
+                loaded_mask = 1 << path_owner
 
-        if loaded < 0 and detected is True:
-            loaded = self.external_slot
+            if loaded < 0 and detected is True:
+                loaded = self.external_slot
 
         topology = self._presence_mask()
 
@@ -2781,7 +3279,7 @@ class Box:
             and state_code == box_protocol.BOX_STATE_PRINT
             and not self._fatal_episode(path_address, status_code))
         snap = BoxSnapshot(
-            data_ready=self.drivers_ready and not owner_reply_missing,
+            data_ready=self.drivers_ready,
             status_code=status_code,
             state_code=state_code,
             temp_c=relay_reply.temp_c if relay_reply else None,
@@ -2798,9 +3296,68 @@ class Box:
             buffer_state=buffer_reply.value if buffer_reply else None,
             relay_status_code=relay_reply.status if relay_reply else None,
             relay_state_code=relay_reply.box_state if relay_reply else None,
+            conflict=None if conflict is None else conflict[1],
         )
         self.snapshot = snap
+        if strict and conflict is not None:
+            raise BoxError(conflict[1])
         return snap
+
+    def _update_path_conflict(self, lanes, replies):
+        """Filament at more than one hub lane, across every box.
+
+        Returns (addresses, message) or None and keeps it in path_conflict.
+        A box in the conflict that missed this reply says nothing about it,
+        so the conflict holds until every box in it answers.
+        """
+        previous = self.path_conflict
+        # Boxes in the conflict that missed this reply keep their last lanes.
+        held = () if previous is None else tuple(
+            address for address in previous[0]
+            if address not in replies and self._box_online(address))
+        for address in held:
+            last = self.box_last.get(address)
+            mask = 0 if last is None else (last.downstream_mask or 0) & 0x0F
+            if mask:
+                lanes[address] = mask
+        lit = sorted(lanes.items())
+        conflict = None
+        if len(lit) > 1 or (lit and lit[0][1] & (lit[0][1] - 1)):
+            conflict = (tuple(address for address, _mask in lit),
+                        self._path_conflict_message(lit))
+        elif held:
+            conflict = previous
+        self.path_conflict = conflict
+        if conflict is not None and (
+                previous is None or previous[1] != conflict[1]):
+            self._warn("%s Loads and unloads are refused until then."
+                       % conflict[1])
+        elif conflict is None and previous is not None:
+            _klog("hub lane conflict cleared", level=logging.info)
+            # Its pause changed no slot: RESUME primes what is loaded.
+            recovery = self.change_engine.resume_recovery
+            if recovery is not None and recovery.reason == PATH_CONFLICT_TITLE:
+                self.change_engine.clear_resume_recovery()
+        if conflict is None:
+            self.conflict_paused = None
+        return conflict
+
+    @staticmethod
+    def _path_conflict_message(lit):
+        def slots(mask):
+            return _join_and([str(local + 1) for local in range(SLOTS_PER_BOX)
+                              if mask & (1 << local)])
+        if len(lit) == 1:
+            address, mask = lit[0]
+            return ("Box %d sees filament at the hub in slots %s. Pull out "
+                    "the filament that shouldn't be there." % (
+                        address, slots(mask)))
+        return ("Filament is at the hub in %s. Pull out the filament that "
+                "shouldn't be there." % _join_and([
+                    "Box %d slot%s %s" % (
+                        address, "s" if mask & (mask - 1) else "",
+                        slots(mask))
+                    for address, mask in lit]))
 
     def _poll(self, eventtime):
         if self.operation_depth:
@@ -2809,21 +3366,181 @@ class Box:
             return eventtime + IDLE_POLL
         include_topology = eventtime - self.last_topology_refresh >= TOPOLOGY_POLL
         try:
-            snap = self.read_live_state(include_topology=include_topology)
-            if include_topology:
-                self.last_topology_refresh = eventtime
-            if (self.clog_detection and snap.tracking
-                    and not self.runout_active):
-                self._check_clog(eventtime, snap)
-            else:
-                self.clog_baseline = None
-            if eventtime - self.last_rfid_refresh >= RFID_REFRESH:
-                self._refresh_rfid_remaining()
-                self.last_rfid_refresh = eventtime
-        except Exception:
-            _klog("status poll failed", level=logging.exception)
+            snap = self.read_live_state(
+                include_topology=include_topology, strict=False)
+        except Exception as exc:
+            self._log_contained("status poll", exc)
             return eventtime + ERROR_BACKOFF
+        self._clear_contained("status poll")
+        if include_topology:
+            self.last_topology_refresh = eventtime
+        # Each step on its own: one failing never starves the rest.
+        if snap.conflict is not None:
+            self._contained("conflict watch", self.pause_for_path_conflict)
+        else:
+            # These infer from the loaded slot, unknown during a conflict.
+            self._contained("release", self._release_unused_boxes)
+            self._contained("offline watch",
+                            self._watch_loaded_box_offline, snap)
+            self._contained("snapped watch", self._watch_snapped, snap)
+            if snap.filament_detected and self.tail_slot is not None:
+                self._contained("tail budget", self.tail_budget)
+        self._contained("clog check", self._poll_clog, eventtime, snap)
+        if eventtime - self.last_rfid_refresh >= RFID_REFRESH:
+            self.last_rfid_refresh = eventtime
+            self._contained("rfid refresh", self._refresh_rfid_remaining)
+        if eventtime - self.last_reconnect >= RECONNECT_INTERVAL:
+            self._contained("reconnect", self._reconnect_lost_boxes, eventtime)
         return eventtime + (ACTIVE_POLL if self.snapshot.tracking else IDLE_POLL)
+
+    def _poll_clog(self, eventtime, snap):
+        if self.clog_detection and snap.tracking and not self.runout_active:
+            self._check_clog(eventtime, snap)
+        else:
+            self.clog_baseline = None
+
+    def _contained(self, key, func, *args):
+        """Run one poll step; a failure is logged, never raised."""
+        try:
+            result = func(*args)
+        except Exception as exc:
+            self._log_contained(key, exc)
+            return None
+        self._clear_contained(key)
+        return result
+
+    def _log_contained(self, key, exc, repeat=True):
+        """The traceback once per distinct error, then one line each time."""
+        message = "%s: %s" % (type(exc).__name__, exc)
+        if self.contained_errors.get(key) != message:
+            self.contained_errors[key] = message
+            _klog("%s failed", key, level=logging.exception)
+        elif repeat:
+            _klog("%s still failing: %s", key, message,
+                  level=logging.warning)
+
+    def _clear_contained(self, key):
+        if self.contained_errors.pop(key, None) is not None:
+            _klog("%s recovered", key, level=logging.info)
+
+    def pause_for_path_conflict(self):
+        """Pause a print while filament is at more than one hub lane.
+
+        A tool change would refuse and end the print. Once the conflict
+        clears, RESUME primes the loaded slot as after any pause. Once per
+        print and conflict; returns whether the print is held.
+        """
+        stats = self.printer.lookup_object("print_stats")
+        if self.path_conflict is None \
+                or stats.state not in ("printing", "paused"):
+            return False
+        job = (stats.print_start_time,)
+        if self.conflict_paused == job:
+            return True
+        self.conflict_paused = job
+        # A recovery already waiting keeps its own instructions. This one
+        # clears with the conflict; nothing is retried.
+        if self.change_engine.resume_recovery is None:
+            self.change_engine.block_resume(
+                PATH_CONFLICT_TITLE, automatic=False,
+                action="Pull out the filament that shouldn't be there, "
+                       "then resume.")
+            self._warn(self.change_engine.recovery_notice())
+        if stats.state == "printing":
+            self.pause_print()
+        return True
+
+    def _watch_loaded_box_offline(self, snap):
+        """Pause when the box feeding a print goes offline.
+
+        Nothing feeds the filament or watches for clogs while it is gone.
+        Resume retries the slot, which needs the box back online.
+        """
+        slot = snap.loaded_slot
+        if not self.is_physical_slot(slot):
+            return
+        address, _local = self._address_slot(slot)
+        # Once an outage: other reads can count the miss that takes the box
+        # offline, so this poll may not be the one that did.
+        if self._box_online(address) or address in self.offline_handled:
+            return
+        stats = self.printer.lookup_object("print_stats")
+        if stats.state not in ("printing", "paused"):
+            return
+        self.offline_handled.add(address)
+        # A recovery already waiting keeps its own instructions.
+        if self.change_engine.resume_recovery is None:
+            self.change_engine.block_resume(
+                "Box %d went offline with %s loaded"
+                % (address, self.slot_label(slot)),
+                target=slot, automatic=True,
+                action="Wait for Box %d to reconnect, then resume." % address)
+            self._warn(self.change_engine.recovery_notice())
+        if stats.state == "printing":
+            self.pause_print()
+
+    def _homing(self):
+        homing = self.printer.lookup_object("homing", None)
+        return homing is not None and (
+            homing.has_active_homing_session()
+            or homing.is_homing_abort_in_progress())
+
+    def _reconnect_lost_boxes(self, eventtime):
+        """Re-address a box that lost power, without a Klipper restart.
+
+        A CFS that keeps power keeps its address and the poll finds it again
+        by itself; one that was power-cycled answers only discovery. Not
+        while homing, where a motor fault must not wait behind the broadcast.
+        """
+        lost = {
+            address: self.box_ids[address]
+            for address in self.drivers
+            if address in self.box_ids and not self._box_online(address)}
+        if not lost or self.serial is None or self._homing():
+            return
+        self.last_reconnect = eventtime
+        reactor = self.reactor
+        address, errors = self.address_manager.reclaim(
+            box_protocol.AutoAddressClient(self.serial), lost,
+            pause=lambda delay: reactor.pause(reactor.monotonic() + delay))
+        for error in errors:
+            if error in self.reconnect_noted:
+                continue
+            self.reconnect_noted.add(error)
+            _klog("box reconnect: %s", error, level=logging.warning)
+            if error == ADDRESS_WEDGE_WARNING:
+                self._warn(error)
+        if address is not None:
+            self._box_reconnected(address)
+
+    def _box_reconnected(self, address):
+        """A power-cycled CFS answers again: forget what it had before."""
+        self.box_misses[address] = 0
+        self.offline_handled.discard(address)
+        self.fault_episodes.pop(address, None)
+        self.advised.pop(address, None)
+        self.crc_errors.pop(address, None)
+        self.crc_warned.discard(address)
+        self.reconnect_noted.clear()
+        self._clear_tracking_owner(address)
+        # The CFS restarted with its default reader policy and no RFID
+        # records, so tag reads and Spoolman lookups under way are stale.
+        # It reads no tags here (reading after Klipper starts is the
+        # startup setting); the % refresh clears what it no longer holds.
+        first = (address - 1) * SLOTS_PER_BOX
+        for slot in range(first, first + SLOTS_PER_BOX):
+            self._clear_rfid_watch(slot)
+            self._invalidate_spoolman(slot)
+        self.rfid_presence.pop(address, None)
+        try:
+            self._initialize_box_rfid(address, self.drivers[address])
+        except Exception as exc:
+            self._warn("RFID initialization failed on box %d: %s" % (
+                address, exc))
+        self.snapshot = replace(
+            self.snapshot, slot_mask=self._presence_mask())
+        self._refresh_rfid_remaining((address,))
+        self._info(self.gcode, "Box %d reconnected" % address)
 
     def _observe_fault(self, address, reply):
         status = reply.status
@@ -2831,6 +3548,10 @@ class Box:
             return
         if status == box_protocol.STATUS_OK:
             self.fault_episodes.pop(address, None)
+            shown = self.advised.get(address)
+            if (shown is not None and self.reactor.monotonic() - shown[1]
+                    >= ADVISORY_REPEAT):
+                del self.advised[address]
             return
         if status == box_protocol.STATUS_INVALID_PARAM:
             _klog("box %d rejected a status query as invalid", address,
@@ -2853,23 +3574,27 @@ class Box:
         path_owned = path_address == address
 
         if status == box_protocol.STATUS_RUNOUT:
-            valid_runout = (
-                tracking_owned
-                and reply.box_state == box_protocol.BOX_STATE_PRINT)
+            runout_slot = None
+            if (tracking_owned
+                    and reply.box_state == box_protocol.BOX_STATE_PRINT):
+                runout_slot = tracking_owner.slot
+            elif path_owned and self.path_owner == self.tail_slot:
+                # A tail restored after a restart has no tracking owner yet.
+                runout_slot = self.path_owner
+            valid_runout = runout_slot is not None
             key = self._fault_key(
                 status, "runout" if valid_runout else "advisory")
             is_new = self.fault_episodes.get(address) != key
             if valid_runout:
                 self.runout_active = True
-                self.runout_origin = tracking_owner.slot
-                self.runout_key = (address, tracking_owner.epoch)
+                self.runout_origin = runout_slot
+                self.runout_key = (address, self.tracking_epoch)
                 if is_new:
-                    self._info(self.gcode, "Box %d spool ran out (%s)" % (
-                        address, box_protocol.status_code_label(status)))
+                    self._report_runout(runout_slot)
+            elif not path_owned:
+                self._advise_unused(address, status)
             elif is_new:
-                self._warn(box_protocol.status_line(
-                    address, status,
-                    note=None if path_owned else "not in use"))
+                self._warn(box_protocol.status_line(address, status))
             self.fault_episodes[address] = key
             return
 
@@ -2895,15 +3620,28 @@ class Box:
               level=logging.warning)
         if not fatal:
             self.fault_episodes[address] = key
-            self._warn(box_protocol.status_line(
-                address, status, note="not in use"))
+            self._advise_unused(address, status)
             return
-        detail = box_protocol.status_line(address, status, fault=True)
+        detail = box_protocol.status_line(address, status)
 
         if self._latch_fatal_fault(address, status, detail):
             if self.change_engine.resume_recovery is not None:
                 detail = self.change_engine.recovery_notice()
             self._warn(detail)
+
+    def _report_runout(self, slot):
+        message = "%s ran out." % self.slot_label(slot)
+        if self.printer.lookup_object("print_stats").state == "printing":
+            message += " The print carries on with the filament left in the tube."
+        self._info(self.gcode, message)
+
+    def _advise_unused(self, address, status):
+        """One line per status: the poll idles this box, clearing it."""
+        shown = self.advised.get(address)
+        if shown is None or shown[0] != status:
+            self.advised[address] = (status, self.reactor.monotonic())
+            self._info(self.gcode, box_protocol.status_line(
+                address, status, note="not in use"))
 
     def _recent_crc_errors(self, address):
         now = self.reactor.monotonic()
@@ -3018,6 +3756,8 @@ class Box:
                 self.activate_tracking(slot)
                 return True
 
+            # Only a load into an empty path measures the whole path.
+            clean_load = live.loaded_slot == -1
             self._set_tracking(
                 driver, address, None, "disable CFS tracking")
             self.check_operation_abort(fault_generation)
@@ -3026,25 +3766,30 @@ class Box:
             self.check_operation_abort(fault_generation)
             self._info(self.gcode, "Loading %s" % self.slot_label(slot))
             if slot in self.rfid_pending:
-                state = self.box_replies.get(address)
-                if (live.loaded_slot == -1
-                        and slots.value & (1 << local)
-                        and state is not None
-                        and state.box_state == box_protocol.BOX_STATE_IDLE
-                        and not state.downstream_mask):
-                    try:
+                try:
+                    # Read the state again: the clear above ends the error
+                    # or print state that kept the CFS from reading the tag.
+                    state = self._query_box_snapshot(address, driver, False)
+                    if (slot in self.rfid_pending
+                            and live.loaded_slot == -1
+                            and slots.value & (1 << local)
+                            and state is not None
+                            and state.box_state == box_protocol.BOX_STATE_IDLE
+                            and not state.downstream_mask):
                         sample = self._query_rfid_sample(slot)
                         if (sample is not None
                                 and sample[0].lower() != "busy"):
                             self._force_rfid_results(
                                 address, driver, 1 << local,
                                 "deferred insertion")
-                    except Exception as exc:
-                        self._warn(
-                            "%s deferred RFID read failed: %s; loading without metadata"
-                            % (self.slot_label(slot), exc))
+                except Exception as exc:
+                    self._warn(
+                        "%s deferred RFID read failed: %s; loading without metadata"
+                        % (self.slot_label(slot), exc))
                 self._clear_rfid_watch(slot)
             load_encoder_start = self._optional_encoder(driver)
+            path_total = self.path_length(address)
+            self.change_engine.op_progress(0.0, path_total)
             self._require_reply(
                 driver.load_stage(local, 0, timeout=45.0), "load stage 0")
             self.check_operation_abort(fault_generation)
@@ -3086,6 +3831,7 @@ class Box:
                                 and self.filament_retry_motion(
                                     "CFS odometer stalled; moving toolhead and retrying load")):
                             stall_retried = True
+                            clean_load = False
                             self.check_operation_abort(fault_generation)
                             stage4 = load_driver.load_stage(
                                 local, 4, timeout=1.0)
@@ -3098,6 +3844,16 @@ class Box:
                     if stage5.status != 0x00:
                         self._record_command_fault(stage5, "load stage 5")
                         raise BoxError(box_protocol.status_detail(stage5.status))
+                    # The feed reply carries the odometer: live progress
+                    # without another request on the bus.
+                    odometer = box_protocol.stage_odometer(stage5)
+                    if odometer is not None:
+                        self.snapshot = replace(
+                            self.snapshot, encoder_mm=odometer)
+                        if load_encoder_start is not None:
+                            self.change_engine.op_progress(
+                                abs(odometer - load_encoder_start),
+                                path_total)
                     self.reactor.pause(
                         self.reactor.monotonic() + STAGE5_POLL)
 
@@ -3137,7 +3893,12 @@ class Box:
             self.runout_active = False
             self.runout_origin = None
             self.mark_hotend_feed_pending(slot)
-        self._report_encoder_delta(driver, load_encoder_start, "fed")
+        fed = self._report_encoder_delta(driver, load_encoder_start, "fed")
+        if fed is not None:
+            self.change_engine.op_progress(
+                fed, max(fed, path_total or 0.0))
+        if clean_load and fed is not None:
+            self._save_path_length(address, fed)
         return False
 
     def _recover_loaded_path(
@@ -3165,23 +3926,24 @@ class Box:
         if fault_generation is None:
             fault_generation = self.fault_generation
         self.check_operation_abort(fault_generation)
-        previous_sensor = self.filament_sensor_enabled()
-        success = False
         saved_gcode = False
         retract_toolhead = None
-        with self._operation():
+        with self._operation(), self.printhead_sensor_off():
             try:
                 live = self.read_live_state(include_topology=False)
                 self.check_operation_abort(fault_generation)
                 if live.loaded_slot in (-1, self.external_slot):
-                    success = True
                     return
                 if not self.is_physical_slot(live.loaded_slot):
                     raise BoxError("CFS loaded-slot state is unavailable")
                 slot = live.loaded_slot
                 driver, address, local = self._driver_for_slot(slot)
+                if self.snapped_slot(live) == slot:
+                    self.snapped = slot
+                    raise BoxError(self._snapped_detail(slot))
+                # Only filament that reached the printhead spans the path.
+                full_unload = bool(live.filament_detected)
                 self._info(self.gcode, "Unloading %s" % self.slot_label(slot))
-                self.disable_filament_sensor()
                 self._set_tracking(
                     driver, address, None, "disable CFS tracking")
                 self.check_operation_abort(fault_generation)
@@ -3229,7 +3991,15 @@ class Box:
                     self.gcode.run_script_from_command(
                         "RESTORE_GCODE_STATE NAME=_box_unload_retract MOVE=0")
                     saved_gcode = False
+                path_total = self.path_length(address)
                 for attempt in range(2):
+                    operation = self.change_engine.running_operation()
+                    if operation is not None and path_total:
+                        # Nothing answers until the pull ends: estimate it.
+                        operation.step("unload", total_mm=path_total)
+                        operation.moving(
+                            0.0, path_total * UNLOAD_ESTIMATE_CAP,
+                            UNLOAD_ESTIMATE_RATE, estimated=True)
                     try:
                         path_reply = driver.unload_path(
                             local, timeout=PATH_RETRACT_TIMEOUT)
@@ -3253,6 +4023,15 @@ class Box:
                         self._query_presence(address, driver),
                         "unload retry slot query")
                     self.check_operation_abort(fault_generation)
+                if (path_reply is not None
+                        and path_reply.status
+                        == box_protocol.STATUS_UNLOAD_HUB_PE_TIMEOUT
+                        and self._snapped_in_retract(address, driver, local)):
+                    detail = self._snapped_detail(slot)
+                    self._record_command_fault(
+                        path_reply, "loaded-path retract", detail)
+                    self.snapped = slot
+                    raise BoxError(detail)
                 self._require_reply(path_reply, "loaded-path retract")
                 self.check_operation_abort(fault_generation)
                 final = self._wait_for_state(
@@ -3273,18 +4052,17 @@ class Box:
                 self.path_owner = None
                 self._clear_runout_state()
                 self.clear_hotend_feed_pending(slot)
-                success = True
             finally:
-                try:
-                    if saved_gcode:
-                        self.gcode.run_script_from_command(
-                            "RESTORE_GCODE_STATE NAME=_box_unload_retract MOVE=0")
-                finally:
-                    if success or previous_sensor:
-                        self.enable_filament_sensor()
-                    else:
-                        self.disable_filament_sensor()
-        self._report_encoder_delta(driver, unload_encoder_start, "retracted")
+                if saved_gcode:
+                    self.gcode.run_script_from_command(
+                        "RESTORE_GCODE_STATE NAME=_box_unload_retract MOVE=0")
+        retracted = self._report_encoder_delta(
+            driver, unload_encoder_start, "retracted")
+        if retracted is not None:
+            self.change_engine.op_progress(
+                retracted, max(retracted, path_total or 0.0))
+        if full_unload and retracted is not None:
+            self._check_retraction(address, retracted)
 
     def retract_for_cut(self, distance, fault_generation=None):
         if fault_generation is None:
@@ -3362,13 +4140,59 @@ class Box:
             return None
 
     def _report_encoder_delta(self, driver, start, action):
+        """Print what the CFS moved and return it in mm, or None."""
         try:
             end = self._encoder(driver)
-            if start is not None and end is not None:
-                self._info(self.gcode, "CFS %s %.2f m of filament." % (
-                    action, abs(end - start) / 1000.0))
         except Exception:
-            pass
+            return None
+        if start is None or end is None:
+            return None
+        travel = abs(end - start)
+        self._info(self.gcode, "CFS %s %.2f m of filament." % (
+            action, travel / 1000.0))
+        return travel
+
+    def _path_key(self, address):
+        """Path lengths follow the CFS, like its slot profiles."""
+        uniid = self.box_ids.get(address)
+        return str(address) if uniid is None else bytes(uniid).hex()
+
+    def _path_samples(self, address):
+        saved = self.store.setting(PATH_SETTING)
+        samples = (saved.get(self._path_key(address))
+                   if isinstance(saved, dict) else None)
+        if not isinstance(samples, list):
+            return []
+        return [float(value) for value in samples
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)]
+
+    def path_length(self, address):
+        """The box's usual load path length in mm, or None until it is known."""
+        samples = sorted(self._path_samples(address))
+        if len(samples) < PATH_MIN_SAMPLES:
+            return None
+        return samples[len(samples) // 2]
+
+    def _save_path_length(self, address, fed):
+        if not PATH_MIN_MM <= fed <= TAIL_MAX_MM:
+            return
+        saved = self.store.setting(PATH_SETTING)
+        lengths = dict(saved) if isinstance(saved, dict) else {}
+        samples = self._path_samples(address) + [round(fed, 1)]
+        lengths[self._path_key(address)] = samples[-PATH_SAMPLES:]
+        self.store.set_setting(PATH_SETTING, lengths)
+
+    def _check_retraction(self, address, retracted):
+        normal = self.path_length(address)
+        # A cut unload retracts this much before the measurement starts.
+        allowed = PATH_SHORT_MM + self.change_engine.retract_length
+        if normal is None or retracted >= normal - allowed:
+            return
+        self._warn(
+            "Your retraction path is normally %.2f m but this retraction was "
+            "only %.2f m.\nFilament may have broke in the tube."
+            % (normal / 1000.0, retracted / 1000.0))
 
     def _extruder_can_move(self):
         try:
