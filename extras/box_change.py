@@ -7,6 +7,7 @@ steps are checkpointed for safe same-command retries.
 """
 
 import copy
+import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -577,8 +578,11 @@ class BoxChangeEngine:
                 target_label, self.printer.get_reactor().monotonic() - started))
         return True
 
-    def unload(self, gcmd, manual=False):
-        """Complete user-facing unload for physical or external filament."""
+    def unload(self, gcmd, manual=False, cfs_only=False):
+        """Complete user-facing unload for physical or external filament.
+
+        cfs_only leaves anything not fed from a CFS slot alone.
+        """
         fault_generation = self.box.fault_generation
         try:
             live = self.box.read_live_state()
@@ -598,6 +602,12 @@ class BoxChangeEngine:
         if manual and not physical:
             raise gcmd.error(
                 "[BOX]: BOX_UNLOAD MANUAL=1 requires a physical CFS slot")
+        if cfs_only and not physical:
+            logging.info(
+                "box: BOX_UNLOAD CFS_ONLY=1 skipped: loaded_slot=%s, "
+                "filament_detected=%s", live.loaded_slot,
+                live.filament_detected)
+            return
         self._op_start(
             "unload", live.loaded_slot, None, self._unload_plan(
                 live, physical,

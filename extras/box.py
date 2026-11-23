@@ -1603,7 +1603,8 @@ class Box:
         if "SLOT" in gcmd.get_command_parameters():
             raise gcmd.error("[BOX]: BOX_UNLOAD no longer accepts SLOT")
         manual = bool(gcmd.get_int("MANUAL", 0, minval=0, maxval=1))
-        self.change_engine.unload(gcmd, manual=manual)
+        cfs_only = bool(gcmd.get_int("CFS_ONLY", 0, minval=0, maxval=1))
+        self.change_engine.unload(gcmd, manual=manual, cfs_only=cfs_only)
 
     def cmd_buffer_retract(self, gcmd):
         try:
