@@ -246,7 +246,9 @@ def clone_repo(url: str, dest: Path, *, branch: str | None, replace: bool) -> bo
         log(f"{dest.name} already exists; skipping clone")
         return False
     prepare_path(dest, replace=replace)
-    cmd = ["git", "clone", "--depth", "1"]
+    # Blobless, not shallow: full history and tags (so git describe gives the
+    # version Moonraker and Klipper show) without every old file version.
+    cmd = ["git", "clone", "--filter=blob:none"]
     if branch:
         cmd.extend(["--branch", branch])
     cmd.extend([url, str(dest)])

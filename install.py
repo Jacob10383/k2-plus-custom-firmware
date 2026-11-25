@@ -8,10 +8,11 @@ import os
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
-import tarfile
+import zipfile
 import time
 import traceback
 import urllib.request
@@ -38,14 +39,14 @@ RELEASE_FILES = {
     "kernel.img": "kernel",
     "swap": "swap utility",
 }
-HELIX_VERSION = "v1.0.3"
-HELIX_ARCHIVE = f"helixscreen-k2-{HELIX_VERSION}.tar.gz"
+HELIX_VERSION = "v1.1.0"
+HELIX_ARCHIVE = "helixscreen-k2.zip"
 HELIX_URL = (
     "https://github.com/prestonbrown/helixscreen/releases/download/"
     f"{HELIX_VERSION}/{HELIX_ARCHIVE}"
 )
-HELIX_SHA256 = "38d3e297440dce5bcc52c3e2249424c0725e0d4e462c8b8ac5888dad1d3dc4f4"
-HELIX_SIZE = 64326464
+HELIX_SHA256 = "37a1f337b99cc1b1cc848aff14f3169064be852ab1fb5f4c7769acd11cc77ac0"
+HELIX_SIZE = 39279505
 
 ROOTFS_A = "/dev/mmcblk0p6"
 ROOTFS_B = "/dev/mmcblk0p7"
@@ -718,24 +719,23 @@ def install_swap(script_path):
     subprocess.run(["sync"], check=True)
 
 
-def _safe_extract_tar(archive_path, dest_dir, label):
+def _safe_extract_zip(archive_path, dest_dir, label):
+    """Extract a zip, keeping the Unix file modes zipfile would drop."""
     dest_dir = os.path.abspath(dest_dir)
     os.makedirs(dest_dir, exist_ok=True)
-    with tarfile.open(archive_path, "r:gz") as tf:
-        members = tf.getmembers()
-        for member in members:
-            target = os.path.abspath(os.path.join(dest_dir, member.name))
+    with zipfile.ZipFile(archive_path) as zf:
+        for info in zf.infolist():
+            target = os.path.abspath(os.path.join(dest_dir, info.filename))
             if os.path.commonpath([dest_dir, target]) != dest_dir:
-                die(f"{label} archive contains unsafe path {member.name!r}")
-            if not (member.isdir() or member.isfile() or member.issym()):
-                die(f"{label} archive contains unsupported entry {member.name!r}")
-            if member.issym():
-                link_target = os.path.abspath(
-                    os.path.join(os.path.dirname(target), member.linkname)
-                )
-                if os.path.commonpath([dest_dir, link_target]) != dest_dir:
-                    die(f"{label} archive contains unsafe symlink {member.name!r}")
-        tf.extractall(dest_dir, members)
+                die(f"{label} archive contains unsafe path {info.filename!r}")
+            mode = info.external_attr >> 16
+            if mode and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                die(f"{label} archive contains unsupported entry {info.filename!r}")
+        for info in zf.infolist():
+            path = zf.extract(info, dest_dir)
+            mode = (info.external_attr >> 16) & 0o777
+            if mode and not info.is_dir():
+                os.chmod(path, mode)
 
 
 def _release_dir_from_extract(extract_dir):
@@ -822,7 +822,7 @@ def seed_custom_helix_archive(archive_path):
         if os.path.exists(path):
             shutil.rmtree(path, ignore_errors=True)
 
-    _safe_extract_tar(archive_path, extract_dir, "HelixScreen")
+    _safe_extract_zip(archive_path, extract_dir, "HelixScreen")
     release_dir = _release_dir_from_extract(extract_dir)
     _validate_helix_release(release_dir)
 

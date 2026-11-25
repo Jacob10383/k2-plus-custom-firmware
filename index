@@ -1,10 +1,10 @@
 {
   "bootstrap": {
-    "sha256": "b534d2804698fa730b67d63ce89d11fa0cfd119a7c07329af33dd25c06c290bf",
-    "size": 54774
+    "sha256": "bdb536d21d744ee3ff51d3ffa6c83436313e4017dc1f618af14c7e5080a9b6d0",
+    "size": 54932
   },
   "extras": {
-    "manifest_sha256": "6ab252114484da622ce6ad00a58b66eb2fa1d82d6bbd148ece9e566c59fbbc72",
+    "manifest_sha256": "a83f72d91c90d661d503d7836e05b1d7feabcee74b54ce1878aaf13c44910a88",
     "manifest_size": 3647
   },
   "format": "k2-release-index-v1",
@@ -13,7 +13,7 @@
     "size": 16777216
   },
   "rootfs": {
-    "sha256": "c85a43760be4086569d34d095a6136882b66e5ea2bbe70cc712c7a58bdf2ab43",
+    "sha256": "8afb2b6aab5c42fcf53c976e9f4f739aa6cd4afb84aee67af229e24a14794616",
     "size": 314572800
   },
   "swap": {

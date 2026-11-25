@@ -167,77 +167,90 @@ def state_name(value):
     return "NO_RESPONSE" if value is None else STATE_NAMES.get(value, "UNKNOWN")
 
 
-# (title, message) shown to users. Identifiers stay in STATUS_NAMES. Titles are
-# unique, so a console line identifies its status without printing the name.
+# (title, message) shown to users. Identifiers stay in STATUS_NAMES. Fluidd
+# shows the title above the message; the console prints only the message, so
+# each message's first sentence must identify its status on its own.
 STATUS_TEXT = {
     STATUS_INVALID_PARAM: (
         "Invalid command",
-        "Try again. If it keeps happening, report it."),
+        "The box rejected a command from the printer. This is a firmware "
+        "bug, please report it."),
     STATUS_BAD_CRC: (
         "Communication errors",
-        "Check the box's cable."),
+        "The box keeps receiving corrupted messages. Check its cable."),
     STATUS_BUSY: (
         "Box busy",
-        "It's still finishing another operation. Try again in a moment."),
+        "The box is still finishing another operation. Try again in a "
+        "moment."),
     STATUS_STAGE0_SENSOR_TIMEOUT: (
         "Filament didn't reach the hub",
-        "Check that it's seated in the slot gears and not tangled."),
+        "The box fed for 7 seconds but the hub never detected filament. "
+        "Check for a tangled spool or filament caught before the hub."),
     STATUS_SLOT_EMPTY: (
         "Slot is empty",
-        "Insert filament into the slot."),
+        "The slot doesn't detect any filament."),
     STATUS_STAGE0_ODOMETER_TIMEOUT: (
-        "Filament isn't moving",
-        "Check for a tangle, or that the hub is gripping the filament."),
+        "Filament isn't clearing the hub",
+        "The filament moved less than 20 mm in 2 seconds after reaching the "
+        "hub. Check for a tangled spool or grinded filament."),
     STATUS_FEED_TIMEOUT: (
         "Feed timed out",
         "The filament never reached the printhead. Check for resistance in "
         "the PTFE tube."),
     STATUS_OVERTRAVEL: (
         "Filament didn't arrive",
-        "The hub fed more than the full tube length. Check for a "
-        "disconnected PTFE tube."),
+        "The box fed 3 m of filament without the printhead detecting it. "
+        "Check for a disconnected PTFE tube."),
     STATUS_ODOMETER_STALLED: (
         "Filament stopped moving",
-        "Check for a jam or resistance between the box and the printhead."),
+        "The filament stopped moving on its way to the printhead. Check for "
+        "a tight bend or snag in the PTFE tube where the tip stopped."),
     STATUS_BUFFER_NOT_FULL: (
         "Buffer didn't fill",
-        "Check the PTFE tube into the buffer."),
+        "The filament reached the printhead, but the buffer didn't fill "
+        "within 3 seconds. Check that the buffer slides freely."),
     STATUS_UNLOAD_BUFFER_TIMEOUT: (
-        "Filament couldn't pull back",
-        "Check for a jam between the box and the printhead."),
+        "Buffer didn't release",
+        "The box pulled back for 5 seconds but the buffer never emptied. "
+        "Check for a stuck buffer or a jam between it and the box."),
     STATUS_UNLOAD_HUB_PE_TIMEOUT: (
         "Filament stuck in the hub",
-        "The retract never cleared it. Check for a jam inside the box."),
+        "The box pulled back, but the hub still detects filament. Check for "
+        "a jam or a broken piece at the hub."),
     STATUS_UNLOAD_NO_FILAMENT: (
         "Nothing to unload",
-        "The slot has no filament for the box to pull back."),
+        "The slot doesn't detect any filament, so it cannot be unloaded."),
     STATUS_UNLOAD_INLET_CLEAR: (
         "Slot inlet already empty",
-        "The filament was gone from the slot before the retract started."),
+        "The slot's sensor no longer detects filament, so the box couldn't "
+        "pull it back. The filament may have broken between the slot and "
+        "the hub."),
     STATUS_UNLOAD_MOTOR_BLOCKED: (
-        "Hub motor stalled",
-        "It stalled while pulling filament back. Check for a jam."),
+        "Box motor stalled",
+        "A box motor stalled for 10 seconds while pulling filament back. "
+        "Check for a jam."),
     STATUS_UNLOAD_ODOMETER_TIMEOUT: (
         "Retract timed out",
-        "The hub kept pulling back but the path never cleared. Check for a "
-        "jam."),
+        "The box pulled back for 40 seconds but the filament never cleared "
+        "the hub."),
     STATUS_RUNOUT: (
         "Spool ran out",
-        "Put a new spool in the slot."),
+        "The box no longer detects filament in this slot. The spool is empty "
+        "or the filament snapped."),
     STATUS_BUFFER_REFILL_STALLED: (
         "Buffer isn't refilling",
-        "The hub is feeding but the buffer stays empty. Check the PTFE tube "
-        "from the hub into the buffer."),
+        "The box keeps feeding but the buffer never fills back up. Check for "
+        "a disconnected PTFE tube."),
     STATUS_BUFFER_REFILL_NO_MOTION: (
         "Buffer refill didn't move",
-        "The filament barely moved when the hub tried to feed. Check for a "
-        "jam or tangle."),
+        "The box tried to refill the buffer but the filament barely moved. "
+        "Check for a tangled spool or obstruction between box and buffer."),
 }
 
 
 def status_text(value):
     """(title, message). A UI shows the title as a headline with the message
-    under it; the console joins them."""
+    under it; the console prints only the message."""
     if value is None:
         return "No response", "The box didn't respond."
     return STATUS_TEXT.get(
@@ -253,14 +266,12 @@ def buffer_state_name(value):
 
 
 def status_detail(value):
-    """The console text for a status: its title, then what to do."""
-    title, message = status_text(value)
-    if value is None:
-        return message
-    if value not in STATUS_TEXT:
+    """The console text for a status: its message, without the title."""
+    _title, message = status_text(value)
+    if value is not None and value not in STATUS_TEXT:
         # Nothing else in the line identifies a status without its own text.
         return "%s [0x%02X]" % (message, value)
-    return "%s. %s" % (title, message)
+    return message
 
 
 def status_line(address, value, note=None):
@@ -507,6 +518,37 @@ def decode_box_state(frame, address):
         reply.address, reply.command, reply.status, reply.payload, reply.raw,
         *values, events,
     )
+
+
+def stalled_motors(reply):
+    """Motors stopped by a 10 s stall: bits 0-3 slots, bit 4 hub."""
+    payload = getattr(reply, "payload", None) or b""
+    if (getattr(reply, "slot_events", None) is None and len(payload) == 6
+            and payload[2] & 0x80):
+        return payload[2] & 0x1F
+    return 0
+
+
+def stalled_motor_names(address, mask):
+    parts = ["hub"] if mask & 0x10 else []
+    parts += ["slot %d" % (local + 1) for local in range(SLOTS_PER_BOX)
+              if mask & (1 << local)]
+    if not parts:
+        return None
+    return "Box %d's %s motor%s" % (
+        address, " and ".join(parts), "s" if len(parts) > 1 else "")
+
+
+def motor_stall_detail(address, mask):
+    names = stalled_motor_names(address, mask)
+    if names is None:
+        return status_detail(STATUS_UNLOAD_MOTOR_BLOCKED)
+    if names.endswith("motors"):
+        # The 10 s is how long any of them was stalled, not each one.
+        return ("%s stalled while pulling filament back. Check for a jam."
+                % names)
+    return ("%s stalled for 10 seconds while pulling filament back. Check "
+            "for a jam." % names)
 
 
 def _record_fields(record):

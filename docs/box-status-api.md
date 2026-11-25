@@ -83,8 +83,8 @@ Each `boxes[]` entry:
 
 `boxes` is `[]` until the first poll. `fault.category` is `fatal` (the print
 pauses), `runout`, or `advisory` (the print continues). `title` is a short
-headline and `message` the explanation; both are always set. The console shows
-them joined, e.g. `Box 1: Filament didn't arrive. The hub fed ...`.
+headline and `message` the explanation, which reads on its own (the console
+prints only `message`); both are always set.
 `fault.status` is a CFS status name, or one with `status_code: null`:
 `FILAMENT_SNAPPED` when the loaded slot's filament broke between the slot and
 the hub and has to be pulled out by hand; `PATH_CONFLICT`, on each box

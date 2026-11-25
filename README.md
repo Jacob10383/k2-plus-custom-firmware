@@ -14,12 +14,15 @@ This is an independent project and is not affiliated with Creality.
 
 ## Repository layout
 
-- `kernel.img` and `rootfs.ext2` — firmware images
 - `install.py` — installation entrypoint
 - `bootstrap` and `swap` — printer setup and firmware-slot commands
-- `index` — release metadata
+- `index` — release metadata, including the SHA-256 of each firmware image
 - `extras/` — Kalico extensions for K2-specific hardware and functionality
 - `docs/` — user documentation
+
+The firmware images, `rootfs.ext2` and `kernel.img`, are attached to each
+[release](https://github.com/Jacob10383/k2-plus-custom-firmware/releases)
+instead of being stored in the repository.
 
 For installation, setup, calibration, OrcaSlicer configuration, updates, and
 reference material, see the
