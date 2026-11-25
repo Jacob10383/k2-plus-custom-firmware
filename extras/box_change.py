@@ -9,7 +9,7 @@ steps are checkpointed for safe same-command retries.
 import copy
 import logging
 import math
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 
 from extras import box_protocol
@@ -1253,18 +1253,23 @@ class BoxChangeEngine:
         self._commit_loaded_slot(target)
         if request.flush and not request.flush_done:
             request.last_step = "flush"
-            prepared = self._prepare_filament(
-                gcmd, source, target,
-                prepared_temperature=prepared_temperature,
-                fault_generation=fault_generation, request=request)
-            request.prepared_filament = bool(
-                request.prepared_filament or prepared)
-            request.flush_done = True
-            if request.print_context:
-                self.prepared_epoch = self._print_epoch()
-                request.last_step = "final_temperature"
-                self._wait_for_final_temperature(
-                    target, fault_generation, request)
+            # The purge's fan guard stays open until the final temperature
+            # wait, so the last snap's fan runs straight into a cooldown.
+            with ExitStack() as purge_fan:
+                prepared = self._prepare_filament(
+                    gcmd, source, target,
+                    prepared_temperature=prepared_temperature,
+                    fault_generation=fault_generation, request=request,
+                    purge_fan=purge_fan if request.print_context else None)
+                request.prepared_filament = bool(
+                    request.prepared_filament or prepared)
+                request.flush_done = True
+                if request.print_context:
+                    self.prepared_epoch = self._print_epoch()
+                    request.last_step = "final_temperature"
+                    self._wait_for_final_temperature(
+                        target, fault_generation, request,
+                        purge_fan=purge_fan)
         elif (request.flush and request.flush_done and request.print_context
               and request.last_step == "final_temperature"):
             self._wait_for_final_temperature(
@@ -1597,7 +1602,10 @@ class BoxChangeEngine:
     def _prepare_filament(
             self, gcmd, source, target, temperature_source=None,
             allow_purge=True, prime_reason=None, prepared_temperature=None,
-            fault_generation=None, request=None, force_prime=False):
+            fault_generation=None, request=None, force_prime=False,
+            purge_fan=None):
+        """purge_fan, an ExitStack, takes over the fan guard so the last
+        snap's fan keeps running until the stack closes."""
         if fault_generation is None:
             fault_generation = self.box.fault_generation
         self._check_abort(fault_generation)
@@ -1631,6 +1639,11 @@ class BoxChangeEngine:
         purge_f = self.purge_speed / FILAMENT_AREA * 60.0
         prime_f = self.print_prime_speed / FILAMENT_AREA * 60.0
         guard = self.box.part_fan_override(0.0)
+        fan_after = 0.0
+        if purge_fan is not None:
+            purge_fan.enter_context(guard)
+            guard = nullcontext()
+            fan_after = self.box.snap_fan_speed
         with guard:
             self.gcode.run_script_from_command(
                 "SAVE_GCODE_STATE NAME=box_filament_prepare")
@@ -1653,14 +1666,14 @@ class BoxChangeEngine:
                         gcmd, "Purging %.1fmm (%s)" % (purge, purge_reason))
                     self._purge_moves(
                         purge, purge_f, clog_epoch, fault_generation,
-                        done=feed)
+                        done=feed, fan_after=fan_after)
                 elif prime > 0.0:
                     self._info(
                         gcmd, "Priming %.1fmm%s" % (
                             prime, " (%s)" % prime_reason if prime_reason else ""))
                     self._purge_moves(
                         prime, prime_f, clog_epoch, fault_generation,
-                        done=feed)
+                        done=feed, fan_after=fan_after)
             finally:
                 self.gcode.run_script_from_command(
                     "RESTORE_GCODE_STATE NAME=box_filament_prepare MOVE=0")
@@ -1690,8 +1703,10 @@ class BoxChangeEngine:
             "fallback %s -> %s" % (self._slot_label(source), self._slot_label(target)))
 
     def _purge_moves(self, distance, feedrate, clog_epoch, fault_generation,
-                     done=0.0):
-        """Purge in chunks with a snap and wipe after each; returns done + distance."""
+                     done=0.0, fan_after=0.0):
+        """Purge in chunks with a snap and wipe after each; returns done + distance.
+
+        The fan stops between chunks; the last snap leaves it at fan_after."""
         chunks = int(math.ceil(distance / PURGE_CHUNK_MM))
         for index in range(chunks):
             self._check_abort(fault_generation, clog_epoch)
@@ -1702,7 +1717,8 @@ class BoxChangeEngine:
             self.gcode.run_script_from_command(
                 "G1 E%.4f F%.1f" % (amount, feedrate))
             self._check_abort(fault_generation, clog_epoch)
-            self.box.flush_clean_snap(fan_after=0.0)
+            self.box.flush_clean_snap(
+                fan_after=fan_after if index == chunks - 1 else 0.0)
             done += distance / chunks
             self.op_progress(done)
             self._check_abort(fault_generation, clog_epoch)
@@ -1721,26 +1737,33 @@ class BoxChangeEngine:
         self.printer.wait_while(waiting, interval=TEMP_POLL)
         self._check_abort(fault_generation)
 
-    def _wait_for_final_temperature(self, target, fault_generation, request):
+    def _wait_for_final_temperature(self, target, fault_generation, request,
+                                    purge_fan=None):
         final = self._effective_temp(target)
         request.settled_temperature = final
         self._op_step("temperature", temperature=final)
-        elapsed = self._wait_for_temperature_target(final, fault_generation)
+        elapsed = self._wait_for_temperature_target(
+            final, fault_generation, purge_fan)
         self._clean_after_temperature_wait(
             elapsed, fault_generation, request)
         self.repush_after_filament_prepare()
         self._check_abort(fault_generation)
 
-    def _wait_for_temperature_target(self, final, fault_generation):
+    def _wait_for_temperature_target(self, final, fault_generation,
+                                     purge_fan=None):
+        """Wait for final, with the fan on to cool. Closing purge_fan puts
+        back the print's fan the purge left running."""
         reactor = self.printer.get_reactor()
         started = reactor.monotonic()
         self.gcode.run_script_from_command("M104 S%d" % final)
         heater = self.printer.lookup_object("heaters").lookup_heater("extruder")
         current, _target = heater.get_temp(reactor.monotonic())
-        fan_guard = (
-            self.box.part_fan_override(1.0)
-            if current > final + TEMP_TOLERANCE else nullcontext())
-        with fan_guard:
+        fan = purge_fan if purge_fan is not None else ExitStack()
+        with fan:
+            if current > final + TEMP_TOLERANCE:
+                fan.enter_context(self.box.part_fan_override(1.0))
+            else:
+                fan.close()  # no blowing on a nozzle that has to reheat
             self._wait_for_temperature(
                 final - TEMP_TOLERANCE, final + TEMP_TOLERANCE,
                 fault_generation)

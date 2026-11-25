@@ -600,6 +600,9 @@ class Box:
         self.fault_generation = 0
         self.last_fatal_reason = None
         self.fault_episodes = {}
+        # address -> (episode, message): replaces STATUS_TEXT's message for
+        # as long as that episode object lasts.
+        self.fault_messages = {}
         self.advised = {}  # address -> (status, time) reported as unused
         self.snapped = None  # loaded slot whose filament snapped in the box
         self.last_reconnect = 0.0
@@ -1044,6 +1047,9 @@ class Box:
         else:
             return None
         title, message = box_protocol.status_text(status_code)
+        exact = self.fault_messages.get(address)
+        if exact is not None and exact[0] is episode and exact[1]:
+            message = exact[1]
         return {
             "category": category,
             "status": box_protocol.status_name(status_code),
@@ -1998,6 +2004,17 @@ class Box:
             return
         for slot in self._pending_rfid_slots(address):
             self._read_rfid_result(slot)
+
+    def _stalled_motors(self, address, driver):
+        """Sent once, in the next state reply after the stall."""
+        try:
+            reply = self._query_box_snapshot(address, driver, False)
+        except Exception as exc:
+            _klog("box %d stalled-motor query failed: %s", address, exc)
+            return 0
+        if reply is None or reply is _DRAINING:
+            return 0
+        return box_protocol.stalled_motors(reply)
 
     def _query_box_snapshot(self, address, driver, include_topology):
         """The box's state reply, None when it did not answer, or _DRAINING.
@@ -3019,6 +3036,8 @@ class Box:
     def _set_tracking(self, driver, address, local, context):
         reply = self._require_reply(
             driver.set_tracking(local, timeout=1.0), context)
+        # The CFS cleared its error, so a detailed message is stale now.
+        self.fault_messages.pop(address, None)
         if local is None:
             self._clear_tracking_owner(address)
         else:
@@ -3083,8 +3102,12 @@ class Box:
     def _latch_fatal_fault(self, address, status, reason, detail=None):
         key = self._fault_key(status, "fatal")
         if self.fault_episodes.get(address) == key:
+            if detail:
+                self.fault_messages[address] = (
+                    self.fault_episodes[address], detail)
             return False
         self.fault_episodes[address] = key
+        self.fault_messages[address] = (key, detail)
         self.fault_generation += 1
         # Operations prefix their own label: "<slot> load failed (CODE): ..."
         self.last_fatal_reason = detail or box_protocol.status_detail(status)
@@ -4007,13 +4030,19 @@ class Box:
                     finally:
                         if retract_toolhead is not None:
                             retract_toolhead.wait_moves()
-                    if (path_reply is None
-                            or path_reply.status
-                            != box_protocol.STATUS_UNLOAD_MOTOR_BLOCKED
-                            or attempt):
+                    stalled = (
+                        path_reply is not None and path_reply.status
+                        == box_protocol.STATUS_UNLOAD_MOTOR_BLOCKED)
+                    if stalled:
+                        motors = self._stalled_motors(address, driver)
+                        stall_detail = box_protocol.motor_stall_detail(
+                            address, motors)
+                    if not stalled or attempt:
                         break
                     if not self.filament_retry_motion(
-                            "CFS unload motor blocked; moving toolhead and retrying unload"):
+                            "%s stalled; moving the toolhead and trying again"
+                            % (box_protocol.stalled_motor_names(address, motors)
+                               or "Box motor")):
                         break
                     self.check_operation_abort(fault_generation)
                     self._set_tracking(
@@ -4033,6 +4062,10 @@ class Box:
                         path_reply, "loaded-path retract", detail)
                     self.snapped = slot
                     raise BoxError(detail)
+                if stalled:
+                    self._record_command_fault(
+                        path_reply, "loaded-path retract", stall_detail)
+                    raise BoxError(stall_detail)
                 self._require_reply(path_reply, "loaded-path retract")
                 self.check_operation_abort(fault_generation)
                 final = self._wait_for_state(
