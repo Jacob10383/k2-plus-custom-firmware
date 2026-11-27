@@ -25,6 +25,15 @@ theme:
         icon: material/weather-sunny
         name: Use light mode
 
+extra:
+  social:
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/RcnUFd7dfX
+      name: Discord
+    - icon: fontawesome/brands/github
+      link: https://github.com/Jacob10383/k2-plus-custom-firmware
+      name: GitHub
+
 markdown_extensions:
   - admonition
   - pymdownx.details

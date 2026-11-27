@@ -14,3 +14,6 @@ between stock and custom whenever you want without reinstalling either one.
 Each keeps its own configuration and files.
 
 To install it, follow the [installation guide](install.md).
+
+!!! tip "Need help?"
+    Ask in the [Discord](https://discord.gg/RcnUFd7dfX) for setup help, bug reports, and updates.
